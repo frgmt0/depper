@@ -388,15 +388,24 @@ jobs:
           echo ".env.production" >>.gitignore
           git add -A
           git commit -qm "podman on the runner"
+          # The runner image ships podman; remove it (and its uid mapping
+          # helpers) so host init installs them from the Ubuntu archive as on
+          # a fresh VPS.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y -q podman uidmap slirp4netns
+          if command -v podman >/dev/null 2>&1; then echo "::error::podman is still installed"; exit 1; fi
           # No --container: host init installs the engine depper.toml uses.
           host_init host-init-podman 0
           check host-init-podman '.error == null and .host_key_status == "added"'
-          check host-init-podman '[.plan[] | select(.id == "subids")][0].change == true and (.applied | index("subids")) != null'
+          check host-init-podman '[.plan[] | select(.id == "packages")][0] | .change == true and (.detail | test("podman")) and (.detail | test("uidmap")) and (.detail | test("slirp4netns"))'
+          check host-init-podman '(.applied | index("packages")) != null'
+          # Ubuntu's useradd already assigns subordinate ids; the step is
+          # planned and satisfied.
+          check host-init-podman '[.plan[] | select(.id == "subids")] | length == 1'
           check host-init-podman '([.doctor.checks[] | select(.status == "fail")] | length) == 0'
           command -v podman
           grep -q '^deploy:' /etc/subuid
           grep -q '^deploy:' /etc/subgid
-          sudo jq -e '.container == "podman"' /etc/depper/host.json
+          sudo jq -e '.container == "podman" and (.packages | index("podman")) != null' /etc/depper/host.json
           git add -A
           git commit -qm "connect to the runner"
           dep 0 host-status-podman host status --json
