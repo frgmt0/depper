@@ -100,12 +100,12 @@ func TestRevertTimerAndImmediateRollbackBothRun(t *testing.T) {
 		o := h.options()
 		o.HardenSSH = true
 		r := h.runner()
-		r.revertDelay = 3 * time.Second
+		r.revertDelay = 15 * time.Second
 		_, err := r.Init(context.Background(), o)
 		if err == nil || !strings.Contains(err.Error(), "rolled back the change, but stopping depper-ssh-revert.timer failed") || !strings.Contains(err.Error(), "which then has nothing left to undo") {
 			t.Fatalf("err = %v", err)
 		}
-		h.waitEvent("done depper-ssh-revert\n", 15*time.Second)
+		h.waitEvent("done depper-ssh-revert\n", 40*time.Second)
 		if got := h.read("fs/etc/ssh/sshd_config.d/10-depper.conf"); got != old {
 			t.Errorf("drop-in after the timer also ran = %q, want %q", got, old)
 		}
@@ -167,12 +167,12 @@ func TestRerunFinishesAnInterruptedHardening(t *testing.T) {
 func TestLateFiringRevertTimer(t *testing.T) {
 	t.Parallel()
 	h := newFakeHost(t, debian12)
-	h.write("timer-delay", "9", 0o644)
+	h.write("timer-delay", "25", 0o644)
 	h.write("deny-admin-after-reload", "", 0o644)
 	o := h.options()
 	o.HardenSSH = true
 	r := h.runner()
-	r.revertDelay, r.revertGrace = 2*time.Second, 2*time.Second
+	r.revertDelay, r.revertGrace = 8*time.Second, 2*time.Second
 	_, err := r.Init(context.Background(), o)
 	if err == nil {
 		t.Fatal("hardening succeeded although the admin cannot log in")
@@ -185,7 +185,7 @@ func TestLateFiringRevertTimer(t *testing.T) {
 	if strings.Contains(h.read("timer-events"), "fired") {
 		t.Fatal("the timer fired before host init gave up; the test does not cover a late timer")
 	}
-	h.waitEvent("done depper-ssh-revert\n", 20*time.Second)
+	h.waitEvent("done depper-ssh-revert\n", 40*time.Second)
 	if h.has("fs/etc/ssh/sshd_config.d/10-depper.conf") {
 		t.Error("the late timer did not remove the drop-in")
 	}

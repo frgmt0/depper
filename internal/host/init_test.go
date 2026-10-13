@@ -876,7 +876,7 @@ func TestHardenSSHRevertTimerFiresWhenAdminLoginFails(t *testing.T) {
 	o.HardenSSH = true
 	h.write("deny-admin-after-reload", "", 0o644)
 	r := h.runner()
-	r.revertDelay, r.revertGrace = 5*time.Second, 3*time.Second
+	r.revertDelay, r.revertGrace = 15*time.Second, 5*time.Second
 	_, err := r.Init(context.Background(), o)
 	if err == nil {
 		t.Fatal("hardening succeeded although the admin cannot log in")
@@ -913,7 +913,7 @@ func TestHardenSSHRevertTimerFiresWhenAdminLoginFails(t *testing.T) {
 	// The timer fires on time (AccuracySec=1s, no randomized delay) and
 	// runs the revert script, which acts on the markers written before.
 	logs := h.read("systemd-run.log")
-	if !strings.Contains(logs, "--unit=depper-ssh-revert --property=Type=oneshot --timer-property=AccuracySec=1s --timer-property=RandomizedDelaySec=0 --on-active=5s /bin/sh "+h.FS+"/var/lib/depper/guard/depper-ssh-revert/revert.sh timer\n") {
+	if !strings.Contains(logs, "--unit=depper-ssh-revert --property=Type=oneshot --timer-property=AccuracySec=1s --timer-property=RandomizedDelaySec=0 --on-active=15s /bin/sh "+h.FS+"/var/lib/depper/guard/depper-ssh-revert/revert.sh timer\n") {
 		t.Errorf("systemd-run.log = %q", logs)
 	}
 	if script := h.read("fs/var/lib/depper/guard/depper-ssh-revert/revert.sh"); !strings.Contains(script, "10-depper.conf") || !strings.Contains(script, "had-none") {

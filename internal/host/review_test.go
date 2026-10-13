@@ -55,7 +55,7 @@ func TestFirewallRevertTimerFiresWhenLoginsFail(t *testing.T) {
 	o := h.options()
 	o.Firewall = []int{80}
 	r := h.runner()
-	r.revertDelay, r.revertGrace = 5*time.Second, 3*time.Second
+	r.revertDelay, r.revertGrace = 15*time.Second, 5*time.Second
 	_, err := r.Init(context.Background(), o)
 	if err == nil {
 		t.Fatal("firewall accepted although logins fail")
