@@ -744,6 +744,26 @@ func TestSSHFilePathsRejectWhitespace(t *testing.T) {
 	}
 }
 
+// A trailing slash on a deployment path is refused at load time for the base
+// [deploy] table and for [targets.<name>] overlays alike.
+func TestDeployPathTrailingSlash(t *testing.T) {
+	cases := []struct {
+		name     string
+		contents string
+	}{
+		{"base deploy path", minimal + "path = \"/srv/app/\"\n"},
+		{"target path", minimal + "[targets.prod]\npath = \"/srv/app/\"\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			expectError(t, tc.name, tc.contents, `\.path must not end with /`)
+		})
+	}
+	if cfg := mustLoad(t, minimal+"path = \"/srv/app\"\n"); cfg.Deploy.Path != "/srv/app" {
+		t.Errorf("path = %q", cfg.Deploy.Path)
+	}
+}
+
 // [deploy].path is used unquoted (rsync destination, unit paths), so only a
 // conservative alphabet is accepted.
 func TestDeployPathAlphabet(t *testing.T) {

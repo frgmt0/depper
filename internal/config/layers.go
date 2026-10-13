@@ -250,6 +250,9 @@ func (d *deployLayer) parse(t map[string]any, label, repo string) error {
 	if d.path != nil && !shell.IsSafePath(*d.path) {
 		return errorf("%s.path must be an absolute remote path made only of %s", label, shell.SafePathChars)
 	}
+	if d.path != nil && strings.HasSuffix(*d.path, "/") {
+		return errorf("%s.path must not end with /", label)
+	}
 	if d.setup, d.setupSet, err = optStringList(t, "setup", label); err != nil {
 		return err
 	}
