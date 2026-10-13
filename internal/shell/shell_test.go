@@ -198,8 +198,9 @@ func TestSessionEnvReplacesForeignRuntimeDir(t *testing.T) {
 	}
 }
 
-// XDG base directories that exist and belong to someone else are dropped;
-// the user's own, and paths that do not exist yet, are kept.
+// XDG base directories that belong to someone else, or cannot be created by
+// the user, are dropped; the user's own, and missing ones in a directory
+// the user owns, are kept.
 func TestSessionEnvDropsForeignBaseDirs(t *testing.T) {
 	sh, err := exec.LookPath("sh")
 	if err != nil {
@@ -210,7 +211,7 @@ func TestSessionEnvDropsForeignBaseDirs(t *testing.T) {
 	}
 	own := t.TempDir()
 	cmd := exec.Command(sh, "-s")
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "XDG_CONFIG_HOME=/", "XDG_DATA_HOME=" + own, "XDG_CACHE_HOME=" + own + "/new", "XDG_STATE_HOME=/"}
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "XDG_CONFIG_HOME=/", "XDG_DATA_HOME=" + own, "XDG_CACHE_HOME=" + own + "/new", "XDG_STATE_HOME=/nonexistent-depper-test/state"}
 	cmd.Stdin = strings.NewReader(Script(append(Prelude(), `sh -c 'printf "%s|%s|%s|%s\n" "${XDG_CONFIG_HOME-unset}" "${XDG_DATA_HOME-unset}" "${XDG_CACHE_HOME-unset}" "${XDG_STATE_HOME-unset}"'`)...))
 	out, err := cmd.CombinedOutput()
 	if err != nil {

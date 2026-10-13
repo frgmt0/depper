@@ -156,7 +156,9 @@ jobs:
           done
           sudo sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication|allowtcpforwarding|port) '
           ls -l /etc/ssh/sshd_config.d/ || true
-          grep -n "^XDG_RUNTIME_DIR" /etc/environment || echo "no XDG_RUNTIME_DIR in /etc/environment"
+          # The runner image exports its own user's XDG directories to every login
+          # through /etc/environment (pam_env); depper must cope (names only).
+          echo "/etc/environment sets: $(grep -o "^[A-Za-z_][A-Za-z0-9_]*=" /etc/environment | tr -d = | tr "\n" " ")"
 
       - name: Create the admin and deploy keys
         run: |

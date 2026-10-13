@@ -64,15 +64,16 @@ func Prelude() []string {
 // /run/user/UID and ~/.config. podman refuses a runtime directory it does
 // not own and cannot read another user's configuration. Unless the
 // inherited runtime directory exists and is owned by the current user, both
-// variables are set to /run/user/$(id -u); XDG_CONFIG_HOME, XDG_DATA_HOME,
-// XDG_CACHE_HOME and XDG_STATE_HOME naming an existing path owned by
-// someone else are unset, so the defaults under $HOME apply.
+// variables are set to /run/user/$(id -u). XDG_CONFIG_HOME, XDG_DATA_HOME,
+// XDG_CACHE_HOME and XDG_STATE_HOME are kept only when they name a
+// directory the current user owns, or a missing one in a directory it owns;
+// otherwise they are unset, so the defaults under $HOME apply.
 func SessionEnv() []string {
 	return []string{
 		`if test -z "${XDG_RUNTIME_DIR:-}" || ! test -d "$XDG_RUNTIME_DIR" || ! test -O "$XDG_RUNTIME_DIR"; then XDG_RUNTIME_DIR="/run/user/$(id -u)"; DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; fi`,
 		`export XDG_RUNTIME_DIR`,
 		`export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"`,
-		`for depper_xdg in XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME; do eval "depper_dir=\${$depper_xdg:-}"; if test -n "$depper_dir" && test -e "$depper_dir" && ! test -O "$depper_dir"; then unset "$depper_xdg"; fi; done`,
+		`for depper_xdg in XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME; do eval "depper_dir=\${$depper_xdg:-}"; if test -n "$depper_dir" && ! test -O "$depper_dir" && ! { ! test -e "$depper_dir" && test -O "$(dirname -- "$depper_dir")"; }; then unset "$depper_xdg"; fi; done`,
 	}
 }
 
