@@ -14,7 +14,7 @@ depper replaces the Python tool `deployer`. See [Migrating from deployer](docs/m
 
 ## What depper does not do
 
-- It does not provision hosts, install packages, open firewall ports, or enable lingering. See [Preparing a host](docs/hosts.md).
+- Deploying does not provision hosts, install packages, open firewall ports, or enable lingering. The separate, explicit command `depper host init` does that once, as an administrator, and nothing else uses root. See [Preparing a host](docs/hosts.md).
 - It does not provide zero-downtime deployments. The unit is restarted on every deployment, so there is a short interruption.
 - It does not roll back databases, uploaded files, or any state outside the release directory.
 - It does not manage system-wide units, Windows services, macOS launchd jobs, or Kubernetes.
@@ -23,7 +23,7 @@ depper replaces the Python tool `deployer`. See [Migrating from deployer](docs/m
 
 ## Requirements
 
-Local machine (where you run `depper`): `ssh`, `rsync`, and `git` (git is optional unless you deploy a ref or use `source = "git"`). Linux or macOS binaries are published.
+Local machine (where you run `depper`): `ssh`, `rsync`, and `git` (git is optional unless you deploy a ref or use `source = "git"`); `depper host init` also needs `ssh-keyscan`, which ships with the OpenSSH client. Linux or macOS binaries are published.
 
 Deploy host: Linux with a systemd user manager, a POSIX `sh`, GNU-compatible coreutils (including `sha256sum`, `mktemp`, `base64`, and `mv -T`), and `rsync`. `curl` is optional and only used as a fallback for URL health checks. A container engine (docker or podman) is needed only when `[container]` is used, and `cloudflared` only when `[tunnel]` is used. No Python is required by depper; your application may need its own runtime.
 
@@ -176,18 +176,24 @@ depper does not install anything else on your local machine: no services, daemon
 
 ## Quick start
 
-Prepare the host first ([docs/hosts.md](docs/hosts.md)): an unprivileged account, SSH access, and `loginctl enable-linger`.
-
 ```sh
 cd your-repository
-depper init           # writes a starter depper.toml
-$EDITOR depper.toml   # set the service name, command, and [deploy].host
-depper doctor         # checks SSH, rsync, systemd, linger, disk space
-depper deploy --dry-run
+depper init                       # detects the project and writes a starter depper.toml
+depper host init root@SERVER      # prepares a fresh VPS and writes the connection into depper.toml
 depper deploy
+```
+
+`depper init` recognises Docker Compose, Dockerfile, Go, Node.js, Python, Rust, and static sites, and marks every inferred line with a comment saying where it came from; review them before you deploy ([Configuration](docs/configuration.md#generating-a-starter-file-with-depper-init)). `depper host init` connects as root (or a user with passwordless sudo), creates an unprivileged deploy user with your SSH key, enables lingering, installs `rsync` and, for container projects, podman or docker, pins the host key after you confirm its fingerprint, and records what it did on the host. Add `--dry-run` to see the plan without changing anything, and `depper host status` to check the result later. It supports Debian/Ubuntu and Fedora/RHEL hosts with systemd; only Ubuntu 24.04 has been verified on a real host (see [Support status](docs/hosts.md#support-status)).
+
+Afterwards:
+
+```sh
+depper doctor         # checks SSH, rsync, systemd, linger, disk space
 depper status
 depper health
 ```
+
+To use a host you prepared yourself, skip `host init`: create the account, enable lingering, and set `[deploy].host` in `depper.toml` by hand ([Manual setup](docs/hosts.md#manual-setup)). Use `depper deploy --dry-run` to validate the configuration without connecting.
 
 A minimal `depper.toml`:
 
@@ -214,7 +220,9 @@ The health URL is requested from the host's network view, so `127.0.0.1` refers 
 
 | Command | Purpose |
 | --- | --- |
-| `depper init [REPO]` | Write a starter `depper.toml`. |
+| `depper init [REPO]` | Detect the project type and write a starter `depper.toml`. Flags: `--print`, `--force`. |
+| `depper host init ADMIN@HOST [REPO]` | Prepare a fresh Linux host over SSH (deploy user, key, linger, packages, optional hardening) and write the connection into `depper.toml`. Flags: `--dry-run`, `--yes`, `--user`, `--port`, `--key`, `--identity`, `--known-hosts`, `--container`, `--cloudflared`, `--harden-ssh`, `--firewall`, `--auto-updates`, `--tailscale-authkey-env`, `--no-write-config`. |
+| `depper host status [REPO]` | Show how the host was prepared and check it as the deploy user. Exit 1 if a check fails. |
 | `depper deploy [REPO]` | Create a release, activate it, wait for health. Flags: `--dry-run`, `--env FILE`, `--env-stdin`, `--ref REF`. |
 | `depper status [REPO]` | Unit state, current release, endpoint, tunnel URL, and health. Exits 0 whenever the host could be read, even if the service is unhealthy. |
 | `depper health [REPO]` | Run the health check. Flags: `--watch SECONDS`, `--count N`. Exit 2 when unhealthy. |
@@ -236,8 +244,8 @@ Exit codes: 0 success, 1 error, 2 unhealthy (`health`), 3 drift, outdated, or no
 
 ## Documentation
 
-- [Configuration reference](docs/configuration.md): every key in `depper.toml`, targets, validation.
-- [Preparing a host](docs/hosts.md): accounts, SSH keys, known_hosts, linger, firewall, `depper doctor`.
+- [Configuration reference](docs/configuration.md): project detection by `depper init`, every key in `depper.toml`, targets, validation.
+- [Preparing a host](docs/hosts.md): `depper host init` and `host status`, hardening options, then the manual steps (accounts, SSH keys, known_hosts, linger, firewall) and `depper doctor`.
 - [Deployments](docs/deployments.md): releases, the deploy transaction, automatic restore, rollback, locking.
 - [Secrets](docs/secrets.md): dotenv format, storage, fingerprints, rotation, threat model.
 - [Containers](docs/containers.md): docker and podman, image and compose modes.

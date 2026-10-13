@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `depper host init ADMIN@HOST [REPO]` prepares a fresh Debian/Ubuntu or Fedora/RHEL host over SSH, as root or a user with passwordless sudo. It pins the host key after you confirm its fingerprint (default file `REPO/.depper/known_hosts`, mode 600), creates an unprivileged deploy user with your public key, enables lingering and starts its systemd user manager, installs `rsync` and the container engine the configuration uses, runs `depper doctor` as the deploy user, and writes `host`, `user`, `port`, `known_hosts`, and `identity_file` into `[deploy]` (or `[targets.NAME]`) with a minimal edit that keeps comments. Every step is checked first, so a second run changes nothing. It prints the plan and asks before applying; `--dry-run` changes nothing, and `--yes` skips the questions (required without a terminal).
+- Opt-in options for `host init`: `--harden-ssh` (a `10-depper.conf` sshd drop-in that disables password and keyboard-interactive login, validated with `sshd -t` and `sshd -T` and by new logins before and after the reload, removed again on failure), `--firewall PORTS` (ufw or firewalld; the SSH port is always included), `--auto-updates` (unattended-upgrades or dnf-automatic), `--tailscale-authkey-env NAME` (installs Tailscale; the key is read from the environment and never appears in a command line, output, or the host record), `--cloudflared`, and `--container podman|docker|none`. Also `--user`, `--port`, `--identity`, `--key`, `--known-hosts`, and `--no-write-config`.
+- `/etc/depper/host.json`, a root-owned, secret-free record of what `host init` set up (version, deploy user, engine, applied steps, installed packages, hardening).
+- `depper host status [REPO]` reads that record and the live state as the deploy user and reports `pass`, `warn`, `fail`, or `info` per check, with `--json` output; exit status 1 when a check fails.
+- `depper init` detects the project type and pre-fills `depper.toml`. Detectors, in precedence order: Docker Compose, Dockerfile, Go, Node.js, Python, Rust, static site, with a generic template as the fallback. Inferred lines carry a comment naming their source, and warnings and server requirements appear in the header. `--print` writes the configuration to standard output, `--force` replaces an existing `depper.toml`, and `--json` reports the detection. Nothing in the repository is executed and `.env` files are not read.
+- `.github/workflows/e2e.yml`, an end-to-end test on a real Ubuntu runner that exercises `host init`, deploy, rollback, secrets, locks, `ssh -W` health checks, podman (build, image, and compose modes), SSH hardening, and ufw. It runs on pushes to `main` and `feature/**` and on `workflow_dispatch`.
+- Documentation: `docs/hosts.md` starts with `host init`, hardening, `host status`, and a support status note; the manual steps follow.
+
+### Changed
+
+- `depper init` now overwrites an existing `depper.toml` only with `--force`, and still refuses when a `deploy.toml` exists. Container projects get `engine = "podman"`.
+- Compose validation runs `compose config` with its output discarded instead of `compose config --quiet`, which podman-compose (the provider of `podman compose` on Ubuntu 24.04) does not accept.
+- Remote scripts no longer trust an inherited `XDG_RUNTIME_DIR` that the deploy user does not own, and drop `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` values that point at another user's directories. A host whose `/etc/environment` sets another user's XDG directories still breaks that user's systemd user manager; remove those lines (see [Preparing a host](docs/hosts.md#another-users-xdg-variables-in-etcenvironment)).
+- The README quick start is now `depper init`, `depper host init root@SERVER`, `depper deploy`; the manual path is documented in `docs/hosts.md`.
+
+### Support status
+
+`host init` has been verified on a real Ubuntu 24.04 host only: `openssh-server` and `ssh.socket` reload, apt packages, `useradd`, lingering, subordinate ids, sshd hardening and ufw, `ssh -W` health checks, rsync, podman in build, image, and compose modes, and secrets push, rollback, and unlock. Fedora/RHEL (`dnf`, `firewalld`, `dnf-automatic`), Tailscale, `cloudflared` installation, the docker engine, a `sudo` administrator, SSH ports other than 22, and IPv6 have not been tested on real hosts.
+
 ## [0.2.0] - 2026-10-13
 
 The tool is renamed from `deployer` to `depper` and rewritten in Go as a single binary. Local requirements are `ssh` and `rsync`; Python is no longer needed on either side.
@@ -64,5 +87,6 @@ Initial release of the Python tool `deployer`.
 - Optional Cloudflare Tunnel support with an owned tunnel per service and `tunnel`, `tunnel-status`, `tunnel-logs`, and `tunnel-stop` commands.
 - Per-service deployment lock.
 
+[Unreleased]: https://github.com/frgmt0/depper/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/frgmt0/depper/releases/tag/v0.2.0
 [0.1.0]: https://github.com/frgmt0/depper/commits/main

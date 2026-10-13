@@ -51,7 +51,7 @@ engine = "docker"
 compose = "compose.yaml"
 ```
 
-depper uses the compose plugin (`<engine> compose`). During setup it runs `compose config --quiet` (to validate the file) and `compose build` in the release directory. The unit runs `compose up --build --remove-orphans` and stops with `compose down`. Every one of these commands passes `--env-file /dev/null`, so a `.env` file in the repository or the release is ignored (see [How secrets reach containers](#how-secrets-reach-containers)). The compose project name is `depper-<name>`, lowercased, with `.` replaced by `_`. `ports`, `volumes`, `args`, and `command` are rejected in `depper.toml` in this mode; define them in the compose file.
+depper uses the compose plugin (`<engine> compose`). During setup it runs `compose config` with its output discarded (`>/dev/null`, to validate the file; not `--quiet`, which podman-compose does not accept) and `compose build` in the release directory. The unit runs `compose up --build --remove-orphans` and stops with `compose down`. Every one of these commands passes `--env-file /dev/null`, so a `.env` file in the repository or the release is ignored (see [How secrets reach containers](#how-secrets-reach-containers)). The compose project name is `depper-<name>`, lowercased, with `.` replaced by `_`. `ports`, `volumes`, `args`, and `command` are rejected in `depper.toml` in this mode; define them in the compose file.
 
 ## The generated unit
 
@@ -146,6 +146,10 @@ Visibility: the container's environment is stored by the engine, so `docker insp
 Pruning a release deletes its image tag (`rmi`), and also removes images labelled `depper.service=<name>` for this service whose release no longer exists. A failed deploy removes the image it built; a deploy interrupted with Ctrl-C leaves the release, and its image, until the next successful deploy prunes the discarded release. Volumes and named compose volumes are never removed by depper.
 
 ## Host requirements
+
+`depper host init` installs the engine for you. Without `--container`, it installs the engine that `depper.toml` resolves `[container].engine` to (`docker` when the key is unset) and nothing when there is no `[container]`; `--container podman|docker|none` overrides that. `depper init` writes `engine = "podman"` for container projects, so a detected container project gets rootless podman by default. For podman it also installs the rootless helpers and adds subordinate id ranges for the deploy user; for docker it adds the deploy user to the `docker` group, which is root-equivalent (see below), and enables `docker.service`. docker is refused on RHEL, CentOS, Rocky, and AlmaLinux, which have no distribution package. Compose mode additionally needs a compose provider, which `host init` does not install: on Ubuntu, `podman compose` needs `podman-compose` (the end-to-end test installs it) or the docker compose plugin. The details and the support status are in [Preparing a host](hosts.md#container-engine). Only podman on Ubuntu 24.04 has been verified on a real host.
+
+Requirements, whether you use `host init` or prepare the host yourself:
 
 - The engine binary (`docker` or `podman`) installed on the host, found on the non-interactive SSH `PATH`. `depper doctor` fails if it is missing.
 - Compose mode needs the compose plugin: `docker compose` (v2), or a working `podman compose` provider.
