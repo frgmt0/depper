@@ -876,7 +876,7 @@ func TestHardenSSHRevertTimerFiresWhenAdminLoginFails(t *testing.T) {
 	o.HardenSSH = true
 	h.write("deny-admin-after-reload", "", 0o644)
 	r := h.runner()
-	r.revertDelay, r.revertGrace = time.Second, 2*time.Second
+	r.revertDelay, r.revertGrace = 5*time.Second, 3*time.Second
 	_, err := r.Init(context.Background(), o)
 	if err == nil {
 		t.Fatal("hardening succeeded although the admin cannot log in")
@@ -911,7 +911,7 @@ func TestHardenSSHRevertTimerFiresWhenAdminLoginFails(t *testing.T) {
 	// The timer is armed before the drop-in is written, so an interrupted
 	// run is undone as well.
 	logs := h.read("systemd-run.log")
-	if !strings.Contains(logs, "--unit=depper-ssh-revert --on-active=1s /bin/sh -c") || !strings.Contains(logs, "10-depper.conf") {
+	if !strings.Contains(logs, "--unit=depper-ssh-revert --on-active=5s /bin/sh -c") || !strings.Contains(logs, "10-depper.conf") {
 		t.Errorf("systemd-run.log = %q", logs)
 	}
 }
