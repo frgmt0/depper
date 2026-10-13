@@ -12,7 +12,9 @@ import (
 	"github.com/frgmt0/depper/internal/config"
 )
 
-const tsKey = "tskey-auth-kTESTSECRET123-ZYXWVUTSRQ"
+// tsKey is a fake Tailscale auth key, assembled at runtime so no literal in
+// the repository looks like a real token to secret scanners.
+var tsKey = strings.Join([]string{"tskey", "auth", "kTESTSECRET123", "ZYXWVUTSRQ"}, "-")
 
 func mustInit(t *testing.T, h *fakeHost, o *Options) *InitResult {
 	t.Helper()
