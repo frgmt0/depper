@@ -111,8 +111,35 @@ type Facts struct {
 	AutoUpdatesTimer string                 `json:"auto_updates_timer,omitempty"`
 	TailscaleUp      bool                   `json:"tailscale_up"`
 
+	// SystemdVersion is the major version from `systemctl --version`
+	// (0 when unknown).
+	SystemdVersion int `json:"systemd_version,omitempty"`
+	// SSHDRootBase is the PermitRootLogin sshd would use without depper's
+	// drop-in ("" when it could not be determined).
+	SSHDRootBase string `json:"sshd_permitrootlogin_without_dropin,omitempty"`
+	// SSHSocketPorts are the ports of ssh.socket when it is active
+	// (socket-activated sshd listens there, whatever sshd -T says).
+	SSHSocketPorts []int `json:"ssh_socket_ports,omitempty"`
+	// Guards is the state of each automatic revert (depper-ssh-revert,
+	// depper-firewall-revert) left on the host.
+	Guards map[string]GuardState `json:"guards,omitempty"`
+
 	Record *Record `json:"record,omitempty"`
 }
+
+// GuardState is what the host says about one automatic revert.
+type GuardState struct {
+	// Timer is the SubState of UNIT.timer ("waiting" while armed).
+	Timer string `json:"timer"`
+	// Service is the ActiveState of UNIT.service.
+	Service string `json:"service"`
+	// Markers is true when revert markers of an unverified change exist.
+	Markers bool `json:"markers"`
+}
+
+// Pending reports that a guarded change of an earlier run was neither
+// verified nor reverted.
+func (g GuardState) Pending() bool { return g.Timer == "waiting" || g.Markers }
 
 // pkgReq is one package requirement: satisfied when the package is installed
 // or, when Cmd is set, when the command exists (curl-minimal and
@@ -305,9 +332,27 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`  if t=$(sshd -T 2>&1); then`,
 		`    echo sshd_t=1`,
 		`    printf '%s\n' "$t" | awk '$1 == "passwordauthentication" || $1 == "kbdinteractiveauthentication" || $1 == "permitrootlogin" || $1 == "pubkeyauthentication" || $1 == "usepam" { print "sshd_" $1 "=" $2 }'`,
-		`    printf 'sshd_ports=%s\n' "$(printf '%s\n' "$t" | awk '$1 == "port" { printf "%s ", $2 }')"`,
+		// Port lines, and the port of every ListenAddress (host:port,
+		// [v6]:port), which sshd -T always prints with a port.
+		`    printf 'sshd_ports=%s\n' "$(printf '%s\n' "$t" | awk '$1 == "port" { printf "%s ", $2 } $1 == "listenaddress" { n = split($2, a, ":"); if (n > 1) printf "%s ", a[n] }')"`,
 		`  else echo sshd_t=0; printf 'sshd_t_msg=%s\n' "$(printf '%s' "$t" | tr '\n' ' ' | head -c 300)"; fi`,
+		// PermitRootLogin as sshd would read it without depper's drop-in:
+		// sshd -T on a copy of the configuration that leaves it out.
+		`  if test -f ` + r.p(SSHDropIn) + `; then`,
+		`    depper_bt=$(mktemp -d) && mkdir "$depper_bt/d" && {`,
+		`      for f in ` + r.p(sshdDropInD) + `/*.conf; do test -f "$f" || continue; test "${f##*/}" = ` + sshDropInName + ` && continue; cp -p "$f" "$depper_bt/d/"; done`,
+		`      awk -v d="$depper_bt/d/*.conf" 'tolower($1) == "include" { for (i = 2; i <= NF; i++) if ($i ~ /^(\/etc\/ssh\/)?sshd_config\.d\/\*\.conf$/) $i = d } { print }' ` + r.p(sshdMain) + ` > "$depper_bt/sshd_config"`,
+		`      printf 'sshd_root_base=%s\n' "$(sshd -T -f "$depper_bt/sshd_config" 2>/dev/null | awk '$1 == "permitrootlogin" { print $2 }')"`,
+		`    }`,
+		`    rm -rf "$depper_bt"`,
+		`  fi`,
 		`fi`,
+		`if systemctl is-active --quiet ssh.socket 2>/dev/null; then printf 'ssh_socket_listen=%s\n' "$(systemctl show -p Listen --value ssh.socket 2>/dev/null | tr '\n' ' ')"; fi`,
+		`printf 'systemd_version=%s\n' "$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 }')"`,
+		`for g in ` + shell.Join(guardUnits...) + `; do`,
+		`  mk=0; for m in ` + shell.Join(guardMarkers...) + `; do test -e ` + r.p(guardStateDir) + `/"$g/$m" && mk=1; done`,
+		`  printf 'guard_%s=%s|%s|%s\n' "$g" "$(systemctl show -p SubState --value "$g.timer" 2>/dev/null)" "$(systemctl show -p ActiveState --value "$g.service" 2>/dev/null)" "$mk"`,
+		`done`,
 		`if grep -Eiq '^[[:space:]]*Include[[:space:]]+(/etc/ssh/)?sshd_config\.d/\*\.conf' ` + r.p(sshdMain) + ` 2>/dev/null; then echo sshd_include=1; fi`,
 		`if test -f ` + r.p(SSHDropIn) + `; then printf 'sshd_dropin=%s\n' "$(base64 < ` + r.p(SSHDropIn) + ` | tr -d '\n')"; fi`,
 		// sshd keeps the first value it reads: the main file up to its
@@ -395,7 +440,7 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 // sshdMetaKeys are sshd_* facts that are not `sshd -T` settings.
 var sshdMetaKeys = map[string]bool{
 	"sshd_t": true, "sshd_t_msg": true, "sshd_ports": true, "sshd_include": true,
-	"sshd_dropin": true, "sshd_conflicts": true, "sshd_unit": true, "sshd_match": true,
+	"sshd_dropin": true, "sshd_conflicts": true, "sshd_unit": true, "sshd_match": true, "sshd_root_base": true,
 }
 
 // parseFacts turns the facts output into Facts.
@@ -500,6 +545,23 @@ func parseFacts(out string) (*Facts, map[string]string, error) {
 		}
 	}
 	f.SSHDPorts = ports(m["sshd_ports"])
+	f.SSHSocketPorts = listenPorts(m["ssh_socket_listen"])
+	f.SystemdVersion, _ = strconv.Atoi(strings.TrimSpace(m["systemd_version"]))
+	f.SSHDRootBase = clean(m["sshd_root_base"])
+	for _, g := range guardUnits {
+		v, ok := m["guard_"+g]
+		if !ok {
+			continue
+		}
+		parts := strings.SplitN(v, "|", 3)
+		for len(parts) < 3 {
+			parts = append(parts, "")
+		}
+		if f.Guards == nil {
+			f.Guards = map[string]GuardState{}
+		}
+		f.Guards[g] = GuardState{Timer: clean(parts[0]), Service: clean(parts[1]), Markers: parts[2] == "1"}
+	}
 	if v, ok := m["sshd_dropin"]; ok {
 		data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(v))
 		if err != nil {
@@ -548,6 +610,28 @@ func ports(s string) []int {
 	}
 	sort.Ints(out)
 	return out
+}
+
+// listenPorts parses the Listen values of a socket unit ("[::]:22 (Stream)
+// 0.0.0.0:2222 (Stream) 22 (Stream)") into sorted TCP ports; datagram and
+// other non-stream listeners are skipped.
+func listenPorts(s string) []int {
+	f := strings.Fields(s)
+	var words []string
+	for i := 0; i < len(f); i++ {
+		if strings.HasPrefix(f[i], "(") {
+			continue
+		}
+		if i+1 < len(f) && strings.HasPrefix(f[i+1], "(") && f[i+1] != "(Stream)" {
+			continue
+		}
+		w := f[i]
+		if j := strings.LastIndex(w, ":"); j >= 0 {
+			w = w[j+1:]
+		}
+		words = append(words, w)
+	}
+	return ports(strings.Join(words, " "))
 }
 
 // gatherFacts runs the facts script as the admin.

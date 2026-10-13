@@ -910,8 +910,21 @@ func TestHardenSSHRevertTimerFiresWhenAdminLoginFails(t *testing.T) {
 	}
 	// The timer is armed before the drop-in is written, so an interrupted
 	// run is undone as well.
+	// The timer fires on time (AccuracySec=1s, no randomized delay) and
+	// runs the revert script, which acts on the markers written before.
 	logs := h.read("systemd-run.log")
-	if !strings.Contains(logs, "--unit=depper-ssh-revert --on-active=5s /bin/sh -c") || !strings.Contains(logs, "10-depper.conf") {
+	if !strings.Contains(logs, "--unit=depper-ssh-revert --property=Type=oneshot --timer-property=AccuracySec=1s --timer-property=RandomizedDelaySec=0 --on-active=5s /bin/sh "+h.FS+"/var/lib/depper/guard/depper-ssh-revert/revert.sh timer\n") {
 		t.Errorf("systemd-run.log = %q", logs)
+	}
+	if script := h.read("fs/var/lib/depper/guard/depper-ssh-revert/revert.sh"); !strings.Contains(script, "10-depper.conf") || !strings.Contains(script, "had-none") {
+		t.Errorf("revert.sh = %q", script)
+	}
+	if got := h.read("fs/var/lib/depper/guard/depper-ssh-revert/reverted"); !strings.HasPrefix(got, "timer ") {
+		t.Errorf("reverted marker = %q, want the timer", got)
+	}
+	for _, m := range []string{"had-none", "had-prev", "prev"} {
+		if h.has("fs/var/lib/depper/guard/depper-ssh-revert/" + m) {
+			t.Errorf("marker %s left after the revert", m)
+		}
 	}
 }

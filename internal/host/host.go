@@ -165,6 +165,9 @@ type Runner struct {
 	// waits past it before checking that the revert worked (0: 15s).
 	revertDelay time.Duration
 	revertGrace time.Duration
+	// interruptAt makes host init stop right after the named guarded step
+	// changed the host, as if it were killed there (tests only).
+	interruptAt string
 }
 
 func (r *Runner) now() time.Time {

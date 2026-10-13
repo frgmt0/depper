@@ -65,18 +65,22 @@ func Prelude() []string {
 // and ~/.config. podman refuses a runtime directory it does not own, so
 // unless the inherited XDG_RUNTIME_DIR exists and is owned by the current
 // user (test -O), both variables are set to /run/user/$(id -u).
-// XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_CACHE_HOME and XDG_STATE_HOME only
-// need to be usable, not owned: each is kept when it names a directory the
-// current user can write to, or a missing one whose parent the user can
-// write to; otherwise it is unset, so the defaults under $HOME apply. The
-// lines work with and without set -u and leave no helper variables behind.
+// XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_CACHE_HOME and XDG_STATE_HOME are
+// kept only when they cannot be planted by another user: the directory
+// exists, is owned by the current user (test -O) and is neither group- nor
+// other-writable, or it does not exist and its parent directory meets the
+// same test. Otherwise the variable is unset, so the defaults under $HOME
+// apply. Symlinks are followed (test -O and ls -L judge the target, not the
+// link), so a link to a private directory is kept and a link to a shared one
+// is dropped. The lines work with and without set -u and leave no helper
+// variables behind.
 func SessionEnv() []string {
 	return []string{
 		`if test -z "${XDG_RUNTIME_DIR:-}" || ! test -d "$XDG_RUNTIME_DIR" || ! test -O "$XDG_RUNTIME_DIR"; then XDG_RUNTIME_DIR="/run/user/$(id -u)"; DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; fi`,
 		`export XDG_RUNTIME_DIR`,
 		`export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"`,
-		`for depper_xdg in XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME; do eval "depper_dir=\${$depper_xdg:-}"; if test -n "$depper_dir" && ! { test -d "$depper_dir" && test -w "$depper_dir"; } && ! { ! test -e "$depper_dir" && test -w "$(dirname -- "$depper_dir")"; }; then unset "$depper_xdg"; fi; done`,
-		`unset depper_xdg depper_dir`,
+		`for depper_xdg in XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME; do eval "depper_dir=\${$depper_xdg:-}"; if test -n "$depper_dir"; then if test -e "$depper_dir" || test -L "$depper_dir"; then depper_chk=$depper_dir; else depper_chk=$(dirname -- "$depper_dir"); fi; depper_mode=; if test -d "$depper_chk" && test -O "$depper_chk"; then depper_mode=$(ls -ldL -- "$depper_chk" | cut -c1-10); fi; case "$depper_mode" in ""|?????w*|????????w*) unset "$depper_xdg";; esac; fi; done`,
+		`unset depper_xdg depper_dir depper_chk depper_mode`,
 	}
 }
 

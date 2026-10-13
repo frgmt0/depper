@@ -84,15 +84,24 @@ func TestGuardedChangesDisarmTheirTimers(t *testing.T) {
 	o.Firewall = []int{80}
 	o.HardenSSH = true
 	mustInit(t, h, o)
+	// The fake timer polls its unit every 0.2 s and logs "cancelled" once
+	// it sees the timer stopped, so this proves each one was stopped while
+	// still waiting, long before it was due (20 s), and never ran.
+	h.waitEvent("cancelled depper-firewall-revert\n", 5*time.Second)
+	h.waitEvent("cancelled depper-ssh-revert\n", 5*time.Second)
 	ev := h.read("timer-events")
-	if !strings.Contains(ev, "armed depper-firewall-revert") || !strings.Contains(ev, "armed depper-ssh-revert") || strings.Contains(ev, "fired") {
+	if !strings.Contains(ev, "armed depper-firewall-revert") || !strings.Contains(ev, "armed depper-ssh-revert") || strings.Contains(ev, "fired") || strings.Contains(ev, "started") {
 		t.Errorf("timer events = %q", ev)
 	}
 	if h.has("units/depper-firewall-revert.timer.active") || h.has("units/depper-ssh-revert.timer.active") {
 		t.Error("a revert timer is still armed")
 	}
-	if h.has("fs/etc/ssh/sshd_config.d/10-depper.conf.depper-prev") {
-		t.Error("the drop-in backup was left behind")
+	h.noGuardMarkers(sshRevertUnit)
+	h.noGuardMarkers(firewallRevertUnit)
+	for _, u := range guardUnits {
+		if h.has("fs" + guardStateDir + "/" + u + "/" + markStarted) {
+			t.Errorf("%s ran", u)
+		}
 	}
 	if !strings.Contains(h.Out.String(), "verified; disarmed depper-ssh-revert.timer") {
 		t.Errorf("output:\n%s", h.Out.String())
@@ -334,7 +343,8 @@ func TestTOMLScanner(t *testing.T) {
 			if sc.topLevel() != tt.top[i] {
 				t.Errorf("%q: line %d topLevel = %v", tt.lines, i, sc.topLevel())
 			}
-			sc.scan(l, headerRe.MatchString(l) && sc.topLevel())
+			_, _, hdr := parseTableHeader(l)
+			sc.scan(l, hdr && sc.topLevel())
 		}
 	}
 	// A header-looking element of a multi-line array is not a header.

@@ -354,9 +354,21 @@ if test "$1" = --user; then
   esac
   exit 0
 fi
+if test "$1" = --version; then
+  echo "systemd $(cat "$FAKE_ROOT/systemd-version" 2>/dev/null || echo 252) (fake)"
+  exit 0
+fi
 if test "$1" = show; then
-  for u; do :; done
-  if test -e "$S/$u.active"; then echo waiting; else echo dead; fi
+  prop=""; u=""
+  while test $# -gt 1; do case "$2" in -p) prop=$3; shift ;; --value) ;; *) u=$2 ;; esac; shift; done
+  case "$prop" in
+    SubState) case "$u" in *.timer) if test -e "$S/$u.active"; then echo waiting; elif test -e "$S/$u.loaded"; then echo elapsed; else echo dead; fi ;; *) if test -e "$S/$u.running"; then echo start; else echo dead; fi ;; esac ;;
+    ActiveState) if test -e "$S/$u.running"; then echo activating; elif test -e "$S/$u.active"; then echo active; else echo inactive; fi ;;
+    LoadState) if test -e "$S/$u.active" || test -e "$S/$u.loaded"; then echo loaded; else echo not-found; fi ;;
+    ActiveEnterTimestampMonotonic) cat "$S/$u.entered" 2>/dev/null || echo 0 ;;
+    Listen) cat "$FAKE_ROOT/$u.listen" 2>/dev/null ;;
+    *) echo "fake systemctl: unsupported property $prop" >&2; exit 1 ;;
+  esac
   exit 0
 fi
 cmd=""; units=""; now=no
@@ -376,18 +388,38 @@ case "$cmd" in
   start)
     for u in $units; do
       case "$u" in user@*.service) id=${u#user@}; id=${id%.service}; mkdir -p "$FS/run/user/$id"; : > "$FS/run/user/$id/manager" ;; esac
+      # A transient service of systemd-run runs its command now (oneshot:
+      # start returns when it finished); its timer has elapsed.
+      if test -f "$S/$u.argv"; then
+        t=${u%.service}.timer
+        rm -f "$S/$t.active"; : > "$S/$t.loaded"
+        echo "started $u" >> "$FAKE_ROOT/timer-events"
+        date +%s > "$S/$u.entered"; : > "$S/$u.running"
+        eval "$(cat "$S/$u.argv")" </dev/null; rc=$?
+        rm -f "$S/$u.running"
+        echo "done ${u%.service}" >> "$FAKE_ROOT/timer-events"
+        test "$rc" = 0 || exit "$rc"
+        continue
+      fi
       : > "$S/$u.active"; fwstart "$u"
     done ;;
   enable) for u in $units; do : > "$S/$u.enabled"; if test "$now" = yes; then : > "$S/$u.active"; fwstart "$u"; fi; done ;;
   disable) for u in $units; do rm -f "$S/$u.enabled"; if test "$now" = yes; then rm -f "$S/$u.active"; fi; done ;;
-  stop) for u in $units; do rm -f "$S/$u.active"; done ;;
+  stop)
+    for u in $units; do
+      case "$u" in *.timer) if test -f "$FAKE_ROOT/timer-stop-fails"; then echo "Failed to stop $u: Access denied" >&2; exit 1; fi; rm -f "$S/$u.loaded" ;; esac
+      rm -f "$S/$u.active"
+    done ;;
   reset-failed) ;;
   is-active) for u in $units; do test -e "$S/$u.active" || exit 3; done ;;
   is-enabled) for u in $units; do test -e "$S/$u.enabled" || exit 1; done ;;
   reload)
     for u in $units; do test -e "$S/$u.active" || { echo "Unit $u is not active." >&2; exit 1; }; done
     echo reload >> "$FAKE_ROOT/sshd-reloads"
-    echo reload >> "$FAKE_ROOT/events" ;;
+    echo reload >> "$FAKE_ROOT/events"
+    # timer-fires-on-reload: the armed ssh revert timer elapses right as
+    # sshd reloads the drop-in (once).
+    if test -f "$FAKE_ROOT/timer-fires-on-reload" && test -e "$S/depper-ssh-revert.timer.active"; then rm -f "$FAKE_ROOT/timer-fires-on-reload"; "$0" start depper-ssh-revert.service; fi ;;
   list-unit-files) for u in $units; do if test -e "$S/$u.file"; then echo "$u disabled"; fi; done ;;
   daemon-reload|restart) ;;
   *) echo "fake systemctl: unsupported $cmd" >&2; exit 1 ;;
@@ -398,23 +430,32 @@ esac
 // command unless the timer was stopped (disarmed) first.
 const fakeSystemdRun = `#!/bin/sh
 printf '%s\n' "systemd-run $*" >> "$FAKE_ROOT/systemd-run.log"
+test -f "$FAKE_ROOT/systemd-run-fails" && { echo "Failed to start transient timer unit: Access denied" >&2; exit 1; }
 unit=""; delay=1
 while test $# -gt 0; do
   case "$1" in
     --unit=*) unit=${1#--unit=} ;;
     --on-active=*) delay=${1#--on-active=}; delay=${delay%s} ;;
-    --*) ;;
+    --property=*|--timer-property=*|--quiet|--collect) ;;
+    --*) echo "fake systemd-run: unsupported option $1" >&2; exit 1 ;;
     *) break ;;
   esac
   shift
 done
+# timer-delay overrides --on-active (a timer that fires late or early).
+test -f "$FAKE_ROOT/timer-delay" && delay=$(cat "$FAKE_ROOT/timer-delay")
 S="$FAKE_ROOT/units"
 mkdir -p "$S"
+if test -e "$S/$unit.timer.active" || test -e "$S/$unit.timer.loaded"; then echo "Failed to start transient timer unit: Unit $unit.timer was already loaded or has a fragment file." >&2; exit 1; fi
+rm -f "$S/$unit.service.entered"
+argv=""; for a; do argv="$argv '$a'"; done
+printf '%s\n' "$argv" > "$S/$unit.service.argv"
 : > "$S/$unit.timer.active"
 echo "armed $unit" >> "$FAKE_ROOT/timer-events"
 # An external sh (not a subshell), so no descriptor of this script stays
-# open in the sleeping process.
-sh -c 'd=$1; S=$2; unit=$3; R=$4; shift 4; sleep "$d"; if test -e "$S/$unit.timer.active"; then rm -f "$S/$unit.timer.active"; echo "fired $unit" >> "$R/timer-events"; "$@"; echo "done $unit" >> "$R/timer-events"; fi' fake-timer "$delay" "$S" "$unit" "$FAKE_ROOT" "$@" </dev/null >/dev/null 2>&1 &
+# open in the sleeping process. It wakes every 0.2 s: a stopped timer is
+# reported as cancelled at once.
+sh -c 'd=$1; S=$2; unit=$3; R=$4; end=$(( $(date +%s) + d )); while test -e "$S/$unit.timer.active"; do if test "$(date +%s)" -ge "$end"; then rm -f "$S/$unit.timer.active"; : > "$S/$unit.timer.loaded"; echo "fired $unit" >> "$R/timer-events"; date +%s > "$S/$unit.service.entered"; : > "$S/$unit.service.running"; eval "$(cat "$S/$unit.service.argv")"; rm -f "$S/$unit.service.running"; echo "done $unit" >> "$R/timer-events"; exit 0; fi; sleep 0.2; done; echo "cancelled $unit" >> "$R/timer-events"' fake-timer "$delay" "$S" "$unit" "$FAKE_ROOT" </dev/null >/dev/null 2>&1 &
 `
 
 const fakeIP = `#!/bin/sh
@@ -467,7 +508,13 @@ const fakeSSHD = `#!/bin/sh
 printf '%s\n' "sshd $*" >> "$FAKE_ROOT/sshd.log"
 FS="$FAKE_ROOT/fs"
 main="$FS/etc/ssh/sshd_config"
-case "$1" in
+mode=$1
+while test $# -gt 1; do case "$2" in -f) main=$3; shift ;; esac; shift; done
+# The drop-in directory named by the Include line (/etc/... is in the fake
+# root; anything else, such as a temporary copy, is a real path).
+inc=$(awk 'tolower($1) == "include" { print $2; exit }' "$main")
+case "$inc" in /etc/*) inc="$FS$inc" ;; esac
+case "$mode" in
   -t)
     echo sshd-t >> "$FAKE_ROOT/events"
     if test -f "$FAKE_ROOT/sshd-t-fail"; then echo "10-depper.conf line 3: Bad configuration option" >&2; exit 255; fi ;;
@@ -478,15 +525,17 @@ case "$1" in
     {
       awk 'tolower($1) == "include" || tolower($1) == "match" { exit } { print }' "$main"
       if grep -qi '^Include' "$main"; then
-        for f in "$FS"/etc/ssh/sshd_config.d/*.conf; do test -f "$f" && awk 'tolower($1) == "match" { exit } { print }' "$f"; done
+        for f in $inc; do test -f "$f" && awk 'tolower($1) == "match" { exit } { print }' "$f"; done
         awk 'tolower($1) == "match" { exit } f { print } tolower($1) == "include" { f = 1 }' "$main"
       fi
     } | awk '
       { k = tolower($1) }
       k == "" || k ~ /^#/ || k == "include" { next }
+      k == "port" || k == "listenaddress" { all[k] = all[k] " " $2; next }
       !(k in v) { v[k] = tolower($2) }
       END {
-        if (!("port" in v)) v["port"] = "22"
+        if (!("port" in all)) all["port"] = " 22"
+        for (k in all) { n = split(all[k], x, " "); for (i = 1; i <= n; i++) print k, x[i] }
         if (!("passwordauthentication" in v)) v["passwordauthentication"] = "yes"
         if (!("kbdinteractiveauthentication" in v)) v["kbdinteractiveauthentication"] = "yes"
         if (!("permitrootlogin" in v)) v["permitrootlogin"] = "prohibit-password"

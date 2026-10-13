@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 
@@ -65,11 +67,7 @@ func (e *configEdit) describe() string {
 	return strings.Join(parts, "; ")
 }
 
-var (
-	headerRe   = regexp.MustCompile(`^\s*\[\s*([^\[\]]+?)\s*\]\s*(#.*)?$`)
-	arrayHdrRe = regexp.MustCompile(`^\s*\[\[`)
-	keyLineRe  = regexp.MustCompile(`^(\s*)("?)([A-Za-z0-9_-]+)("?)\s*=(.*)$`)
-)
+var keyLineRe = regexp.MustCompile(`^(\s*)("?)([A-Za-z0-9_-]+)("?)\s*=(.*)$`)
 
 // tomlString renders s as a TOML basic string. Callers pass validated
 // values without control characters.
@@ -77,18 +75,134 @@ func tomlString(s string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`
 }
 
-// normalizeTable turns a header body like ` targets . "prod" ` into
-// "targets.prod".
-func normalizeTable(h string) string {
-	parts := strings.Split(h, ".")
-	for i, p := range parts {
-		p = strings.TrimSpace(p)
-		if len(p) >= 2 && (p[0] == '"' || p[0] == '\'') && p[len(p)-1] == p[0] {
-			p = p[1 : len(p)-1]
-		}
-		parts[i] = p
+// parseTableHeader recognises a TOML table header line: "[" or "[[", a dotted
+// key of bare keys (A-Za-z0-9_-), basic strings ("..." with escapes) and
+// literal strings ('...'), optional whitespace around the dots, "]" or "]]",
+// then optional whitespace and an optional # comment. key is the normalized
+// path (quotes removed, escapes resolved, parts joined with "."), e.g.
+// `[ targets . "prod" ]` gives "targets.prod". array reports "[[". ok is
+// false for any other line, including a malformed header. The caller must
+// only offer lines that start outside any multi-line value (tomlScanner).
+func parseTableHeader(line string) (key string, array, ok bool) {
+	s := strings.TrimLeft(line, " \t")
+	if !strings.HasPrefix(s, "[") {
+		return "", false, false
 	}
-	return strings.Join(parts, ".")
+	s = s[1:]
+	if strings.HasPrefix(s, "[") {
+		array, s = true, s[1:]
+	}
+	var parts []string
+	for {
+		s = strings.TrimLeft(s, " \t")
+		var part string
+		part, s, ok = parseHeaderKeyPart(s)
+		if !ok {
+			return "", false, false
+		}
+		parts = append(parts, part)
+		s = strings.TrimLeft(s, " \t")
+		if strings.HasPrefix(s, ".") {
+			s = s[1:]
+			continue
+		}
+		break
+	}
+	closer := "]"
+	if array {
+		closer = "]]"
+	}
+	if !strings.HasPrefix(s, closer) {
+		return "", false, false
+	}
+	s = strings.TrimLeft(s[len(closer):], " \t")
+	if s != "" && s[0] != '#' {
+		return "", false, false
+	}
+	return strings.Join(parts, "."), array, true
+}
+
+// parseHeaderKeyPart reads one bare, basic-string or literal-string key from
+// the start of s and returns it with the remaining text.
+func parseHeaderKeyPart(s string) (part, rest string, ok bool) {
+	if s == "" {
+		return "", "", false
+	}
+	switch s[0] {
+	case '"':
+		var b strings.Builder
+		for i := 1; i < len(s); i++ {
+			switch c := s[i]; c {
+			case '"':
+				return b.String(), s[i+1:], true
+			case '\\':
+				r, n, valid := unescapeTOML(s[i+1:])
+				if !valid {
+					return "", "", false
+				}
+				b.WriteRune(r)
+				i += n
+			default:
+				if c < 0x20 && c != '\t' || c == 0x7f {
+					return "", "", false
+				}
+				b.WriteByte(c)
+			}
+		}
+		return "", "", false
+	case '\'':
+		end := strings.IndexByte(s[1:], '\'')
+		if end < 0 {
+			return "", "", false
+		}
+		return s[1 : end+1], s[end+2:], true
+	}
+	end := 0
+	for end < len(s) && (s[end] >= 'a' && s[end] <= 'z' || s[end] >= 'A' && s[end] <= 'Z' || s[end] >= '0' && s[end] <= '9' || s[end] == '_' || s[end] == '-') {
+		end++
+	}
+	if end == 0 {
+		return "", "", false
+	}
+	return s[:end], s[end:], true
+}
+
+// unescapeTOML decodes the escape sequence after a backslash in a basic
+// string. n is the number of bytes of s it consumed.
+func unescapeTOML(s string) (r rune, n int, ok bool) {
+	if s == "" {
+		return 0, 0, false
+	}
+	switch s[0] {
+	case 'b':
+		return '\b', 1, true
+	case 't':
+		return '\t', 1, true
+	case 'n':
+		return '\n', 1, true
+	case 'f':
+		return '\f', 1, true
+	case 'r':
+		return '\r', 1, true
+	case 'e':
+		return 0x1b, 1, true
+	case '"', '\\':
+		return rune(s[0]), 1, true
+	case 'u', 'U':
+		width := 4
+		if s[0] == 'U' {
+			width = 8
+		}
+		if len(s) < 1+width {
+			return 0, 0, false
+		}
+		v, err := strconv.ParseUint(s[1:1+width], 16, 32)
+		if err != nil || v > unicode.MaxRune || v >= 0xd800 && v <= 0xdfff {
+			return 0, 0, false
+		}
+		return rune(v), 1 + width, true
+	}
+	return 0, 0, false
 }
 
 // tomlScanner follows the lexical state of a TOML document line by line:
@@ -245,14 +359,12 @@ func editConfigText(text, table string, values []configValue) (string, []ConfigC
 			sc.scan(line, false)
 			continue
 		}
-		trimmed := strings.TrimSpace(line)
-		if arrayHdrRe.MatchString(line) {
-			current = "\x00array"
-			sc.scan(line, true)
-			continue
-		}
-		if m := headerRe.FindStringSubmatch(line); m != nil && !strings.HasPrefix(trimmed, "#") {
-			current = normalizeTable(m[1])
+		if name, array, ok := parseTableHeader(line); ok {
+			current = name
+			if array {
+				// [[x]] tables are never edited.
+				current = "\x00array"
+			}
 			if current == table {
 				if headerAt >= 0 {
 					return "", nil, fmt.Errorf("[%s] appears more than once", table)

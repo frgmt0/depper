@@ -41,10 +41,14 @@ type Step struct {
 
 	lines    []string
 	packages []string
-	// revert undoes a guarded step (firewall, harden-ssh); it runs from
-	// a transient systemd timer armed before the step and disarmed once new
-	// logins succeed.
-	revert []string
+	// prepare and revert belong to a guarded step (the firewall): prepare
+	// writes the markers of what to undo into the guard's state directory
+	// ($d) before the step runs; revert undoes it, acting only on those
+	// markers and removing each one it handled. revert runs from a transient
+	// systemd timer armed before the step and disarmed once new logins
+	// succeed, or at once when the step fails.
+	prepare []string
+	revert  []string
 }
 
 // Plan is what host init will do.
@@ -54,8 +58,9 @@ type Plan struct {
 	// Packages are the packages depper installs (for the record).
 	Packages []string `json:"packages"`
 
-	// rootBefore is the effective PermitRootLogin before hardening and
-	// hardenRoot whether the drop-in sets PermitRootLogin.
+	// rootBefore is the PermitRootLogin sshd uses without depper's drop-in
+	// and hardenRoot whether the drop-in sets PermitRootLogin (only when
+	// rootBefore is yes).
 	rootBefore string
 	hardenRoot bool
 }
@@ -106,6 +111,7 @@ func firewallPorts(o *Options, f *Facts) []int {
 	ports := unionInts(o.Firewall, []int{o.Port})
 	if f != nil {
 		ports = unionInts(ports, f.SSHDPorts)
+		ports = unionInts(ports, f.SSHSocketPorts)
 	}
 	return ports
 }
@@ -137,6 +143,12 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 			id = "unknown (no /etc/os-release)"
 		}
 		return nil, &ErrUnsupported{Reason: fmt.Sprintf("unsupported operating system %q (ID_LIKE %q): depper host init supports Debian/Ubuntu (apt) and Fedora/RHEL/CentOS/Rocky/AlmaLinux (dnf)", id, f.OSLike)}
+	}
+	if f.OSID == "amzn" {
+		major, _, _ := strings.Cut(f.VersionID, ".")
+		if n, err := strconv.Atoi(major); err != nil || n < 2023 {
+			return nil, &ErrUnsupported{Reason: fmt.Sprintf("Amazon Linux %s is not supported: depper host init supports Amazon Linux 2023 and later (Amazon Linux 2 has no dnf and an older systemd)", shellName(f.VersionID))}
+		}
 	}
 	if !f.Systemd {
 		return nil, &ErrUnsupported{Reason: fmt.Sprintf("%s is not running systemd (no /run/systemd/system); depper needs a systemd user manager", o.Host)}
@@ -418,13 +430,10 @@ fi`
 	// Runner.guarded): a timed revert is armed first and disarmed only after
 	// new admin and deploy logins succeed.
 	if o.Firewall != nil {
-		if f.Commands["systemd-run"] == "" {
-			return nil, fmt.Errorf("--firewall: systemd-run was not found on the host; depper needs it to arm the automatic revert")
-		}
 		want := firewallPorts(o, f)
 		portList := intsString(want)
-		if len(f.SSHDPorts) > 0 && !containsInt(f.SSHDPorts, o.Port) {
-			p.warn("host init connects to port %d, but sshd listens on %s: assuming a port forward or NAT in between, so the firewall allows %s", o.Port, intsString(f.SSHDPorts), portList)
+		if listen := unionInts(f.SSHDPorts, f.SSHSocketPorts); len(listen) > 0 && !containsInt(listen, o.Port) {
+			p.warn("host init connects to port %d, but sshd listens on %s: assuming a port forward or NAT in between, so the firewall allows %s", o.Port, intsString(listen), portList)
 		}
 		if f.Family == FamilyDebian {
 			s = p.add(&Step{ID: StepFirewall, Title: "Firewall (ufw): allow TCP " + portList})
@@ -447,13 +456,12 @@ fi`
 				}
 				if !f.UFWActive {
 					s.lines = append(s.lines, "ufw --force enable")
-					s.revert = []string{"ufw --force disable"}
 					parts = append(parts, "enable ufw")
-				} else {
-					for _, port := range add {
-						s.revert = append(s.revert, "ufw delete allow "+strconv.Itoa(port)+"/tcp")
-					}
 				}
+				s.prepare, s.revert = firewallMarkers(!f.UFWActive, add,
+					[]string{"ufw --force disable"},
+					nil,
+					func(pt string) []string { return []string{"ufw delete allow " + pt + " || true"} })
 				s.Detail = strings.Join(parts, ", then ") + "; reverted automatically unless new admin and " + o.User + " logins succeed"
 			}
 		} else {
@@ -500,26 +508,31 @@ fi`
 							`firewall-cmd --zone="$depper_zone" --add-port=`+pt,
 							`firewall-cmd --permanent --zone="$depper_zone" --add-port=`+pt)
 					}
-					s.revert = append(s.revert, zone...)
-					for _, port := range add {
-						pt := strconv.Itoa(port) + "/tcp"
-						s.revert = append(s.revert,
-							`firewall-cmd --zone="$depper_zone" --remove-port=`+pt+` || true`,
-							`firewall-cmd --permanent --zone="$depper_zone" --remove-port=`+pt+` || true`)
-					}
+					s.prepare, s.revert = firewallMarkers(false, add, nil, zone,
+						func(pt string) []string {
+							return []string{
+								`firewall-cmd --zone="$depper_zone" --remove-port=` + pt + ` || true`,
+								`firewall-cmd --permanent --zone="$depper_zone" --remove-port=` + pt + ` || true`,
+							}
+						})
 					s.Detail = "allow " + intsString(add) + " (runtime and permanent)"
 				} else {
 					for _, port := range add {
 						s.lines = append(s.lines, `firewall-offline-cmd --zone="$depper_zone" --add-port=`+strconv.Itoa(port)+"/tcp")
 					}
 					s.lines = append(s.lines, "systemctl enable --now firewalld.service")
-					s.revert = []string{"systemctl disable --now firewalld.service"}
+					s.prepare, s.revert = firewallMarkers(true, nil, []string{"systemctl disable --now firewalld.service"}, nil, nil)
 					s.Detail = "allow " + intsString(add) + ", then enable firewalld"
 					if len(add) == 0 {
 						s.Detail = "enable firewalld"
 					}
 				}
 				s.Detail += "; reverted automatically unless new admin and " + o.User + " logins succeed"
+			}
+		}
+		if s.Change {
+			if err := guardSupported(f, "--firewall"); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -597,8 +610,6 @@ fi`
 		switch {
 		case f.Commands["sshd"] == "":
 			return nil, fmt.Errorf("--harden-ssh: sshd was not found on the host")
-		case f.Commands["systemd-run"] == "":
-			return nil, fmt.Errorf("--harden-ssh: systemd-run was not found on the host; depper needs it to arm the automatic revert")
 		case !f.SSHDInclude:
 			return nil, fmt.Errorf("--harden-ssh: %s does not Include sshd_config.d/*.conf, so a drop-in would be ignored. depper does not edit the main sshd_config; add `Include /etc/ssh/sshd_config.d/*.conf` at its top yourself, or drop --harden-ssh", sshdMain)
 		case len(f.SSHDConflicts) > 0:
@@ -606,10 +617,18 @@ fi`
 		case !f.SSHDTest:
 			return nil, fmt.Errorf("--harden-ssh: the current sshd configuration does not validate (sshd -T: %s); fix it first", f.SSHDTestOutput)
 		}
-		// PermitRootLogin is only ever tightened: written when it is yes
-		// now, or kept when depper's drop-in already carries it.
+		// PermitRootLogin is only ever tightened: the drop-in sets it only
+		// when sshd would otherwise use yes. The value is read without
+		// depper's own drop-in, so a line an earlier build wrote is dropped
+		// again when the rest of the configuration is stricter.
 		p.rootBefore = f.SSHD["permitrootlogin"]
-		p.hardenRoot = p.rootBefore == "yes" || (f.SSHDDropInSet && strings.Contains(f.SSHDDropIn, "\n"+rootLoginLine+"\n"))
+		if f.SSHDDropInSet {
+			if f.SSHDRootBase == "" {
+				return nil, fmt.Errorf("--harden-ssh: cannot determine PermitRootLogin without depper's drop-in (sshd -T on a copy of the configuration without %s failed); check `sshd -T` on the host", sshDropInName)
+			}
+			p.rootBefore = f.SSHDRootBase
+		}
+		p.hardenRoot = p.rootBefore == "yes"
 		want := dropInContent(p.hardenRoot)
 		if f.SSHDDropInSet && f.SSHDDropIn == want && sshdHardened(f.SSHD) {
 			s.Detail = "drop-in present and in effect"
@@ -620,6 +639,9 @@ fi`
 				root = "PermitRootLogin prohibit-password"
 			}
 			s.Detail = "PasswordAuthentication no, KbdInteractiveAuthentication no, " + root + "; verified with sshd -t and new " + o.User + " and " + o.Admin + " logins; reverted automatically after " + RevertDelay.String() + " unless they succeed"
+			if err := guardSupported(f, "--harden-ssh"); err != nil {
+				return nil, err
+			}
 		}
 		if len(f.SSHDMatch) > 0 {
 			p.warn("sshd has Match blocks that set password, keyboard-interactive or root login (%s); --harden-ssh does not cover the connections they match", strings.Join(f.SSHDMatch, ", "))
@@ -732,7 +754,7 @@ func (r *Runner) tailscaleInstall(f *Facts) ([]string, string, error) {
 	switch {
 	case f.OSID == "fedora":
 		url = "https://pkgs.tailscale.com/stable/fedora/tailscale.repo"
-	case f.OSID == "amzn" && regexp.MustCompile(`^[0-9]{1,4}$`).MatchString(major):
+	case f.OSID == "amzn" && regexp.MustCompile(`^20[2-9][0-9]$`).MatchString(major):
 		url = "https://pkgs.tailscale.com/stable/amazon-linux/" + major + "/tailscale.repo"
 	case regexp.MustCompile(`^[0-9]{1,3}$`).MatchString(major):
 		dist := "rhel"
@@ -826,6 +848,56 @@ func shellName(s string) string {
 		return "(empty)"
 	}
 	return s
+}
+
+// minSystemd is the oldest systemd whose systemd-run has --collect, which
+// the automatic revert needs (a failed transient unit must not linger).
+const minSystemd = 236
+
+// guardSupported checks that the host can arm the automatic revert of a
+// guarded change (flag names it in the message).
+func guardSupported(f *Facts, flag string) error {
+	switch {
+	case f.Commands["systemd-run"] == "":
+		return fmt.Errorf("%s: systemd-run was not found on the host; depper needs it to arm the automatic revert", flag)
+	case f.SystemdVersion == 0:
+		return fmt.Errorf("%s: cannot read the systemd version (systemctl --version); depper needs systemd %d or later to arm the automatic revert", flag, minSystemd)
+	case f.SystemdVersion < minSystemd:
+		return fmt.Errorf("%s: the host runs systemd %d, whose systemd-run has no --collect; depper needs systemd %d or later to arm the automatic revert safely", flag, f.SystemdVersion, minSystemd)
+	}
+	return nil
+}
+
+// firewallMarkers returns the prepare and revert lines of a firewall step.
+// enabling: the step turns the firewall on (marker was-inactive; the
+// revert runs disable). added: ports the step opens (marker added-ports,
+// one per line; the revert runs remove for each, after the setup lines).
+func firewallMarkers(enabling bool, added []int, disable, setup []string, remove func(pt string) []string) (prepare, revert []string) {
+	if enabling {
+		prepare = append(prepare, `: > "$d/`+markWasInactive+`"`)
+		revert = append(revert, `if test -f "$d/`+markWasInactive+`"; then`)
+		for _, l := range disable {
+			revert = append(revert, "  "+l)
+		}
+		revert = append(revert, `  rm -f "$d/`+markWasInactive+`"`, "fi")
+	}
+	if len(added) > 0 && remove != nil {
+		var ps []string
+		for _, p := range added {
+			ps = append(ps, strconv.Itoa(p))
+		}
+		prepare = append(prepare, "printf '%s\\n' "+strings.Join(ps, " ")+` > "$d/`+markAddedPorts+`"`)
+		revert = append(revert, `if test -f "$d/`+markAddedPorts+`"; then`)
+		for _, l := range setup {
+			revert = append(revert, "  "+l)
+		}
+		revert = append(revert, `  while read -r depper_port; do`, `    case "$depper_port" in ""|*[!0-9]*) continue ;; esac`)
+		for _, l := range remove(`"$depper_port"/tcp`) {
+			revert = append(revert, "    "+l)
+		}
+		revert = append(revert, `  done < "$d/`+markAddedPorts+`"`, `  rm -f "$d/`+markAddedPorts+`"`, "fi")
+	}
+	return prepare, revert
 }
 
 // firewalldZoneLines set $depper_zone to the zone of iface (the interface

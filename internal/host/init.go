@@ -214,6 +214,27 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 	if err != nil {
 		return err
 	}
+	// A guarded change of an interrupted run (neither verified nor
+	// reverted) is reverted before anything else is planned; a dry run
+	// only reports it.
+	if pendingGuards(facts) != "" {
+		if o.DryRun {
+			plan := fmt.Sprintf("an interrupted host init left an unverified change pending (%s); host init reverts it before planning, so this plan may differ from the real one", pendingGuards(facts))
+			defer func() { res.Warnings = append(res.Warnings, plan) }()
+			r.printf("WARNING: %s\n", plan)
+		} else {
+			if _, err := r.finishPending(ctx, admin, facts); err != nil {
+				return err
+			}
+			if facts, err = r.gatherFacts(ctx, admin, o, key); err != nil {
+				return err
+			}
+			if p := pendingGuards(facts); p != "" {
+				return fmt.Errorf("the revert of an interrupted host init is still pending after finishing it (%s); check the timers and %s on the host", p, guardStateDir)
+			}
+			r.printf("The interrupted run is undone; planning from the current state.\n")
+		}
+	}
 	res.Facts = facts
 
 	// 3. The plan.
@@ -305,7 +326,9 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 		}
 	}
 	if s := plan.step(StepHardenSSH); applyErr == nil && s != nil && s.Change {
-		if err := r.hardenSSH(ctx, admin, adminTarget, deployTarget, o, plan, facts.SSHDUnit); err != nil {
+		if err := r.hardenSSH(ctx, admin, adminTarget, deployTarget, o, plan, facts.SSHDUnit); errors.Is(err, errInterrupted) {
+			return err
+		} else if err != nil {
 			applyErr = err
 		} else {
 			res.Applied = append(res.Applied, StepHardenSSH)

@@ -552,6 +552,46 @@ jobs:
           dep 0 khealth --timeout 60 health --json
           check khealth '.ok == true and .method == "ssh-forward" and .body.state == "running"'
 
+      - name: SSH hardening reverts itself when the admin is locked out
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          cd "$W/basic"
+          sshd_auth() { sudo sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin) ' | sort; }
+          before=$(sshd_auth)
+          echo "before: $(tr '\n' ' ' <<<"$before")"
+          sudo test ! -e /etc/ssh/sshd_config.d/10-depper.conf
+          # The test hook (docs/development.md) reports the admin login after
+          # the sshd reload as failed and skips the immediate rollback, so
+          # only the timer armed on the host can undo the drop-in.
+          start=$(date +%s)
+          export DEPPER_E2E=1 DEPPER_E2E_LOCKOUT_ADMIN=1
+          host_init lockout 1 --harden-ssh
+          unset DEPPER_E2E DEPPER_E2E_LOCKOUT_ADMIN
+          check lockout '.error | test("a new login as root failed .*DEPPER_E2E_LOCKOUT_ADMIN")'
+          check lockout '.error | test("so depper-ssh-revert.timer on the host undid the change at [0-9:]+ UTC; a new root login works again")'
+          check lockout '(.applied | index("harden-ssh")) == null'
+          grep_log lockout 'armed depper-ssh-revert.timer: it undoes this change at'
+          grep_log lockout 'waiting for depper-ssh-revert.timer'
+          # The revert ran from the timer, on time (120 s, AccuracySec=1s).
+          read -r who at < <(sudo cat /var/lib/depper/guard/depper-ssh-revert/reverted)
+          expect_eq "reverted by" "$who" timer
+          took=$((at - start))
+          echo "the timer reverted the drop-in ${took}s after host init started"
+          if [ "$took" -lt 118 ] || [ "$took" -gt 130 ]; then echo "::error::the revert ran ${took}s after host init started, want ~120s"; exit 1; fi
+          sudo test ! -e /etc/ssh/sshd_config.d/10-depper.conf
+          for m in had-none had-prev prev; do sudo test ! -e "/var/lib/depper/guard/depper-ssh-revert/$m"; done
+          expect_eq "sshd -T after the revert" "$(sshd_auth)" "$before"
+          # sshd was reloaded with the original configuration: when it
+          # allowed passwords before, the running server offers them again.
+          if grep -qx 'passwordauthentication yes' <<<"$before"; then
+            rc=0
+            ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o BatchMode=yes \
+              -o UserKnownHostsFile="$W/basic/.depper/known_hosts" -o StrictHostKeyChecking=yes \
+              deploy@127.0.0.1 true >"$LOG/password-reverted.out" 2>"$LOG/password-reverted.err" || rc=$?
+            cat "$LOG/password-reverted.err"
+            if grep -q 'Permission denied (publickey)\.' "$LOG/password-reverted.err"; then echo "::error::sshd still refuses passwords after the revert (ssh exit $rc)"; exit 1; fi
+          fi
+
       - name: SSH hardening and firewall
         run: |
           . "$RUNNER_TEMP/e2e/lib.sh"
@@ -582,6 +622,10 @@ jobs:
           probe_tcp 22 || { echo "::error::port 22 is not reachable from the probe namespace"; exit 1; }
           host_init harden 0 --harden-ssh --firewall 22
           check harden '.error == null and (.applied | index("harden-ssh")) != null and (.applied | index("firewall")) != null'
+          # The elapsed timer of the lockout step is cleared, not mistaken
+          # for an interrupted run.
+          grep_log harden 'clearing the finished depper-ssh-revert.timer of an earlier run'
+          if grep -q 'Finishing an interrupted host init' "$LOG/harden.out" "$LOG/harden.err"; then echo "::error::the elapsed timer was treated as pending"; exit 1; fi
           sudo test -f /etc/ssh/sshd_config.d/10-depper.conf
           eff=$(sudo sshd -T)
           grep -qx 'passwordauthentication no' <<<"$eff"
@@ -612,7 +656,9 @@ jobs:
           expect_eq "deploy login over $IP" "$got" deploy
           # The guarded changes were disarmed, not left to fire.
           if systemctl list-timers --all --no-pager | grep -q 'depper-.*-revert'; then echo "::error::a revert timer is still armed"; systemctl list-timers --all --no-pager; exit 1; fi
-          sudo test ! -e /etc/ssh/sshd_config.d/10-depper.conf.depper-prev
+          for u in depper-ssh-revert depper-firewall-revert; do
+            for m in had-none had-prev prev was-inactive added-ports started; do sudo test ! -e "/var/lib/depper/guard/$u/$m"; done
+          done
           # The deploy user still deploys.
           git commit -q --allow-empty -m "deploy after hardening"
           dep 0 deploy-hardened deploy --json
@@ -637,7 +683,9 @@ jobs:
           mapfile -t foreign <"$W/xdg-environment"
           as_deploy systemctl --user set-environment "${foreign[@]}"
           menv=$(as_deploy systemctl --user show-environment)
-          grep -qxF -f "$W/xdg-environment" <<<"$menv" || { echo "::error::the user manager did not take the foreign XDG_* values; this step tests nothing"; exit 1; }
+          for line in "${foreign[@]}"; do
+            grep -qxF -- "$line" <<<"$menv" || { echo "::error::the user manager did not take the foreign $line; this step tests nothing"; exit 1; }
+          done
           echo "user manager: $(grep '^XDG_' <<<"$menv" | tr '\n' ' ')"
           # check_service UNIT: the main process has the deploy user's runtime
           # directory and none of the foreign values.
