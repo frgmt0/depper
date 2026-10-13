@@ -193,7 +193,7 @@ jobs:
           grep -qx 'host = "127.0.0.1"' depper.toml
           grep -qx 'user = "deploy"' depper.toml
           grep -qx 'known_hosts = ".depper/known_hosts"' depper.toml
-          grep -qx "identity_file = \"$KEYS/deploy\"" depper.toml
+          grep -qx "identity_file = \"~/${KEYS#"$HOME"/}/deploy\"" depper.toml
           test "$(stat -c %a .depper/known_hosts)" = 600
           git add -A
           git commit -qm "connect to the runner"
