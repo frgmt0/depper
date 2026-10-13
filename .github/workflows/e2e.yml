@@ -126,7 +126,7 @@ jobs:
           as_deploy() {
             local uid
             uid=$(id -u deploy)
-            sudo -u deploy env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
+            (cd / && sudo -u deploy env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@")
           }
           EOF
           git config --global user.email e2e@depper.invalid
