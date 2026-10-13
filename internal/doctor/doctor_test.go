@@ -246,7 +246,7 @@ func TestScriptRunsUnderPOSIXShell(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(sh, "-s")
-	cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}
+	cmd.Env = scriptEnv(t, home)
 	cmd.Stdin = strings.NewReader(Script(baseConfig()))
 	out, err := cmd.Output()
 	if err != nil {
@@ -290,7 +290,7 @@ func TestScriptLayoutDetection(t *testing.T) {
 	run := func(t *testing.T, home string) map[string]string {
 		t.Helper()
 		cmd := exec.Command(sh, "-s")
-		cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}
+		cmd.Env = scriptEnv(t, home)
 		cmd.Stdin = strings.NewReader("echo 'motd: layout=legacy'\n" + Script(baseConfig()))
 		out, err := cmd.Output()
 		if err != nil {

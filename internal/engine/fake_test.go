@@ -5,7 +5,8 @@ package engine
 // The test binary doubles as the fake ssh and rsync programs (re-executed
 // through small wrapper scripts with DEPPER_FAKE set). Fake ssh runs the
 // script it receives with dash (or sh) -s, with HOME pointing at the fake
-// remote home and PATH starting with fake systemctl/journalctl/docker/curl;
+// remote home and a PATH of only the fake tools plus an allowlist of basic
+// utilities (see isolation_test.go);
 // `ssh -W` serves canned HTTP responses. Fake rsync copies with the local
 // rsync. Nothing ever contacts a real host.
 
@@ -84,7 +85,7 @@ host:
 	cmd.Dir = filepath.Join(root, "home")
 	env := []string{
 		"HOME=" + filepath.Join(root, "home"),
-		"PATH=" + filepath.Join(root, "remote-bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"PATH=" + remotePATH(root),
 		"FAKE_ROOT=" + root,
 		"XDG_RUNTIME_DIR=" + filepath.Join(root, "run"),
 		"TMPDIR=" + filepath.Join(root, "tmp"),
@@ -313,6 +314,7 @@ func newFakeHost(t *testing.T) *fakeHost {
 			t.Fatal(err)
 		}
 	}
+	setupSysBin(t, root)
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)

@@ -33,6 +33,51 @@ Authentication is non-interactive (`ssh -o BatchMode=yes`): use SSH keys or an a
 
 ## Install
 
+depper is a single binary. These methods install it for your user or system-wide; none of them changes anything else on the machine. Supported platforms: Linux and macOS, amd64 and arm64.
+
+### Install script
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/frgmt0/depper/main/install.sh | sh
+```
+
+If you prefer not to pipe a script to `sh`, download it, read it, then run it:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/frgmt0/depper/main/install.sh
+less install.sh
+sh install.sh
+```
+
+The script detects your OS and architecture, downloads the release archive and `checksums.txt`, verifies the SHA-256 checksum (aborting on a mismatch), and installs `depper` with mode 0755. It never uses `sudo`. It prints the installed version and, if the install directory is not on your `PATH`, the line to add.
+
+| Variable | Meaning |
+| --- | --- |
+| `DEPPER_VERSION` | Version to install, `0.2.0` or `v0.2.0`. Default: the latest release. |
+| `DEPPER_INSTALL_DIR` | Directory to install into. Default: `/usr/local/bin` if it is writable, otherwise `$HOME/.local/bin` (created if missing). |
+
+```sh
+DEPPER_VERSION=0.2.0 DEPPER_INSTALL_DIR="$HOME/bin" sh install.sh
+```
+
+To install into `/usr/local/bin` when your user cannot write to it, run the script as root yourself:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/frgmt0/depper/main/install.sh | sudo DEPPER_INSTALL_DIR=/usr/local/bin sh
+```
+
+If the install directory is not on your `PATH`, add it. For bash or zsh, put this in `~/.bashrc` or `~/.zshrc`:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+For fish:
+
+```fish
+fish_add_path $HOME/.local/bin
+```
+
 ### Release binary
 
 Archives for Linux and macOS (amd64 and arm64) are attached to each [GitHub release](https://github.com/frgmt0/depper/releases) together with `checksums.txt` (SHA-256). Replace `VERSION`, `OS` (`linux` or `darwin`), and `ARCH` (`amd64` or `arm64`):
@@ -57,7 +102,13 @@ The checksum file lives in the same release as the archive, so it detects corrup
 go install github.com/frgmt0/depper/cmd/depper@latest
 ```
 
-This requires Go 1.24 or newer. A binary built this way reports its version as `dev`.
+This requires Go 1.24 or newer. The binary is placed in `$(go env GOPATH)/bin` (or `$GOBIN`), which must be on your `PATH`:
+
+```sh
+export PATH="$(go env GOPATH)/bin:$PATH"
+```
+
+Add that line to `~/.bashrc` or `~/.zshrc` to keep it. A binary built this way reports its version as `dev`.
 
 ### From source
 
@@ -72,6 +123,56 @@ To embed a version string, as release builds do:
 ```sh
 go build -ldflags "-X github.com/frgmt0/depper/internal/version.Version=v0.2.0" -o depper ./cmd/depper
 ```
+
+### Shell completion
+
+`depper completion` generates completion scripts for bash, zsh, fish, and PowerShell. Run `depper completion SHELL --help` for the details of one shell. Write the script once to the location for your shell, then start a new shell.
+
+bash (needs the `bash-completion` package):
+
+```sh
+mkdir -p ~/.local/share/bash-completion/completions
+depper completion bash > ~/.local/share/bash-completion/completions/depper
+```
+
+zsh. Write the script as `_depper` into a directory on `$fpath` (it must come before `compinit` runs), and make sure completion is enabled:
+
+```sh
+mkdir -p ~/.zsh/completions
+depper completion zsh > ~/.zsh/completions/_depper
+```
+
+```sh
+# in ~/.zshrc, before compinit
+fpath=(~/.zsh/completions $fpath)
+autoload -U compinit; compinit
+```
+
+fish:
+
+```sh
+mkdir -p ~/.config/fish/completions
+depper completion fish > ~/.config/fish/completions/depper.fish
+```
+
+To try completion in the current session only: `source <(depper completion bash)`, `source <(depper completion zsh)`, or `depper completion fish | source`. Add `--no-descriptions` to omit the descriptions.
+
+### Updating
+
+Re-run the install script, which installs the latest release over the existing binary (or pin a version with `DEPPER_VERSION`). If you installed with `go install`, run the same `go install ...@latest` command again. Regenerate the completion file after an update if commands changed.
+
+### Uninstalling
+
+Remove the binary and any completion files you created:
+
+```sh
+rm "$(command -v depper)"
+rm -f ~/.local/share/bash-completion/completions/depper
+rm -f ~/.zsh/completions/_depper
+rm -f ~/.config/fish/completions/depper.fish
+```
+
+depper does not install anything else on your local machine: no services, daemons, or global configuration. Uninstalling the binary does not affect deployments already running on your hosts; see [Deployments](docs/deployments.md) for managing those.
 
 ## Quick start
 
@@ -150,4 +251,4 @@ Exit codes: 0 success, 1 error, 2 unhealthy (`health`), 3 drift, outdated, or no
 
 ## License
 
-License: not yet specified.
+depper is released under the [MIT License](LICENSE).

@@ -2,8 +2,8 @@ package tunnel
 
 // Test harness: a fake "remote host" in a temporary directory. Scripts sent
 // to ssh run locally with dash (or sh) -s, with HOME pointing at the fake
-// remote home and PATH starting with fake systemctl, journalctl, and
-// cloudflared programs; rsync copies locally. Nothing contacts a real host
+// remote home and PATH of only fake systemctl, journalctl, and
+// cloudflared programs plus allowlisted basic utilities (isolation_test.go); rsync copies locally. Nothing contacts a real host
 // or Cloudflare.
 
 import (
@@ -188,6 +188,7 @@ func newFakeHost(t *testing.T) *fakeHost {
 			t.Fatal(err)
 		}
 	}
+	setupSysBin(t, root)
 	h.writeExec("remote-bin/systemctl", fakeSystemctl)
 	h.writeExec("remote-bin/journalctl", fakeJournalctl)
 	h.writeExec("remote-bin/cloudflared", fakeCloudflared)
@@ -273,7 +274,7 @@ func (h *fakeHost) Run(ctx context.Context, c transport.Cmd) (transport.Result, 
 		h.mu.Unlock()
 		env := []string{
 			"HOME=" + h.Home,
-			"PATH=" + filepath.Join(h.Root, "remote-bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"PATH=" + remotePATH(h.Root),
 			"FAKE_ROOT=" + h.Root,
 			"XDG_RUNTIME_DIR=" + filepath.Join(h.Root, "run"),
 			"TMPDIR=" + filepath.Join(h.Root, "tmp"),

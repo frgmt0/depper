@@ -4,13 +4,16 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-10-13
 
 The tool is renamed from `deployer` to `depper` and rewritten in Go as a single binary. Local requirements are `ssh` and `rsync`; Python is no longer needed on either side.
 
 ### Added
 
 - Single static binary, published for Linux and macOS (amd64 and arm64) with SHA-256 checksums through GoReleaser.
+- `install.sh`, a POSIX sh installer that detects OS and architecture, verifies the SHA-256 checksum, and installs to `/usr/local/bin` or `~/.local/bin` without `sudo`. `DEPPER_VERSION` and `DEPPER_INSTALL_DIR` select the version and directory.
+- MIT license (`LICENSE`).
+- README sections for installation, shell completion, updating, and uninstalling.
 - Container services: `[container]` with docker or podman in `build`, `image`, or `compose` mode, including ports, volumes, extra run arguments, and a command override (`ports`, `volumes`, `args`, and `command` are rejected with `compose`). In build and image mode each release runs its own image tag, `depper/<name>:<release-id>`: image mode tags the pulled image, so a release keeps running the exact image it was deployed with, and records `image` and `image_digest` in the release metadata. Build-mode images carry the label `depper.service=<name>`, and pruning removes only images of its own service. The lowercased service name must be a valid image name.
 - `[endpoint]` to record where a service is reachable without a tunnel.
 - `[health]` with URL or command checks, `expect_status`, `timeout`, `start_period`, and `interval`. URL checks run from the host's network view over `ssh -W` (with `ControlPath=none` and a `LocalCommand` ready marker), with a remote `curl` fallback when forwarding is refused. `timeout` covers only the HTTP exchange; the SSH connection gets `max(15 s, timeout)`. A health command that exits with status 255 is reported as unhealthy, not as an ssh failure.
