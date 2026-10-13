@@ -197,3 +197,26 @@ func TestSessionEnvReplacesForeignRuntimeDir(t *testing.T) {
 		}
 	}
 }
+
+// XDG base directories that exist and belong to someone else are dropped;
+// the user's own, and paths that do not exist yet, are kept.
+func TestSessionEnvDropsForeignBaseDirs(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not available")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root owns every directory used here")
+	}
+	own := t.TempDir()
+	cmd := exec.Command(sh, "-s")
+	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "XDG_CONFIG_HOME=/", "XDG_DATA_HOME=" + own, "XDG_CACHE_HOME=" + own + "/new", "XDG_STATE_HOME=/"}
+	cmd.Stdin = strings.NewReader(Script(append(Prelude(), `sh -c 'printf "%s|%s|%s|%s\n" "${XDG_CONFIG_HOME-unset}" "${XDG_DATA_HOME-unset}" "${XDG_CACHE_HOME-unset}" "${XDG_STATE_HOME-unset}"'`)...))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	if want := "unset|" + own + "|" + own + "/new|unset\n"; string(out) != want {
+		t.Errorf("got %q, want %q", out, want)
+	}
+}
