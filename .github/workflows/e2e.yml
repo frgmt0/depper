@@ -627,48 +627,47 @@ jobs:
         run: |
           . "$RUNNER_TEMP/e2e/lib.sh"
           uid=$(id -u deploy)
-          # Put the runner image's XDG lines back into /etc/environment and
-          # restart the deploy user's manager, which then carries them.
+          # With the runner image's XDG lines in /etc/environment the deploy
+          # user's manager does not start at all (user@.service times out; its
+          # generators read /home/runner/.config), which depper cannot fix, so
+          # "Start sshd" removes them. What depper controls is the services:
+          # give the running manager the foreign values, as environment.d
+          # would, and check that the services it starts do not inherit them.
           test -s "$W/xdg-environment" || { echo "::error::the runner image no longer sets XDG_* in /etc/environment; this step tests nothing"; exit 1; }
-          cat "$W/xdg-environment" | sudo tee -a /etc/environment >/dev/null
-          restart_manager() {
-            sudo systemctl restart "user@$uid.service"
-            for _ in $(seq 1 60); do
-              if as_deploy systemctl --user is-active --quiet depper-basic.service; then return 0; fi
-              sleep 1
-            done
-            as_deploy systemctl --user status --no-pager depper-basic.service || true
-            return 1
-          }
-          restart_manager
+          mapfile -t foreign <"$W/xdg-environment"
+          as_deploy systemctl --user set-environment "${foreign[@]}"
           menv=$(as_deploy systemctl --user show-environment)
+          grep -qxF -f "$W/xdg-environment" <<<"$menv" || { echo "::error::the user manager did not take the foreign XDG_* values; this step tests nothing"; exit 1; }
           echo "user manager: $(grep '^XDG_' <<<"$menv" | tr '\n' ' ')"
-          grep -qxF -f "$W/xdg-environment" <<<"$menv" || { echo "::error::the user manager did not pick up any foreign XDG_* value; this step tests nothing"; exit 1; }
+          # check_service UNIT: the main process has the deploy user's runtime
+          # directory and none of the foreign values.
+          check_service() {
+            local pid penv k v
+            pid=$(as_deploy systemctl --user show -p MainPID --value "$1")
+            test "$pid" -gt 0
+            penv=$(sudo cat "/proc/$pid/environ" | tr '\0' '\n')
+            echo "$1: $(grep '^XDG_' <<<"$penv" | tr '\n' ' ')"
+            expect_eq "$1 XDG_RUNTIME_DIR" "$(grep '^XDG_RUNTIME_DIR=' <<<"$penv")" "XDG_RUNTIME_DIR=/run/user/$uid"
+            while IFS='=' read -r k v; do
+              if grep -qx "$k=$v" <<<"$penv"; then echo "::error::$1 inherited the foreign $k=$v"; return 1; fi
+            done <"$W/xdg-environment"
+          }
           # The process service: the start script sanitises its environment.
-          pid=$(as_deploy systemctl --user show -p MainPID --value depper-basic.service)
-          test "$pid" -gt 0
-          penv=$(sudo cat "/proc/$pid/environ" | tr '\0' '\n')
-          echo "service: $(grep '^XDG_' <<<"$penv" | tr '\n' ' ')"
-          expect_eq "service XDG_RUNTIME_DIR" "$(grep '^XDG_RUNTIME_DIR=' <<<"$penv")" "XDG_RUNTIME_DIR=/run/user/$uid"
-          while IFS='=' read -r k v; do
-            case "$k" in XDG_RUNTIME_DIR) continue ;; esac
-            if grep -qx "$k=$v" <<<"$penv"; then echo "::error::the service inherited the foreign $k=$v"; exit 1; fi
-          done <"$W/xdg-environment"
           cd "$W/basic"
+          dep 0 restart-xdg restart
+          check_service depper-basic.service
           dep 0 health-xdg --timeout 60 health --json
           check health-xdg '.ok == true'
-          # The podman service: the unit's sh -c wrapper sanitises the engine's
-          # environment, so rootless podman starts the container again.
+          # The podman service: the unit's sh -c wrapper sanitises the
+          # engine's environment, so rootless podman starts the container.
           cd "$W/container"
-          for _ in $(seq 1 60); do
-            if as_deploy systemctl --user is-active --quiet depper-container-demo.service; then break; fi
-            sleep 2
-          done
+          dep 0 crestart-xdg --timeout 300 restart
+          # The main process is the engine itself (podman run).
+          check_service depper-container-demo.service
           dep 0 chealth-xdg --timeout 120 health --json
           check chealth-xdg '.ok == true'
           # Restore the fresh-VPS state.
-          sudo sed -i -E "/^XDG_[A-Z_]+=/d" /etc/environment
-          restart_manager
+          as_deploy systemctl --user unset-environment "${foreign[@]%%=*}"
 
       - name: Diagnostics
         if: failure()

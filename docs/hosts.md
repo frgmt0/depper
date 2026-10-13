@@ -340,7 +340,7 @@ Some images set `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, or similar in `/etc/enviro
 
 depper sanitises the environment of everything it starts. Its own scripts, the process-mode start script `.depper-start.sh`, and every container engine invocation in a generated unit (`ExecStart`, `ExecStartPre`, `ExecStop`, run through `/bin/sh -c '<sanitise>; exec "$0" "$@"'`) reset `XDG_RUNTIME_DIR` to `/run/user/UID` unless the inherited one is owned by the user, and keep `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` only when the user can write to them (or when the directory is missing and its parent is writable). So the services depper starts no longer inherit another user's `XDG_*` from the user manager.
 
-depper cannot change what the systemd user manager itself inherits: its own generators and `environment.d` still see these variables, and so does anything else that runs inside the manager. On images that set them, removing the foreign lines from `/etc/environment` is still recommended (as root):
+depper cannot change what the systemd user manager itself inherits: its own generators and `environment.d` still see these variables, and so does anything else that runs inside the manager. This is not just cosmetic: on the GitHub-hosted Ubuntu runner image, with its `XDG_*` lines in `/etc/environment`, the deploy user's manager does not start at all (`user@UID.service` times out), so no service runs, sanitised or not. The end-to-end test therefore only checks the services against a running manager that was given the foreign values (`systemctl --user set-environment`). On images that set them, remove the foreign lines from `/etc/environment` (as root):
 
 ```sh
 grep '^XDG_' /etc/environment                   # see what is set
