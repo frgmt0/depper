@@ -854,3 +854,44 @@ func TestStatusChecksEffectiveSSHD(t *testing.T) {
 		t.Errorf("firewall off: %+v", c)
 	}
 }
+
+// Item 17: when sshd -T cannot read its configuration as the deploy user
+// (cloud images ship 600 drop-ins), host status asks sshd which methods it
+// offers to new deploy and root connections.
+func TestStatusProbesOfferedMethodsWhenSSHDTIsRootOnly(t *testing.T) {
+	t.Parallel()
+	h := newFakeHost(t, debian12)
+	o := h.options()
+	o.HardenSSH = true
+	mustInit(t, h, o)
+	h.write("sshd-T-root-only", "", 0o644)
+	cfg, err := config.LoadTarget(h.Repo, "", noEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func() StatusCheck {
+		st, err := h.runner().Status(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range st.Checks {
+			if c.Name == "ssh hardening" {
+				return c
+			}
+		}
+		return StatusCheck{}
+	}
+	if c := check(); c.Status != StatusPass || !strings.Contains(c.Detail, "sshd offers deploy: publickey; root: publickey") || !strings.Contains(c.Detail, "Permission denied") {
+		t.Errorf("hardened: %+v", c)
+	}
+	h.write("fs/etc/ssh/sshd_config.d/01-override.conf", "PasswordAuthentication yes\n", 0o644)
+	if c := check(); c.Status != StatusWarn || !strings.Contains(c.Detail, "recorded as applied by depper but not in effect now") || !strings.Contains(c.Detail, "publickey,password") {
+		t.Errorf("overridden: %+v", c)
+	}
+	// The probes offered no credential and pinned the host key.
+	for _, argv := range h.Exec.Argv() {
+		if strings.Contains(argv, "PubkeyAuthentication=no") && (!strings.Contains(argv, "IdentityAgent=none") || !strings.Contains(argv, "StrictHostKeyChecking=yes")) {
+			t.Errorf("probe argv: %s", argv)
+		}
+	}
+}

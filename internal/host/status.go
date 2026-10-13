@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 
 	"github.com/frgmt0/depper/internal/config"
 	"github.com/frgmt0/depper/internal/shell"
+	"github.com/frgmt0/depper/internal/transport"
 )
 
 // Status check outcomes. "info" marks opt-in features that are not enabled.
@@ -215,9 +217,27 @@ func (r *Runner) Status(ctx context.Context, cfg *config.Config) (*StatusResult,
 		feature("ssh hardening", h.SSH, sshdHardened(eff), values, values)
 	} else {
 		msg := clean(m["sshd_t_msg"])
-		if h.SSH {
-			add("ssh hardening", StatusWarn, "cannot read the effective sshd settings as "+res.User+" (sshd -T: "+msg+"); "+SSHDropIn+" is "+dropin)
-		} else {
+		// sshd -T cannot read every configuration file as the deploy
+		// user (cloud images ship 600 drop-ins): ask sshd itself which
+		// methods it offers to new deploy and root connections.
+		offered, perr := r.probeAuthMethods(ctx, cfg, res.User, "root")
+		switch {
+		case perr == nil:
+			var parts []string
+			hardened := true
+			for _, u := range []string{res.User, "root"} {
+				parts = append(parts, u+": "+strings.Join(offered[u], ","))
+				for _, meth := range offered[u] {
+					if meth == "password" || meth == "keyboard-interactive" {
+						hardened = false
+					}
+				}
+			}
+			values := "sshd offers " + strings.Join(parts, "; ") + " (probed with new connections; sshd -T as " + res.User + ": " + msg + "; " + SSHDropIn + " " + dropin + ")"
+			feature("ssh hardening", h.SSH, hardened, values, values)
+		case h.SSH:
+			add("ssh hardening", StatusWarn, "cannot read the effective sshd settings as "+res.User+" (sshd -T: "+msg+"; probing the offered methods: "+clean(perr.Error())+"); "+SSHDropIn+" is "+dropin)
+		default:
 			add("ssh hardening", StatusInfo, "not enabled (opt-in)")
 		}
 	}
@@ -241,4 +261,41 @@ func (r *Runner) Status(ctx context.Context, cfg *config.Config) (*StatusResult,
 	feature("auto updates", h.AutoUpdates, m["autoupd"] == "1", "automatic security updates are enabled", "automatic security updates are not enabled")
 	feature("tailscale", h.Tailscale, m["tailscale_up"] == "1", "tailscale is up", "tailscale is not up")
 	return res, nil
+}
+
+var deniedRe = regexp.MustCompile(`Permission denied \(([a-z0-9@.,-]*)\)`)
+
+// probeAuthMethods opens new connections as each user without offering any
+// credential and returns the authentication methods sshd says can continue
+// ("Permission denied (publickey,password)."). This is what sshd applies
+// to a real connection from here, Match blocks included.
+func (r *Runner) probeAuthMethods(ctx context.Context, cfg *config.Config, users ...string) (map[string][]string, error) {
+	program := r.SSHProgram
+	if program == "" {
+		program = "ssh"
+	}
+	base := cfg.SSHTarget()
+	_, addr := base.SplitHost()
+	out := map[string][]string{}
+	for _, u := range users {
+		t := transport.Target{Host: u + "@" + addr, Port: base.Port, KnownHosts: base.KnownHosts,
+			Options: append(append([]string{}, sessionOptions...), "ControlPath=none", "ConnectTimeout=10", "PubkeyAuthentication=no", "PasswordAuthentication=no",
+				"KbdInteractiveAuthentication=no", "GSSAPIAuthentication=no", "HostbasedAuthentication=no", "IdentityAgent=none")}
+		args := append([]string{program}, t.SSHOptions()...)
+		args = append(args, "-T", "--", t.Host, "true")
+		res, err := r.Exec.Run(ctx, transport.Cmd{Args: args, Capture: true})
+		text := res.Stderr
+		if err != nil {
+			text += " " + err.Error()
+		}
+		m := deniedRe.FindStringSubmatch(text)
+		if m == nil {
+			if err == nil {
+				return nil, fmt.Errorf("%s logged in without credentials", u)
+			}
+			return nil, fmt.Errorf("%s: %s", u, lastLines(text, 1))
+		}
+		out[u] = strings.Split(m[1], ",")
+	}
+	return out, nil
 }

@@ -114,12 +114,25 @@ jobs:
             git -C "$2" commit -qm "example"
           }
 
-          # host_init NAME WANT [ARGS...]: depper host init as root with the
-          # admin key, authorizing the deploy key, in the current directory.
+          # host_fp: the runner's own ed25519 host key fingerprint, read on the
+          # host (as from a provider console), so --yes pins a verified key.
+          host_fp() {
+            ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{ print $2 }'
+          }
+
+          # host_init_as ADMIN NAME WANT [ARGS...]: depper host init as ADMIN
+          # with the admin key, authorizing the deploy key, in the current
+          # directory.
+          host_init_as() {
+            local admin=$1 name=$2 want=$3
+            shift 3
+            dep "$want" "$name" host init "$admin@127.0.0.1" --identity "$KEYS/admin" --key "$KEYS/deploy.pub" \
+              --host-key-fingerprint "$(host_fp)" --yes --json "$@"
+          }
+
+          # host_init NAME WANT [ARGS...]: host_init_as root.
           host_init() {
-            local name=$1 want=$2
-            shift 2
-            dep "$want" "$name" host init root@127.0.0.1 --identity "$KEYS/admin" --key "$KEYS/deploy.pub" --yes --json "$@"
+            host_init_as root "$@"
           }
 
           # as_deploy CMD...: run CMD as the deploy user with its user manager.
@@ -161,10 +174,12 @@ jobs:
           # applies to every login and environment.d to every systemd user manager.
           # Any other user's manager then breaks (its generators cannot open
           # /home/runner/.config; rootless podman refuses /run/user/1001), so remove
-          # them to make the runner look like a fresh VPS. depper's own scripts
-          # ignore such foreign directories (shell.SessionEnv, unit-tested), but the
-          # units run in the user manager's environment, which depper does not own.
+          # them to make the runner look like a fresh VPS. depper's scripts and the
+          # services it starts ignore such foreign directories (shell.SessionEnv),
+          # which the "foreign XDG" step checks with the lines put back; the user
+          # manager itself is not depper's to fix.
           echo "/etc/environment sets: $(grep -o "^[A-Za-z_][A-Za-z0-9_]*=" /etc/environment | tr -d = | tr "\n" " ")"
+          grep -E "^XDG_[A-Z_]+=" /etc/environment > "$RUNNER_TEMP/e2e/xdg-environment" || true
           sudo sed -i -E "/^XDG_[A-Z_]+=/d" /etc/environment
 
       - name: Create the admin and deploy keys
@@ -186,8 +201,15 @@ jobs:
           . "$RUNNER_TEMP/e2e/lib.sh"
           new_repo "$GITHUB_WORKSPACE/examples/basic" "$W/basic"
           cd "$W/basic"
+          export FP
+          FP=$(host_fp)
           host_init host-init 0
           check host-init '.error == null and .host_key_status == "added" and .user == "deploy" and .admin == "root"'
+          # Only the key matching --host-key-fingerprint is pinned.
+          check host-init '.host_keys == [{"type": "ssh-ed25519", "fingerprint": env.FP}]'
+          expect_eq "pinned keys" "$(grep -c . .depper/known_hosts)" 1
+          # The record lists the local steps too.
+          sudo jq -e '.steps as $s | ["known-hosts", "config", "record", "user"] | all(. as $x | $s | index($x) != null)' /etc/depper/host.json
           check host-init '.facts.privilege == "root" and .facts.family == "debian" and .facts.systemd == true'
           # shellcheck disable=SC2016 # $a is a jq variable
           check host-init '.applied as $a | ["known-hosts", "user", "authorized-key", "linger", "user-manager", "record", "config"] | all(. as $s | $a | index($s) != null)'
@@ -307,6 +329,22 @@ jobs:
           check host-status '([.checks[] | select(.status == "fail")] | length) == 0'
           # shellcheck disable=SC2016 # $p is a jq variable
           check host-status '[.checks[] | select(.status == "pass") | .name] as $p | ["record", "user", "linger", "systemd"] | all(. as $n | $p | index($n) != null)'
+
+      - name: host init again as a passwordless-sudo admin
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          cd "$W/basic"
+          sudo useradd --create-home --shell /bin/bash admin
+          sudo usermod -p '*' admin
+          echo 'admin ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/90-e2e-admin >/dev/null
+          sudo chmod 440 /etc/sudoers.d/90-e2e-admin
+          sudo install -d -m 700 -o admin -g admin /home/admin/.ssh
+          sudo install -m 600 -o admin -g admin "$KEYS/admin.pub" /home/admin/.ssh/authorized_keys
+          host_init_as admin host-init-sudo 0
+          check host-init-sudo '.error == null and .admin == "admin" and .facts.privilege == "sudo" and .facts.admin_user == "admin"'
+          check host-init-sudo '.applied == [] and [.plan[] | select(.change)] == [] and .config_written == false'
+          check host-init-sudo '([.doctor.checks[] | select(.status == "fail")] | length) == 0'
+          git diff --exit-code depper.toml
 
       - name: unlock and the ssh -W health check
         run: |
@@ -440,6 +478,7 @@ jobs:
           expect_eq "container greeting after rollback" "$(curl -fsS http://127.0.0.1:8081/)" "hello from the e2e container"
           dep 0 cstatus status --json
           check cstatus '.current_release == env.CR1 and .health.ok == true'
+          if grep -rqF -f <(cut -d= -f2 .env.production) "$LOG"; then echo "::error::the secret value appears in depper output"; exit 1; fi
 
       - name: podman (image mode, digest pinning)
         run: |
@@ -480,11 +519,14 @@ jobs:
       - name: podman compose (compose example)
         run: |
           . "$RUNNER_TEMP/e2e/lib.sh"
-          # The runner image ships docker's compose plugin, which `podman
-          # compose` would prefer and which needs the podman API socket. A
-          # plain Ubuntu host has neither, so install podman-compose (the
-          # provider an Ubuntu user installs) and select it for podman.
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q podman-compose
+          # host init installs the compose provider (podman-compose) itself;
+          # make sure the runner does not have it already.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y -q podman-compose
+          if command -v podman-compose >/dev/null 2>&1; then echo "::error::podman-compose is still installed"; exit 1; fi
+          # The runner image also ships docker's compose plugin, which `podman
+          # compose` prefers over podman-compose and which needs the podman API
+          # socket. A plain VPS has no docker plugin, so select podman-compose
+          # for podman, as such a host would use it.
           sudo install -d /etc/containers/containers.conf.d
           printf '[engine]\ncompose_providers = ["/usr/bin/podman-compose"]\ncompose_warning_logs = false\n' | sudo tee /etc/containers/containers.conf.d/50-e2e-compose.conf >/dev/null
           new_repo "$GITHUB_WORKSPACE/examples/compose" "$W/compose"
@@ -498,6 +540,10 @@ jobs:
           git commit -qm "podman compose on the runner"
           host_init host-init-compose 0
           check host-init-compose '.error == null and ([.doctor.checks[] | select(.status == "fail")] | length) == 0'
+          check host-init-compose '[.plan[] | select(.id == "packages")][0] | .change == true and (.detail | test("podman-compose"))'
+          check host-init-compose '[.doctor.checks[] | select(.name == "compose")][0].status == "pass"'
+          command -v podman-compose
+          sudo jq -e '(.packages | index("podman-compose")) != null' /etc/depper/host.json
           git add -A
           git commit -qm "connect to the runner"
           dep 0 kdeploy --timeout 900 deploy --json
@@ -511,6 +557,29 @@ jobs:
           . "$RUNNER_TEMP/e2e/lib.sh"
           cd "$W/basic"
           echo "before: $(sudo sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin) ' | tr '\n' ' ')"
+          # Traffic from the runner to its own addresses goes through lo,
+          # which ufw always accepts. To see the firewall, probe the
+          # runner's non-loopback address from a network namespace joined by
+          # a veth pair, so packets arrive on a real interface.
+          export IP
+          IP=$(hostname -I | awk '{ print $1 }')
+          test -n "$IP"
+          sudo ip netns add probe
+          sudo ip link add vh-probe type veth peer name vp-probe
+          sudo ip link set vp-probe netns probe
+          sudo ip addr add 10.200.0.1/24 dev vh-probe
+          sudo ip link set vh-probe up
+          sudo ip netns exec probe ip addr add 10.200.0.2/24 dev vp-probe
+          sudo ip netns exec probe ip link set vp-probe up
+          sudo ip netns exec probe ip link set lo up
+          sudo ip netns exec probe ip route add default via 10.200.0.1
+          # probe_tcp PORT: can the namespace open TCP PORT on $IP?
+          probe_tcp() { sudo ip netns exec probe timeout 5 bash -c "exec 3<>/dev/tcp/$IP/$1" 2>/dev/null; }
+          # A throwaway listener on a port the firewall will not allow.
+          (setsid nc -lk 9999 </dev/null >/dev/null 2>&1 &)
+          for _ in $(seq 1 50); do if ss -ltn | grep -q ':9999 '; then break; fi; sleep 0.1; done
+          probe_tcp 9999 || { echo "::error::port 9999 is not reachable from the probe namespace before the firewall"; exit 1; }
+          probe_tcp 22 || { echo "::error::port 22 is not reachable from the probe namespace"; exit 1; }
           host_init harden 0 --harden-ssh --firewall 22
           check harden '.error == null and (.applied | index("harden-ssh")) != null and (.applied | index("firewall")) != null'
           sudo test -f /etc/ssh/sshd_config.d/10-depper.conf
@@ -533,6 +602,17 @@ jobs:
           sudo ufw status verbose
           sudo ufw status | grep -q '^Status: active'
           sudo ufw status | grep -Eq '^22/tcp +ALLOW'
+          # Through a real interface: 22 is open (a deploy login works over
+          # the non-loopback address), 9999 is blocked.
+          probe_tcp 22 || { echo "::error::port 22 is blocked from $IP"; exit 1; }
+          if probe_tcp 9999; then echo "::error::port 9999 is reachable through the firewall"; exit 1; fi
+          got=$(sudo ip netns exec probe ssh -i "$KEYS/deploy" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
+            -o UserKnownHostsFile="$W/basic/.depper/known_hosts" -o HostKeyAlias=127.0.0.1 -o StrictHostKeyChecking=yes \
+            "deploy@$IP" 'id -un')
+          expect_eq "deploy login over $IP" "$got" deploy
+          # The guarded changes were disarmed, not left to fire.
+          if systemctl list-timers --all --no-pager | grep -q 'depper-.*-revert'; then echo "::error::a revert timer is still armed"; systemctl list-timers --all --no-pager; exit 1; fi
+          sudo test ! -e /etc/ssh/sshd_config.d/10-depper.conf.depper-prev
           # The deploy user still deploys.
           git commit -q --allow-empty -m "deploy after hardening"
           dep 0 deploy-hardened deploy --json
@@ -542,6 +622,53 @@ jobs:
           check host-status-hardened '[.checks[] | select(.name == "ssh hardening" or .name == "firewall") | .status] == ["pass", "pass"]'
           host_init harden-again 0 --harden-ssh --firewall 22
           check harden-again '.applied == [] and [.plan[] | select(.change)] == []'
+
+      - name: services ignore a foreign XDG environment
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          uid=$(id -u deploy)
+          # Put the runner image's XDG lines back into /etc/environment and
+          # restart the deploy user's manager, which then carries them.
+          test -s "$W/xdg-environment" || { echo "::error::the runner image no longer sets XDG_* in /etc/environment; this step tests nothing"; exit 1; }
+          cat "$W/xdg-environment" | sudo tee -a /etc/environment >/dev/null
+          restart_manager() {
+            sudo systemctl restart "user@$uid.service"
+            for _ in $(seq 1 60); do
+              if as_deploy systemctl --user is-active --quiet depper-basic.service; then return 0; fi
+              sleep 1
+            done
+            as_deploy systemctl --user status --no-pager depper-basic.service || true
+            return 1
+          }
+          restart_manager
+          menv=$(as_deploy systemctl --user show-environment)
+          echo "user manager: $(grep '^XDG_' <<<"$menv" | tr '\n' ' ')"
+          grep -qxF -f "$W/xdg-environment" <<<"$menv" || { echo "::error::the user manager did not pick up any foreign XDG_* value; this step tests nothing"; exit 1; }
+          # The process service: the start script sanitises its environment.
+          pid=$(as_deploy systemctl --user show -p MainPID --value depper-basic.service)
+          test "$pid" -gt 0
+          penv=$(sudo cat "/proc/$pid/environ" | tr '\0' '\n')
+          echo "service: $(grep '^XDG_' <<<"$penv" | tr '\n' ' ')"
+          expect_eq "service XDG_RUNTIME_DIR" "$(grep '^XDG_RUNTIME_DIR=' <<<"$penv")" "XDG_RUNTIME_DIR=/run/user/$uid"
+          while IFS='=' read -r k v; do
+            case "$k" in XDG_RUNTIME_DIR) continue ;; esac
+            if grep -qx "$k=$v" <<<"$penv"; then echo "::error::the service inherited the foreign $k=$v"; exit 1; fi
+          done <"$W/xdg-environment"
+          cd "$W/basic"
+          dep 0 health-xdg --timeout 60 health --json
+          check health-xdg '.ok == true'
+          # The podman service: the unit's sh -c wrapper sanitises the engine's
+          # environment, so rootless podman starts the container again.
+          cd "$W/container"
+          for _ in $(seq 1 60); do
+            if as_deploy systemctl --user is-active --quiet depper-container-demo.service; then break; fi
+            sleep 2
+          done
+          dep 0 chealth-xdg --timeout 120 health --json
+          check chealth-xdg '.ok == true'
+          # Restore the fresh-VPS state.
+          sudo sed -i -E "/^XDG_[A-Z_]+=/d" /etc/environment
+          restart_manager
 
       - name: Diagnostics
         if: failure()

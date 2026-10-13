@@ -123,7 +123,7 @@ rest:
 		fmt.Fprintln(os.Stderr, "fake ssh: missing host")
 		return 255
 	}
-	if strings.Join(args[i:], " ") != transport.RemoteShell {
+	if strings.Join(args[i:], " ") != transport.RemoteShell && opts["PubkeyAuthentication"] != "no" {
 		fmt.Fprintf(os.Stderr, "fake ssh: unexpected remote command %q\n", args[i:])
 		return 255
 	}
@@ -164,6 +164,24 @@ rest:
 		"SSH_CONNECTION=192.0.2.7 50022 " + laddr + " " + strconv.Itoa(port),
 		"FAKE_ROOT=" + root,
 		"TMPDIR=" + filepath.Join(root, "tmp"),
+	}
+	if opts["PubkeyAuthentication"] == "no" {
+		// No credentials offered: answer like sshd, with the methods the
+		// effective configuration (fake sshd -T) allows.
+		cmd := exec.Command("/bin/sh", filepath.Join(root, "remote-bin", "sshd"), "-T")
+		cmd.Env = []string{"FAKE_ROOT=" + root, "PATH=" + fakeRemotePATH(root)}
+		out, _ := cmd.Output()
+		methods := "publickey"
+		for _, line := range strings.Split(string(out), "\n") {
+			switch line {
+			case "passwordauthentication yes":
+				methods += ",password"
+			case "kbdinteractiveauthentication yes":
+				methods += ",keyboard-interactive"
+			}
+		}
+		fmt.Fprintf(os.Stderr, "%s@%s: Permission denied (%s).\n", user, addr, methods)
+		return 255
 	}
 	if exists(filepath.Join(root, "firewall-blocks-ssh")) && (exists(filepath.Join(root, "ufw-active")) || exists(filepath.Join(root, "units", "firewalld.service.active"))) {
 		fmt.Fprintln(os.Stderr, "ssh: connect to host "+addr+" port "+strconv.Itoa(port)+": Connection timed out")
@@ -454,6 +472,7 @@ case "$1" in
     echo sshd-t >> "$FAKE_ROOT/events"
     if test -f "$FAKE_ROOT/sshd-t-fail"; then echo "10-depper.conf line 3: Bad configuration option" >&2; exit 255; fi ;;
   -T)
+    if test -f "$FAKE_ROOT/sshd-T-root-only" && test "${FAKE_UID:-0}" != 0; then echo "/etc/ssh/sshd_config.d/50-cloud-init.conf: Permission denied" >&2; exit 255; fi
     # Like sshd: the main file up to its Include, then the drop-ins in
     # lexical order, then the rest of the main file; the first value wins.
     {

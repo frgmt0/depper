@@ -131,7 +131,7 @@ The unit sets `RestartSec=3`. `depper stop` leaves the service stopped until `de
 | `source` | string | `"worktree"` | `"worktree"` uploads the working directory including uncommitted changes. `"git"` uploads the committed content of `HEAD` (`git archive`). `depper deploy --ref REF` forces git mode for one deployment. |
 | `healthcheck` | string | none | Alias of `[health].command`. Setting both is an error. |
 
-Always-excluded rsync patterns (applied before `exclude`): `.git/`, `.env`, `.env.*`, `deploy.toml`, `depper.toml`, `.cloudflared/`, `.cache/`, `node_modules/`, `venv/`, `.venv/`, `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`. The selected secrets file is also excluded by its anchored path when it lies inside the repository. `.gitignore` is not consulted in worktree mode: anything not excluded is uploaded, including ignored build output.
+Always-excluded rsync patterns (applied before `exclude`): `.git/`, `.env`, `.env.*`, `deploy.toml`, `depper.toml`, `.cloudflared/`, `.depper/`, `.cache/`, `node_modules/`, `venv/`, `.venv/`, `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`. `.depper/` keeps repository-local depper state out of releases, in particular the `.depper/known_hosts` that `depper host init` writes; like the other patterns it is unanchored, so a `.depper/` directory at any depth is excluded. The selected secrets file is also excluded by its anchored path when it lies inside the repository. `.gitignore` is not consulted in worktree mode: anything not excluded is uploaded, including ignored build output.
 
 Examples of `host`:
 

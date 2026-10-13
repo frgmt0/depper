@@ -51,7 +51,7 @@ engine = "docker"
 compose = "compose.yaml"
 ```
 
-depper uses the compose plugin (`<engine> compose`). During setup it runs `compose config` with its output discarded (`>/dev/null`, to validate the file; not `--quiet`, which podman-compose does not accept) and `compose build` in the release directory. The unit runs `compose up --build --remove-orphans` and stops with `compose down`. Every one of these commands passes `--env-file /dev/null`, so a `.env` file in the repository or the release is ignored (see [How secrets reach containers](#how-secrets-reach-containers)). The compose project name is `depper-<name>`, lowercased, with `.` replaced by `_`. `ports`, `volumes`, `args`, and `command` are rejected in `depper.toml` in this mode; define them in the compose file.
+depper uses the compose plugin (`<engine> compose`); `depper doctor` checks it (see [Host requirements](#host-requirements)). During setup it runs `compose config` with its output discarded (`>/dev/null`, to validate the file; not `--quiet`, which podman-compose does not accept) and `compose build` in the release directory. The unit runs `compose up --build --remove-orphans` and stops with `compose down`. Every one of these commands passes `--env-file /dev/null`, so a `.env` file in the repository or the release is ignored (see [How secrets reach containers](#how-secrets-reach-containers)). The compose project name is `depper-<name>`, lowercased, with `.` replaced by `_`. `ports`, `volumes`, `args`, and `command` are rejected in `depper.toml` in this mode; define them in the compose file.
 
 ## The generated unit
 
@@ -66,9 +66,9 @@ After=network.target
 Type=simple
 WorkingDirectory=/home/deploy/.local/share/depper/api/current
 EnvironmentFile=/home/deploy/.local/share/depper/api/.depper/environment
-ExecStartPre=-"/usr/bin/docker" "rm" "-f" "depper-api"
-ExecStart="/usr/bin/docker" "run" "--rm" "--name" "depper-api" $DEPPER_CONTAINER_ENV_ARGS "-p" "127.0.0.1:8080:8080" "-v" "/srv/api-data:/data" "depper/api:release-20261012T154501.237Z-3fa9c2d1"
-ExecStop="/usr/bin/docker" "stop" "depper-api"
+ExecStartPre=-/bin/sh -c "..." "/usr/bin/docker" "rm" "-f" "depper-api"
+ExecStart=/bin/sh -c "..." "/usr/bin/docker" "run" "--rm" "--name" "depper-api" $DEPPER_CONTAINER_ENV_ARGS "-p" "127.0.0.1:8080:8080" "-v" "/srv/api-data:/data" "depper/api:release-20261012T154501.237Z-3fa9c2d1"
+ExecStop=/bin/sh -c "..." "/usr/bin/docker" "stop" "depper-api"
 Restart=on-failure
 RestartSec=3
 
@@ -79,12 +79,14 @@ WantedBy=default.target
 For compose mode:
 
 ```ini
-ExecStart="/usr/bin/docker" "compose" "-p" "depper-api" "-f" "compose.yaml" "--env-file" "/dev/null" "up" "--build" "--remove-orphans"
-ExecStop="/usr/bin/docker" "compose" "-p" "depper-api" "-f" "compose.yaml" "--env-file" "/dev/null" "down"
+ExecStart=/bin/sh -c "..." "/usr/bin/docker" "compose" "-p" "depper-api" "-f" "compose.yaml" "--env-file" "/dev/null" "up" "--build" "--remove-orphans"
+ExecStop=/bin/sh -c "..." "/usr/bin/docker" "compose" "-p" "depper-api" "-f" "compose.yaml" "--env-file" "/dev/null" "down"
 ```
 
+(In the unit, `"..."` is the environment-sanitising script described below.)
 Notes:
 
+- `"..."` stands for a script that every engine invocation (`ExecStart`, `ExecStartPre`, and `ExecStop`, in all three modes) runs through `/bin/sh -c '<sanitise>; exec "$0" "$@"'`, with the engine path and its arguments as `$0` and `"$@"`. It applies the same environment sanitising as depper's own scripts: `XDG_RUNTIME_DIR` is reset to `/run/user/UID` unless the inherited one is owned by the user, and `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` are kept only when the user can write to them (or when the directory is missing and its parent is writable). A service therefore does not inherit a foreign `XDG_*` from the systemd user manager, for example from `/etc/environment` through `pam_env`; rootless podman refuses a runtime directory it does not own. Process-mode services get the same treatment from `.depper-start.sh`. depper cannot change what the user manager itself inherits, so on images that put another user's `XDG_*` in `/etc/environment`, remove those lines as well (see [Preparing a host](hosts.md#another-users-xdg-variables-in-etcenvironment)).
 - The container name is `depper-<name>`. `ExecStartPre=-... rm -f` removes a stale container left by a crash; the leading `-` means a failure there is ignored.
 - depper resolves the engine's absolute path on the host with `command -v` and writes it into the unit.
 - The order of `run` arguments is: `--rm --name`, the `--env KEY` arguments from `$DEPPER_CONTAINER_ENV_ARGS`, `-p` entries, `-v` entries, `args`, the image, then the `command` words.
@@ -147,12 +149,12 @@ Pruning a release deletes its image tag (`rmi`), and also removes images labelle
 
 ## Host requirements
 
-`depper host init` installs the engine for you. Without `--container`, it installs the engine that `depper.toml` resolves `[container].engine` to (`docker` when the key is unset) and nothing when there is no `[container]`; `--container podman|docker|none` overrides that. `depper init` writes `engine = "podman"` for container projects, so a detected container project gets rootless podman by default. For podman it also installs the rootless helpers and adds subordinate id ranges for the deploy user; for docker it adds the deploy user to the `docker` group, which is root-equivalent (see below), and enables `docker.service`. docker is refused on RHEL, CentOS, Rocky, and AlmaLinux, which have no distribution package. Compose mode additionally needs a compose provider, which `host init` does not install: on Ubuntu, `podman compose` needs `podman-compose` (the end-to-end test installs it) or the docker compose plugin. The details and the support status are in [Preparing a host](hosts.md#container-engine). Only podman on Ubuntu 24.04 has been verified on a real host.
+`depper host init` installs the engine for you. Without `--container`, it installs the engine that `depper.toml` resolves `[container].engine` to (`docker` when the key is unset) and nothing when there is no `[container]`; `--container podman|docker|none` overrides that. `depper init` writes `engine = "podman"` for container projects, so a detected container project gets rootless podman by default. For podman it also installs the rootless helpers and adds subordinate id ranges for the deploy user; for docker it adds the deploy user to the `docker` group, which is root-equivalent (see below), and enables `docker.service`. docker is refused on RHEL, CentOS, Rocky, and AlmaLinux, which have no distribution package. When the resolved configuration uses `compose`, `host init` also installs a compose provider: `podman-compose` for podman; for docker, the first of `docker-compose-plugin`, `docker-compose-v2`, and `docker-compose` (version 2 or later only) that is installed or available from the repositories. If none is available it refuses with a message: with empty apt lists, run `sudo apt-get update`; on RHEL-compatible systems `podman-compose` is in EPEL; docker on Debian bookworm only offers compose v1, so install `docker-ce` and `docker-compose-plugin` from Docker's repository. Podman is refused on Amazon Linux 2023; use `--container docker` there. The details and the support status are in [Preparing a host](hosts.md#container-engine). Only podman on Ubuntu 24.04 has been verified on a real host.
 
 Requirements, whether you use `host init` or prepare the host yourself:
 
 - The engine binary (`docker` or `podman`) installed on the host, found on the non-interactive SSH `PATH`. `depper doctor` fails if it is missing.
-- Compose mode needs the compose plugin: `docker compose` (v2), or a working `podman compose` provider.
+- Compose mode needs the compose plugin: `docker compose` (v2), or a working `podman compose` provider. `depper doctor` has a `compose` check for this: in compose mode, when the engine is installed, it runs `<engine> compose version` as the deploy user and fails if that does not succeed. It is skipped when the engine itself is missing (the `container engine` check already fails).
 - The account must be able to use the engine without root:
   - Rootless podman: no daemon and no extra group. Requires subordinate UID/GID ranges for the account (`/etc/subuid`, `/etc/subgid`), and lingering so containers survive logout. Rootless containers cannot bind ports below 1024 unless the system allows it.
   - Docker: the account must be in the `docker` group, or use rootless docker.
