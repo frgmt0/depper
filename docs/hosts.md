@@ -51,8 +51,8 @@ On your machine: `ssh`, `ssh-keyscan` (both ship with the OpenSSH client), and a
 
 On the host:
 
-- A Debian/Ubuntu family system (`apt`) or a Fedora/RHEL family system (`dnf`). depper reads `ID` and `ID_LIKE` from `/etc/os-release`: `debian`, `ubuntu`, `fedora`, `rhel`, `centos`, `rocky`, and `almalinux` are recognised, as are derivatives that list one of `debian`, `ubuntu`, `fedora`, `rhel`, or `centos` in `ID_LIKE`. Other systems are refused before anything changes. Amazon Linux 2023 (`ID=amzn`) is handled as a dnf system: podman is refused there (use docker), and Tailscale comes from its Amazon Linux repository.
-- systemd as the init system (`/run/systemd/system` must exist) and `runuser` from util-linux. `--harden-ssh` and `--firewall` also need `systemd-run` (see [Guarded changes](#guarded-changes-automatic-revert)).
+- A Debian/Ubuntu family system (`apt`) or a Fedora/RHEL family system (`dnf`). depper reads `ID` and `ID_LIKE` from `/etc/os-release`: `debian`, `ubuntu`, `fedora`, `rhel`, `centos`, `rocky`, and `almalinux` are recognised, as are derivatives that list one of `debian`, `ubuntu`, `fedora`, `rhel`, or `centos` in `ID_LIKE`. Other systems are refused before anything changes. Amazon Linux 2023 and later (`ID=amzn`) is handled as a dnf system: podman is refused there (use docker), and Tailscale comes from its Amazon Linux repository. Amazon Linux 2 is refused before anything changes.
+- systemd as the init system (`/run/systemd/system` must exist) and `runuser` from util-linux. A `--harden-ssh` or `--firewall` step that actually changes something also needs `systemd-run` and systemd 236 or later (for `--collect`); otherwise host init refuses with a clear message (see [Guarded changes](#guarded-changes-automatic-revert)).
 - An administrator login that is root, or a user for which `sudo -n` works. depper connects with `BatchMode=yes` and cannot type a password, so a user whose `sudo` asks for one is refused, with a message showing the sudoers line that would allow it. A non-root administrator needs an SSH key; password login is not supported.
 - Network access from the host to its package repositories.
 
@@ -173,15 +173,27 @@ All hardening is opt-in. Nothing in this section happens unless you pass the fla
 
 #### Guarded changes (automatic revert)
 
-`--harden-ssh` and `--firewall` can lock everyone out of the host, so each runs as a guarded change. Both need `systemd-run` on the host; without it host init refuses, changing nothing.
+`--harden-ssh` and `--firewall` can lock everyone out of the host, so each runs as a guarded change. A guarded step that has something to change needs `systemd-run` and systemd 236 or later (`--collect`); without them host init refuses with a clear message, changing nothing. A step that is already satisfied needs neither.
 
-1. Before the change, depper arms a transient systemd timer on the host (`systemd-run --unit=depper-ssh-revert` for sshd, `depper-firewall-revert` for the firewall) that fires after 120 seconds and undoes the change by itself:
-   - `--harden-ssh`: restores the previous drop-in from `10-depper.conf.depper-prev`, or removes `10-depper.conf` when there was none, then reloads sshd.
-   - `--firewall`: when the firewall was off before, runs `ufw --force disable` or `systemctl disable --now firewalld`; otherwise it removes only the rules depper added.
+Each guarded change keeps its state in `/var/lib/depper/guard/UNIT/` on the host, where `UNIT` is `depper-ssh-revert` or `depper-firewall-revert`: the script `revert.sh` and explicit marker files that say what to undo.
+
+| Change | Markers |
+|---|---|
+| `--harden-ssh` | `had-prev` and `prev` (a drop-in existed; `prev` is its copy) or `had-none` (there was none) |
+| `--firewall` | `was-inactive` (the firewall was off) and `added-ports` (the TCP ports depper added, one per line) |
+| both | `started` (the timer started the revert), `reverted` (who ran the revert and when), `reloaded` (sshd is about to reload the drop-in) |
+
+The revert acts only on the markers that exist and removes each one it has handled, so it is idempotent: the timer and host init may both run it, and the second run does nothing.
+
+1. Before the change, depper writes the markers and `revert.sh` and arms a transient timer on the host: `systemd-run --collect` with `Type=oneshot`, `AccuracySec=1s`, and `RandomizedDelaySec=0`, firing 120 seconds after arming. Host init prints the exact time. The revert undoes the change by itself:
+   - `--harden-ssh`: restores the previous drop-in from the `prev` copy, or removes `10-depper.conf` when there was none, then reloads sshd (the timer always reloads; host init reloads only if the `reloaded` marker says it had).
+   - `--firewall`: when the firewall was off before, runs `ufw --force disable` or `systemctl disable --now firewalld`; otherwise it removes only the ports depper added.
 2. depper makes the change and checks it with new SSH connections, each a fresh login without connection sharing: one as the deploy user and one as the administrator.
-3. Only when both succeed does depper disarm the timer (`systemctl stop`), and for sshd delete the saved previous drop-in.
+3. Only when both succeed does depper disarm the timer and remove the markers. Disarming stops the timer first, then checks whether the revert service ever started; if it did, the change is reported as undone.
 
-If a check fails, depper rolls back at once over the administrator connection and disarms the timer. If that is impossible, it waits for the timer to fire, checks that an administrator login works again, and reports exactly what happened, including when a login still fails and you must use the provider console. If disarming fails after a successful check, depper reports loudly that the timer will undo the change at the time it names (stop it yourself with `sudo systemctl stop depper-ssh-revert.timer`, or the `depper-firewall-revert` unit, to keep the change); if the timer had already fired, it says the change was undone and to run host init again. A run that is interrupted (Ctrl-C, a lost connection) is undone by the timer too. A timer left behind by an interrupted run is stopped when the next run arms its own.
+If a check fails, depper rolls back at once over the administrator connection and disarms the timer. If that is impossible (for example after a lockout), host init polls the host every few seconds for the `reverted` marker, until 120 seconds plus 15 seconds have passed. It reports the time at which the timer reverted the change and that an administrator login works again; if the marker does not appear in time, it says the revert is overdue and to use the provider console. If disarming fails after a successful check, depper reports loudly that the timer will undo the change at the time it names (stop it yourself with `sudo systemctl stop depper-ssh-revert.timer`, or the `depper-firewall-revert` unit, to keep the change); if the timer had already started, it says the change was undone and to run host init again. If `systemd-run` itself fails while arming, the error says that the revert script and markers were written and removed again (or could not be removed, and then how to proceed).
+
+A run that is interrupted (Ctrl-C, a lost connection) is undone by the timer too. If the next host init finds the timer still waiting or markers present, it says "Finishing an interrupted host init", runs the revert at once (it starts the revert service, which `systemctl` waits for), reads the host again, and only then plans. A dry run only warns about it. A timer of an earlier run that has already elapsed is cleared with a note when the next run arms its own; a waiting one is never stopped silently.
 
 #### `--harden-ssh`
 
@@ -193,19 +205,19 @@ KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 ```
 
-The `PermitRootLogin` line is written only when the effective value is `yes` (or when depper's own earlier drop-in already carried it). Otherwise the directive is omitted: depper never weakens `PermitRootLogin`, so `prohibit-password`, `forced-commands-only`, and `no` stay as they are. Root login with a key therefore stays allowed only where it was allowed before. If the administrator is root and `PermitRootLogin` is `no`, root could not log in anyway, so the administrator must be a user with passwordless sudo.
+The `PermitRootLogin` line is written only when the underlying value is `yes`. depper determines that value without its own drop-in (`sshd -T` on a temporary copy of the configuration without `10-depper.conf`); if it cannot, it refuses. Otherwise the directive is omitted, and a `PermitRootLogin` line written by earlier depper builds over a stricter setting is removed again: depper never weakens `PermitRootLogin`, so `prohibit-password`, `forced-commands-only`, and `no` stay as they are. Root login with a key therefore stays allowed only where it was allowed before. If the administrator is root and `PermitRootLogin` is `no`, root could not log in anyway, so the administrator must be a user with passwordless sudo.
 
 The file name sorts before the drop-ins that cloud images ship (Ubuntu's `50-cloud-init.conf`), and sshd keeps the first value it reads for each option, so depper's settings win over those. Only a line that sorts earlier, or a line in the main `sshd_config` before its `Include`, can override them.
 
 Safety checks, all before anything is locked down:
 
 - **Refusal at planning time.** depper refuses to continue, changing nothing, when:
-  - `sshd` is not installed, or `systemd-run` is missing;
+  - `sshd` is not installed;
   - the main `/etc/ssh/sshd_config` has no `Include /etc/ssh/sshd_config.d/*.conf` line, because the drop-in would be ignored (add the line yourself, or drop the flag);
   - the current sshd configuration does not pass `sshd -T`;
   - `PasswordAuthentication`, `KbdInteractiveAuthentication`, `ChallengeResponseAuthentication`, or `PermitRootLogin` is set to `yes` in the main config before its `Include`, or in a drop-in that sorts before `10-depper.conf`. The error names those files, for example `sshd_config.d/01-local.conf`. Change or remove those lines first.
 - **Match blocks.** A `Match` block in `sshd_config` or a drop-in that sets `PasswordAuthentication`, `KbdInteractiveAuthentication`, `ChallengeResponseAuthentication`, or `PermitRootLogin` is not refused. The plan prints a warning, and `depper host status` reports an `ssh match blocks` warning: hardening does not cover the connections such a block matches.
-- **Validation after writing.** depper keeps the previous drop-in, writes the new one, runs `sshd -t`, and checks the effective settings with `sshd -T`. If sshd rejects the configuration, or an option still has a weaker value, the previous drop-in is restored (or the file removed) and the command fails. The `PermitRootLogin` check accepts anything at least as strict as before (and never weaker than `prohibit-password`).
+- **Validation after writing.** depper keeps the previous drop-in (in the guard's state directory), writes the new one, runs `sshd -t`, and checks the effective settings with `sshd -T`. If sshd rejects the configuration, or an option still has a weaker value, the previous drop-in is restored (or the file removed) and the command fails. The `PermitRootLogin` check accepts anything at least as strict as before (and never weaker than `prohibit-password`).
 - **Key login proof.** Before sshd is reloaded, depper opens a new SSH connection as the deploy user with its key and runs a test script. If that fails, the previous state is restored and sshd is not reloaded.
 - **Reload and re-check.** depper reloads `ssh.service` or `sshd.service` (whichever is active), then opens new connections as the deploy user and as the administrator. If either fails, it rolls back as described under [Guarded changes](#guarded-changes-automatic-revert).
 
@@ -220,7 +232,7 @@ Afterwards `depper host status` reports `ssh hardening` as a warning, because th
 
 #### `--firewall PORTS`
 
-Enables a host firewall. It allows the union of three sets of TCP ports: the ports you list, the port `host init` connects to (`--port`), and every port sshd listens on (from `sshd -T`). So the port in use cannot be closed by the list you give, and neither can a port sshd listens on. For example `--firewall 80,443` allows 22, 80, and 443. If `--port` is not one of sshd's ports, depper warns and assumes a port forward or NAT in between.
+Enables a host firewall. It allows the union of these TCP ports: the ports you list, the port `host init` connects to (`--port`), every sshd `Port` and `ListenAddress` port (from `sshd -T`), and the `ListenStream` ports of `ssh.socket` when that socket is active. So the port in use cannot be closed by the list you give, and neither can a port sshd listens on, including through socket activation. For example `--firewall 80,443` allows 22, 80, and 443. If `--port` is not one of sshd's ports, depper warns and assumes a port forward or NAT in between.
 
 - Debian and Ubuntu: installs `ufw`, runs `ufw allow N/tcp` for each port that is not allowed yet, then `ufw --force enable` if ufw is inactive. ufw's default policy applies to everything else.
 - Fedora and RHEL: installs `firewalld`. depper works in the zone of the interface that the administrator's SSH connection arrives on: it takes the local address from `SSH_CONNECTION`, finds the interface that holds it with `ip -o addr`, and asks `firewall-cmd --get-zone-of-interface`. If that gives no zone it uses the default zone and warns. If firewalld is running, depper adds each missing port to both the runtime and the permanent configuration of that zone, so no reload is needed. Otherwise it adds the ports offline and enables `firewalld.service`. Port 22 counts as allowed when the `ssh` service is allowed in the zone, in both configurations.
@@ -338,7 +350,7 @@ With human output, `host status` first prints the depper version and timestamps 
 
 Some images set `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, or similar in `/etc/environment` for their own default user (for example `/run/user/1001` and `/home/runner/.config`). `pam_env` applies that file to every login and systemd applies it to every user manager, so the deploy user's manager and rootless podman then try to use another user's directories and fail: units cannot start, or podman refuses a runtime directory it does not own.
 
-depper sanitises the environment of everything it starts. Its own scripts, the process-mode start script `.depper-start.sh`, and every container engine invocation in a generated unit (`ExecStart`, `ExecStartPre`, `ExecStop`, run through `/bin/sh -c '<sanitise>; exec "$0" "$@"'`) reset `XDG_RUNTIME_DIR` to `/run/user/UID` unless the inherited one is owned by the user, and keep `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` only when the user can write to them (or when the directory is missing and its parent is writable). So the services depper starts no longer inherit another user's `XDG_*` from the user manager.
+depper sanitises the environment of everything it starts. Its own scripts, the process-mode start script `.depper-start.sh`, and every container engine invocation in a generated unit (`ExecStart`, `ExecStartPre`, `ExecStop`, run through `/bin/sh -c '<sanitise>; exec "$0" "$@"'`) reset `XDG_RUNTIME_DIR` to `/run/user/UID` unless the inherited one is owned by the user, and keep `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` only when the directory is owned by the user and not writable by group or others (or when it is missing and its parent meets that test; symbolic links are followed). So the services depper starts no longer inherit another user's `XDG_*` from the user manager.
 
 depper cannot change what the systemd user manager itself inherits: its own generators and `environment.d` still see these variables, and so does anything else that runs inside the manager. This is not just cosmetic: on the GitHub-hosted Ubuntu runner image, with its `XDG_*` lines in `/etc/environment`, the deploy user's manager does not start at all (`user@UID.service` times out), so no service runs, sanitised or not. The end-to-end test therefore only checks the services against a running manager that was given the foreign values (`systemctl --user set-environment`). On images that set them, remove the foreign lines from `/etc/environment` (as root):
 
@@ -367,7 +379,7 @@ Verified on a real Ubuntu 24.04 VM (a GitHub-hosted runner, acting as its own de
 Not verified on real hosts:
 
 - Fedora, RHEL, CentOS, Rocky, and AlmaLinux (`dnf`, `firewalld`, `dnf-automatic`), and Amazon Linux 2023
-- the automatic revert timers firing on a real host, and `host status` reading `sshd -T` as the deploy user
+- the automatic revert timers firing on a real host (only the `--harden-ssh` lockout case is covered by the end-to-end test), and `host status` reading `sshd -T` as the deploy user
 - Tailscale installation and `tailscale up`
 - `cloudflared` installation
 - the docker engine path (group membership and `docker.service`)

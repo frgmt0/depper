@@ -622,9 +622,8 @@ jobs:
           probe_tcp 22 || { echo "::error::port 22 is not reachable from the probe namespace"; exit 1; }
           host_init harden 0 --harden-ssh --firewall 22
           check harden '.error == null and (.applied | index("harden-ssh")) != null and (.applied | index("firewall")) != null'
-          # The elapsed timer of the lockout step is cleared, not mistaken
-          # for an interrupted run.
-          grep_log harden 'clearing the finished depper-ssh-revert.timer of an earlier run'
+          # The timer that already ran in the lockout step (systemd unloads
+          # it with --collect) is not mistaken for an interrupted run.
           if grep -q 'Finishing an interrupted host init' "$LOG/harden.out" "$LOG/harden.err"; then echo "::error::the elapsed timer was treated as pending"; exit 1; fi
           sudo test -f /etc/ssh/sshd_config.d/10-depper.conf
           eff=$(sudo sshd -T)
