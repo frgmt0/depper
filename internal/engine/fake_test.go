@@ -90,6 +90,11 @@ host:
 		"XDG_RUNTIME_DIR=" + filepath.Join(root, "run"),
 		"TMPDIR=" + filepath.Join(root, "tmp"),
 	}
+	// FAKE_ROOT/login-xdg emulates a login that sets another user's
+	// XDG_RUNTIME_DIR (pam_env with /etc/environment).
+	if xdg, err := os.ReadFile(filepath.Join(root, "login-xdg")); err == nil {
+		env = append(env, "XDG_RUNTIME_DIR="+strings.TrimSpace(string(xdg)))
+	}
 	cmd.Env = env
 	if err := cmd.Run(); err != nil {
 		if exit, ok := err.(*exec.ExitError); ok {
@@ -249,6 +254,7 @@ echo "journal line for $*"
 // holds one "ref label" line per image (label "-" when unlabelled).
 const fakeDocker = `#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_ROOT/docker.log"
+printf '%s\n' "${XDG_RUNTIME_DIR:-}" >> "$FAKE_ROOT/docker-xdg.log"
 images="$FAKE_ROOT/docker-images"
 touch "$images"
 case "$1" in

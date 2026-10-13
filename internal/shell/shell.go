@@ -51,11 +51,23 @@ func Script(lines ...string) string {
 }
 
 // Prelude returns the lines every systemd --user script starts with: strict
-// mode and the session bus variables a non-interactive SSH session lacks.
+// mode and the session variables (SessionEnv).
 func Prelude() []string {
+	return append([]string{"set -eu"}, SessionEnv()...)
+}
+
+// SessionEnv returns lines that export XDG_RUNTIME_DIR and
+// DBUS_SESSION_BUS_ADDRESS for systemctl --user and rootless podman. A
+// non-interactive SSH session may lack them, and an inherited
+// XDG_RUNTIME_DIR may belong to another user (pam_env applies
+// /etc/environment, which on some images names the image user's
+// /run/user/UID); podman refuses such a directory. Unless the inherited
+// directory exists and is owned by the current user, both are set to
+// /run/user/$(id -u).
+func SessionEnv() []string {
 	return []string{
-		"set -eu",
-		`export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"`,
+		`if test -z "${XDG_RUNTIME_DIR:-}" || ! test -d "$XDG_RUNTIME_DIR" || ! test -O "$XDG_RUNTIME_DIR"; then XDG_RUNTIME_DIR="/run/user/$(id -u)"; DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; fi`,
+		`export XDG_RUNTIME_DIR`,
 		`export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"`,
 	}
 }

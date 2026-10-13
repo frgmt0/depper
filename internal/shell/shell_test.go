@@ -3,6 +3,7 @@ package shell
 import (
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -152,5 +153,47 @@ func TestWrapRunsNothingWhenTruncated(t *testing.T) {
 	}
 	if Wrap("echo x") != "set +xv\n{\necho x\n}\n" {
 		t.Errorf("Wrap without trailing newline = %q", Wrap("echo x"))
+	}
+}
+
+// An inherited XDG_RUNTIME_DIR that is missing or owned by another user
+// (pam_env applying /etc/environment, as on the GitHub runner image) is
+// replaced, with the bus address; the session's own one is kept.
+func TestSessionEnvReplacesForeignRuntimeDir(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not available")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root owns every directory used here")
+	}
+	own := t.TempDir()
+	run := "/run/user/" + strconv.Itoa(os.Geteuid())
+	for _, tt := range []struct {
+		name, xdg, dbus, wantXDG, wantDBus string
+	}{
+		{"unset", "", "", run, "unix:path=" + run + "/bus"},
+		{"another user's", "/", "unix:path=//bus", run, "unix:path=" + run + "/bus"},
+		{"missing", own + "/gone", "", run, "unix:path=" + run + "/bus"},
+		{"own", own, "unix:path=" + own + "/custom", own, "unix:path=" + own + "/custom"},
+		{"own without bus", own, "", own, "unix:path=" + own + "/bus"},
+	} {
+		cmd := exec.Command(sh, "-s")
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+		if tt.xdg != "" {
+			cmd.Env = append(cmd.Env, "XDG_RUNTIME_DIR="+tt.xdg)
+		}
+		if tt.dbus != "" {
+			cmd.Env = append(cmd.Env, "DBUS_SESSION_BUS_ADDRESS="+tt.dbus)
+		}
+		cmd.Stdin = strings.NewReader(Script(append(Prelude(), `printf '%s\n%s\n' "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS"`, `sh -c 'printf "%s\n" "$XDG_RUNTIME_DIR"'`)...))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: %v %s", tt.name, err, out)
+		}
+		want := tt.wantXDG + "\n" + tt.wantDBus + "\n" + tt.wantXDG + "\n"
+		if string(out) != want {
+			t.Errorf("%s: got %q, want %q", tt.name, out, want)
+		}
 	}
 }

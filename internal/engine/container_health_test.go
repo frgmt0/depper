@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -134,6 +135,32 @@ func TestImageModeTagsPerRelease(t *testing.T) {
 		t.Errorf("per-release tags of pruned releases kept: %q", images)
 	}
 	checkScriptSyntax(t, h.Exec.Scripts())
+}
+
+// The GitHub runner image puts its own user's XDG_RUNTIME_DIR into
+// /etc/environment, so pam_env hands /run/user/1001 to every SSH login and
+// rootless podman refused it ("XDG_RUNTIME_DIR directory ... is not owned by
+// the current user"). The engine must run with the deploy user's own.
+func TestContainerEngineGetsOwnRuntimeDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root owns every directory used here")
+	}
+	h := newFakeHost(t)
+	writeFile(t, filepath.Join(h.Root, "login-xdg"), "/")
+	toml := "[service]\nname = \"web\"\n[deploy]\nhost = \"fakehost\"\n[container]\nengine = \"podman\"\nbuild = \".\"\n"
+	repo := writeRepo(t, toml, map[string]string{"Dockerfile": "FROM scratch\n"})
+	h.writeExec("remote-bin/podman", fakeDocker)
+	deploy(t, h.Engine(loadConfig(t, repo)), DeployOptions{})
+	want := "/run/user/" + strconv.Itoa(os.Geteuid())
+	lines := strings.Fields(h.log("docker-xdg.log"))
+	if len(lines) == 0 {
+		t.Fatal("the container engine never ran")
+	}
+	for _, got := range lines {
+		if got != want {
+			t.Errorf("container engine ran with XDG_RUNTIME_DIR=%q, want %q", got, want)
+		}
+	}
 }
 
 func TestChooseDigest(t *testing.T) {

@@ -64,10 +64,8 @@ const statusMarker = "@@depper-host-status"
 // statusScript reads the host record and live state as the deploy user; it
 // needs no administrator rights and changes nothing.
 func (r *Runner) statusScript() string {
-	return shell.Script(
-		"set -u",
-		`export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"`,
-		`export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"`,
+	lines := append([]string{"set -u"}, shell.SessionEnv()...)
+	return shell.Script(append(lines,
 		"echo "+statusMarker,
 		`u=$(id -un 2>/dev/null || true)`,
 		`printf 'user=%s\n' "$u"`,
@@ -83,7 +81,7 @@ func (r *Runner) statusScript() string {
 		`for t in dnf-automatic-install.timer dnf5-automatic.timer; do if systemctl is-enabled --quiet "$t" 2>/dev/null; then echo autoupd=1; fi; done`,
 		`if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then echo tailscale_up=1; fi`,
 		`echo status_done=1`,
-	)
+	)...)
 }
 
 // Status reports on a host prepared by host init, connecting as the deploy

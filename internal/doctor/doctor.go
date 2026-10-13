@@ -87,14 +87,11 @@ const factsMarker = "@@doctor"
 // deploy host. It only reads state.
 func Script(cfg *config.Config) string {
 	base, legacy := engine.BaseAssignments(cfg)
-	lines := []string{
-		"set +xv",
-		"set -u",
-		`export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"`,
-		`export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"`,
-		"base=" + base,
-		"legacy=" + legacy,
-		`echo ` + factsMarker,
+	lines := append([]string{"set +xv", "set -u"}, shell.SessionEnv()...)
+	lines = append(lines,
+		"base="+base,
+		"legacy="+legacy,
+		`echo `+factsMarker,
 		`user=$(id -un 2>/dev/null || true)`,
 		`printf 'user=%s\n' "$user"`,
 		`printf 'base=%s\n' "$base"`,
@@ -109,7 +106,7 @@ func Script(cfg *config.Config) string {
 		// Free space of the filesystem that holds (or will hold) the base.
 		`d=$base; while test ! -d "$d" && test "$d" != / && test "$d" != .; do d=$(dirname "$d"); done`,
 		`printf 'disk_kb=%s\n' "$(df -Pk "$d" 2>/dev/null | awk 'NR==2 { print $4 }')"`,
-	}
+	)
 	if c := cfg.Container; c != nil {
 		lines = append(lines, `printf 'engine=%s\n' "$(command -v `+shell.Quote(c.Engine)+` 2>/dev/null || true)"`)
 	}

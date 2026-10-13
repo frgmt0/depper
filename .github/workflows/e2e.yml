@@ -156,6 +156,7 @@ jobs:
           done
           sudo sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication|allowtcpforwarding|port) '
           ls -l /etc/ssh/sshd_config.d/ || true
+          grep -n "^XDG_RUNTIME_DIR" /etc/environment || echo "no XDG_RUNTIME_DIR in /etc/environment"
 
       - name: Create the admin and deploy keys
         run: |
