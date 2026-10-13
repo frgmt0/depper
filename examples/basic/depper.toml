@@ -1,0 +1,25 @@
+# Minimal process service. server.py runs on the deploy host, so the host needs python3.
+
+[service]
+name = "basic"
+command = "python3 server.py"
+restart = "on-failure"
+
+[deploy]
+# SSH alias, DNS name, IPv4/IPv6 address, optionally prefixed with user@.
+host = "deploy@203.0.113.10"
+# keep_releases = 5
+
+[env]
+HOST = "127.0.0.1"
+PORT = "8080"
+GREETING = "hello from depper"
+
+# Checked from the host, so the loopback address is fine.
+[health]
+url = "http://127.0.0.1:8080/health"
+expect_status = 200
+
+# Uncomment if you bind to a reachable address (set HOST above) and open the port.
+# [endpoint]
+# url = "http://203.0.113.10:8080"

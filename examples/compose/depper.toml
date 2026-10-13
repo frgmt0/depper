@@ -1,0 +1,24 @@
+# Compose stack: depper runs "docker compose up" under a systemd user unit.
+
+[service]
+name = "compose-demo"
+restart = "on-failure"
+
+[deploy]
+host = "deploy@203.0.113.10"
+
+[container]
+engine = "docker"               # or "podman" (needs a working "podman compose")
+compose = "compose.yaml"
+
+[env]
+GREETING = "hello from compose"
+
+# Optional secrets (see the README); the file must exist when this table is present.
+# [secrets]
+# file = ".env.production"
+
+[health]
+url = "http://127.0.0.1:8080/health"
+expect_status = 200
+start_period = 60

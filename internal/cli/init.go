@@ -101,12 +101,14 @@ command = "python -m your_app"
 restart = "on-failure"
 
 [deploy]
-host = "desktop"            # SSH alias, DNS name, IPv4, or IPv6 address (user@ allowed)
-# user = "deploy"
+# Replace with your server: an SSH alias, a DNS name, an IPv4 address, or an
+# IPv6 address, optionally prefixed with user@ (203.0.113.10 is a documentation address).
+host = "deploy@203.0.113.10"
+# user = "deploy"                      # alternative to a user@ prefix in host
 # port = 22
-# identity_file = "~/.ssh/id_ed25519"
-# known_hosts = "~/.ssh/known_hosts"   # pins host keys (StrictHostKeyChecking=yes)
-# path = "/absolute/path/on/server"    # default: ~/.local/share/depper/<name>
+# identity_file = "~/.ssh/id_ed25519"  # no whitespace in the path
+# known_hosts = "~/.ssh/known_hosts"   # pins host keys (StrictHostKeyChecking=yes); no whitespace in the path
+# path = "/absolute/path/on/server"    # default: ~/.local/share/depper/<name>; only letters, digits and . _ @ + / -
 # setup = ["python -m venv .venv", ".venv/bin/pip install -r requirements.txt"]
 # exclude = ["build/"]
 # keep_releases = 5
@@ -136,10 +138,10 @@ host = "desktop"            # SSH alias, DNS name, IPv4, or IPv6 address (user@ 
 # [container]
 # engine = "docker"                    # or "podman"
 # build = "."                          # or image = "ghcr.io/you/app:1.0", or compose = "compose.yaml"
-# ports = ["127.0.0.1:8000:8000"]
+# ports = ["127.0.0.1:8000:8000"]      # ports, volumes and args are not allowed with compose
 # volumes = ["/srv/data:/data"]
 
-# Public HTTPS through a Cloudflare Tunnel.
+# Public HTTPS through a Cloudflare Tunnel (not overridable per target).
 # [tunnel]
 # hostname = "app.example.com"
 # service = "http://127.0.0.1:8000"

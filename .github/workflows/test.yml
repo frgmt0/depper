@@ -34,4 +34,6 @@ jobs:
           fi
 
       - name: Test
-        run: go test -race ./...
+        # The engine package alone needs about 16 minutes under -race on a laptop
+        # (about 1 minute without it), longer than the default 10-minute go test timeout.
+        run: go test -race -timeout 45m ./...

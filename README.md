@@ -1,155 +1,153 @@
-# deployer
+# depper
 
-`deployer` is a small Python 3.11+ command-line tool for shipping a repository to a Linux host over SSH and rsync, then running it as a systemd **user** service. It keeps the service definition in the repository and uses the host's user account, so the deployed process does not need root privileges.
+depper deploys a repository to a Linux host over SSH and runs it as a systemd user service. It copies the working tree (or a git ref) into a new release directory with rsync, installs a systemd user unit, restarts the service, waits for a health check, and restores the previous release automatically if the deployment does not become healthy. A deployment is described by a single `depper.toml` in the repository. Nothing is installed on the host beyond what the service itself needs; depper is a single local binary that drives the system `ssh` and `rsync`.
+
+depper replaces the Python tool `deployer`. See [Migrating from deployer](docs/migrating-from-deployer.md) for existing deployments.
+
+## What depper manages
+
+- Release directories under `~/.local/share/depper/<name>` (or `[deploy].path`), with `current` and `previous` symlinks, release metadata, and pruning of old releases.
+- One systemd user unit per service, `depper-<name>.service`, for either a process command or a docker/podman container (build, prebuilt image, or compose file).
+- The service environment: plain variables from `[env]` and secrets from a local dotenv file, stored on the host in a private file with a salted-fingerprint manifest for drift detection.
+- Health checks (HTTP URL or command), deployment transactions, automatic restore, rollback, and a per-service lock.
+- Optional: a dedicated Cloudflare Tunnel per service, and a generated GitHub Actions workflow.
+
+## What depper does not do
+
+- It does not provision hosts, install packages, open firewall ports, or enable lingering. See [Preparing a host](docs/hosts.md).
+- It does not provide zero-downtime deployments. The unit is restarted on every deployment, so there is a short interruption.
+- It does not roll back databases, uploaded files, or any state outside the release directory.
+- It does not manage system-wide units, Windows services, macOS launchd jobs, or Kubernetes.
+- It is not a secret vault. Secrets are protected by file permissions on the host account. See [Secrets](docs/secrets.md).
+- It does not run on a host without systemd, and it does not use a remote agent or daemon.
+
+## Requirements
+
+Local machine (where you run `depper`): `ssh`, `rsync`, and `git` (git is optional unless you deploy a ref or use `source = "git"`). Linux or macOS binaries are published.
+
+Deploy host: Linux with a systemd user manager, a POSIX `sh`, GNU-compatible coreutils (including `sha256sum`, `mktemp`, `base64`, and `mv -T`), and `rsync`. `curl` is optional and only used as a fallback for URL health checks. A container engine (docker or podman) is needed only when `[container]` is used, and `cloudflared` only when `[tunnel]` is used. No Python is required by depper; your application may need its own runtime.
+
+The remote base directory (`[deploy].path`, or the default under the remote `$HOME`) may contain only letters, digits, and `. _ @ + / -`. A remote `$HOME` with other characters needs `[deploy].path`. Local `identity_file` and `known_hosts` paths, and the CI variables `DEPPER_SSH_KEY_FILE` and `DEPPER_KNOWN_HOSTS_FILE`, may not contain whitespace.
+
+Authentication is non-interactive (`ssh -o BatchMode=yes`): use SSH keys or an agent. Password prompts are not supported.
 
 ## Install
 
-From a checkout, install the command with either:
+### Release binary
+
+Archives for Linux and macOS (amd64 and arm64) are attached to each [GitHub release](https://github.com/frgmt0/depper/releases) together with `checksums.txt` (SHA-256). Replace `VERSION`, `OS` (`linux` or `darwin`), and `ARCH` (`amd64` or `arm64`):
 
 ```sh
-pipx install .
+VERSION=0.2.0 OS=linux ARCH=amd64
+base="https://github.com/frgmt0/depper/releases/download/v${VERSION}"
+archive="depper_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -fsSLO "${base}/${archive}"
+curl -fsSLO "${base}/checksums.txt"
+grep " ${archive}\$" checksums.txt | sha256sum -c -      # on macOS: ... | shasum -a 256 -c -
+tar -xzf "${archive}" depper
+install -m 0755 depper /usr/local/bin/depper
+depper --version
 ```
 
-or an isolated virtual environment:
+The checksum file lives in the same release as the archive, so it detects corruption and mismatched downloads but does not prove authorship. Compare it against the release page if that matters to you.
+
+### go install
 
 ```sh
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install .
+go install github.com/frgmt0/depper/cmd/depper@latest
 ```
 
-Your local `python3` must be version 3.11 or newer. The target host must be Linux with Python 3 and rsync available. SSH must be able to connect using the configured host name or alias. See [SETUP.md](SETUP.md) for host preparation.
+This requires Go 1.24 or newer. A binary built this way reports its version as `dev`.
+
+### From source
+
+```sh
+git clone https://github.com/frgmt0/depper.git
+cd depper
+go build -o depper ./cmd/depper
+```
+
+To embed a version string, as release builds do:
+
+```sh
+go build -ldflags "-X github.com/frgmt0/depper/internal/version.Version=v0.2.0" -o depper ./cmd/depper
+```
 
 ## Quick start
 
-The repository needs a `deploy.toml` file. This example deploys a Python HTTP server:
+Prepare the host first ([docs/hosts.md](docs/hosts.md)): an unprivileged account, SSH access, and `loginctl enable-linger`.
+
+```sh
+cd your-repository
+depper init           # writes a starter depper.toml
+$EDITOR depper.toml   # set the service name, command, and [deploy].host
+depper doctor         # checks SSH, rsync, systemd, linger, disk space
+depper deploy --dry-run
+depper deploy
+depper status
+depper health
+```
+
+A minimal `depper.toml`:
 
 ```toml
 [service]
-name = "sample-http"
+name = "basic"
 command = "python3 server.py"
-restart = "on-failure"
 
 [deploy]
-host = "desktop"
-# path = "/srv/sample-http" # optional; omit to use ~/.local/share/deployer/sample-http
+host = "deploy@203.0.113.10"
 
 [env]
 PORT = "8080"
+
+[health]
+url = "http://127.0.0.1:8080/health"
 ```
 
-```sh
-deployer init       # create a starter deploy.toml when one is absent
-deployer            # deploy (the default command)
-deployer status
-deployer logs
-deployer restart
-deployer stop
-deployer rollback
-```
+`depper` with no command is the same as `depper deploy`. A repository path can be given where the usage shows `[REPO]`, for example `depper status /path/to/repo`; `depper /path/to/repo status` is accepted as well.
 
-Use a repository path explicitly when running the command elsewhere. The subcommand comes first:
-
-```sh
-deployer deploy /path/to/sample-http
-deployer deploy --dry-run
-deployer deploy --env .env.prod
-```
-
-`--dry-run` shows the planned deployment without copying files or changing the remote service. `status`, `logs`, `restart`, `stop`, and `rollback` operate on the service named by `deploy.toml`. Rollback uses the deployer's retained previous release when one is available; it cannot roll back database or other external state.
-
-`--env FILE` overrides the file selected by `[secrets].file` for that deployment. Relative CLI paths start at your current directory; relative TOML paths start at the repository root. Absolute paths and `~` are also supported.
-
-`--env FILE` is a deploy-only option; status, logs, restart, stop, rollback, and tunnel commands do not load secret files. If a secret source is removed, the next deployment writes only the remaining `[env]` values and removes keys that existed only in the old secret source.
-
-## Configuration
-
-`deploy.toml` has three core sections and optional `[secrets]` and `[tunnel]` sections:
-
-- `[service]` requires `name` and `command`. `restart` is optional and must be `on-failure`, `always`, or `no`.
-- `[deploy]` requires `host`. `path` is an optional absolute remote directory. If omitted, the path is resolved on the remote host as `~/.local/share/deployer/<name>`. `setup` is an optional array of shell commands run on the remote host before starting the service. `exclude` is an optional array of rsync exclude patterns. `healthcheck` is an optional command used after startup; a nonzero exit status marks deployment unhealthy.
-- `[env]` contains string environment variables passed to the service.
-- `[secrets]` is optional. Set `file` to a dotenv file path such as `.env.prod`; repository-relative paths are resolved from the repository, while a CLI `--env FILE` path is resolved from the current working directory.
-- `[tunnel]` is optional. Set `hostname` to a chosen `*.frgmt.xyz` hostname and `service` to the local origin (for example, `http://127.0.0.1:3001`). The deployer creates a dedicated locally-managed `cloudflared` tunnel for the service and runs it as an independent user service.
-
-For example:
-
-```toml
-[service]
-name = "worker"
-command = ".venv/bin/python worker.py --queue jobs"
-restart = "always"
-
-[deploy]
-host = "desktop"
-path = "/home/deploy/apps/worker"
-setup = [
-  "python3 -m venv .venv",
-  ".venv/bin/pip install -r requirements.txt",
-]
-exclude = [".git/", ".venv/", "__pycache__/"]
-healthcheck = "curl -fsS http://127.0.0.1:8080/ >/dev/null"
-
-[env]
-PYTHONUNBUFFERED = "1"
-QUEUE_NAME = "jobs"
-
-[secrets]
-file = ".env.prod"
-```
-
-An optional public route looks like this:
-
-```toml
-[tunnel]
-hostname = "worker.frgmt.xyz"
-service = "http://127.0.0.1:8080"
-```
-
-The hostname must be available in your Cloudflare zone. The deployer never overwrites an existing DNS route or takes over a tunnel it does not own; choose another hostname if there is a conflict. A public HTTPS route and access control are separate decisions: configure [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/access-controls/) when the application must require authentication.
-
-Keep secrets out of `deploy.toml` and version control. During `deploy`, values from `[secrets].file` or `--env FILE` override duplicate `[env]` keys and are transferred over SSH to the protected remote `.deployer/environment` file (directories mode 700, file mode 600). Both the configured dotenv file and a CLI override are excluded from rsync—including an anchored path for a selected file inside the repository, and its resolved target when applicable—and are never copied into the release or left in the service working directory. Secrets are loaded only for the runtime service; setup and healthcheck commands do not receive them. There is no interpolation or shell sourcing. Double-quoted values may contain escaped or literal newlines; unquoted values are single-line. A missing selected file fails deployment rather than silently reusing a previous copy. Previous values remain in protected rollback transaction backups, so rotate secrets with that retention caveat.
-
-The dotenv file accepts one `KEY=VALUE` assignment per line, with blank lines and comments beginning with `#` ignored. An optional `export ` prefix is accepted. Keys use shell environment names; values may be unquoted or enclosed in matching single or double quotes. Double-quoted values support `\n`, `\r`, `\t`, `\\`, and `\"` escapes and may span lines; single-quoted and unquoted values do not interpret escapes. Inline comments beginning with whitespace followed by `#` are ignored for unquoted values. Files must be UTF-8 (a UTF-8 BOM is accepted) and no larger than 1 MiB. Shell expressions, command substitutions, and `${NAME}` references remain literal text; they are never evaluated.
-
-The protected environment file is a permission boundary, not an encrypted vault: the service account can read it, and root can read it. Application code can also expose values through its own logs or diagnostics.
+The health URL is requested from the host's network view, so `127.0.0.1` refers to the host, not your machine.
 
 ## Commands
 
-```text
-deployer [COMMAND] [REPO]
-deployer deploy [REPO] [--dry-run] [--env FILE]
-deployer init [REPO]
-deployer status [REPO]
-deployer logs [REPO]
-deployer restart [REPO]
-deployer stop [REPO]
-deployer rollback [REPO]
-deployer tunnel [REPO]
-deployer tunnel-status [REPO]
-deployer tunnel-logs [REPO] [--lines N]
-deployer tunnel-stop [REPO]
-```
+| Command | Purpose |
+| --- | --- |
+| `depper init [REPO]` | Write a starter `depper.toml`. |
+| `depper deploy [REPO]` | Create a release, activate it, wait for health. Flags: `--dry-run`, `--env FILE`, `--env-stdin`, `--ref REF`. |
+| `depper status [REPO]` | Unit state, current release, endpoint, tunnel URL, and health. Exits 0 whenever the host could be read, even if the service is unhealthy. |
+| `depper health [REPO]` | Run the health check. Flags: `--watch SECONDS`, `--count N`. Exit 2 when unhealthy. |
+| `depper check [REPO]` | Compare the deployed commit and secrets with the local repository. Exit 3 when outdated, not deployed, or secrets differ. |
+| `depper releases [REPO]` | List releases on the host, newest first. |
+| `depper rollback [REPO]` | Switch to the previous release, or `--to ID`. After an interrupted operation whose automatic restore failed, a bare `rollback` restores the state saved before it. |
+| `depper logs [REPO]` | Show the service journal. Flags: `--lines N`, `-f`. |
+| `depper restart [REPO]`, `depper stop [REPO]` | Restart or stop the unit. |
+| `depper secrets list\|diff\|push [REPO]` | Inspect and replace the service environment. |
+| `depper doctor [REPO]` | Check that the host is ready. Exit 1 if any check fails. |
+| `depper unlock [REPO]` | Remove a stale deployment lock (not refreshed for 15 minutes). `--force` for a more recent one. |
+| `depper ci init [REPO]` | Write a GitHub Actions deploy workflow. |
+| `depper tunnel`, `tunnel-status`, `tunnel-logs`, `tunnel-stop` | Manage the optional Cloudflare Tunnel. |
+| `depper migrate [REPO]` | Convert a deployment made by the Python `deployer`; rerun it to resume an interrupted migration. |
 
-Run `deployer --help` for the installed command's complete option list. Targets are Linux systemd user services; this tool does not manage Windows services, macOS launchd jobs, containers, or system-wide systemd units.
+Global flags: `--target NAME` (or `DEPPER_TARGET`) selects a `[targets.NAME]` overlay; `--json` writes machine-readable JSON to stdout and moves human messages to stderr.
 
-Cloudflare tunnels are optional and require separate `cloudflared` authentication on the target host. See [SETUP.md](SETUP.md#optional-cloudflare-tunnel) before adding a `[tunnel]` section.
+Exit codes: 0 success, 1 error, 2 unhealthy (`health`), 3 drift, outdated, or not deployed (`check`, `secrets diff`).
 
-When a tunnel is configured, manage its independent connector with:
+## Documentation
 
-```sh
-deployer tunnel
-deployer tunnel-status
-deployer tunnel-logs
-deployer tunnel-stop
-```
+- [Configuration reference](docs/configuration.md): every key in `depper.toml`, targets, validation.
+- [Preparing a host](docs/hosts.md): accounts, SSH keys, known_hosts, linger, firewall, `depper doctor`.
+- [Deployments](docs/deployments.md): releases, the deploy transaction, automatic restore, rollback, locking.
+- [Secrets](docs/secrets.md): dotenv format, storage, fingerprints, rotation, threat model.
+- [Containers](docs/containers.md): docker and podman, image and compose modes.
+- [Health checks and status](docs/health.md): `[health]`, `[endpoint]`, JSON schemas, polling long-running tasks.
+- [CI/CD](docs/ci.md): GitHub Actions workflow and other CI systems.
+- [Cloudflare Tunnel](docs/tunnels.md): optional public HTTPS routes.
+- [Migrating from deployer](docs/migrating-from-deployer.md)
+- [Development](docs/development.md): building, testing, releasing.
+- [Changelog](CHANGELOG.md)
+- Examples: [`examples/`](examples)
 
-`tunnel-stop` disables the connector while retaining its owned state and DNS route; the next `deployer deploy` starts it again. Tunnel hostname and origin changes are refused in this version. A tunnel setup failure can leave the application deployment successful, so check both the application and tunnel status.
+## License
 
-## Deployment behavior
-
-Each deployment copies the current working tree, including uncommitted changes, into a new release directory. It runs setup, installs the user service, then checks that the process is running without automatic restarts after three seconds. An optional health command must also succeed. This causes a short service interruption; it is not a zero-downtime deployment.
-
-`restart = "no"` disables crash restarts; the service is still enabled to start at boot. Use `on-failure` for crash recovery or `always` to also restart after a clean process exit. A deliberate `deployer stop` stays stopped until restarted or the user manager starts again.
-
-Keep databases, uploads, and other persistent data outside release directories. Old and failed releases are retained; this version does not automatically prune disk usage. Custom remote paths use plain absolute paths without spaces, quotes, backslashes, or percent signs. Use an SSH alias for IPv6 hosts or custom ports.
+License: not yet specified.

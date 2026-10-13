@@ -60,8 +60,15 @@ func TestInitWritesAConfigThatLoads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("written config does not load: %v", err)
 	}
-	if cfg.Service.Name != "My-Repo-" || cfg.Deploy.Host != "desktop" || cfg.Service.Command == "" {
-		t.Errorf("cfg = %+v", cfg.Service)
+	if cfg.Service.Name != "My-Repo-" || cfg.Deploy.Host != "deploy@203.0.113.10" || cfg.Service.Command == "" {
+		t.Errorf("cfg = %+v host %q", cfg.Service, cfg.Deploy.Host)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(written), "desktop") {
+		t.Errorf("the starter template contains a personal host alias:\n%s", written)
 	}
 
 	app, _, stderr := testApp(nil)
@@ -109,7 +116,9 @@ func TestStarterTemplateExamplesAreValid(t *testing.T) {
 		if commented && strings.HasPrefix(body, "[") {
 			inContainer = strings.HasPrefix(body, "[container]")
 		}
-		if inContainer || strings.HasPrefix(body, `command = "curl`) {
+		// [deploy].user is the alternative to the user@ prefix in host, so
+		// the two cannot both be active.
+		if inContainer || strings.HasPrefix(body, `command = "curl`) || strings.HasPrefix(body, `user = `) {
 			continue
 		}
 		if commented && (strings.HasPrefix(body, "[") || strings.Contains(body, " = ")) {

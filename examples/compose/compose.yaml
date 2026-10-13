@@ -1,0 +1,11 @@
+services:
+  web:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Interpolated from the service environment that depper writes
+      # ([env] and the optional dotenv secrets).
+      GREETING: ${GREETING:-hello from compose}
+      API_TOKEN: ${API_TOKEN:-}
+    restart: "no"          # systemd supervises the stack; do not let the engine restart it too

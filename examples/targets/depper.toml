@@ -1,0 +1,49 @@
+# One configuration, two environments. Select with --target or DEPPER_TARGET:
+#
+#   depper deploy --target staging
+#   DEPPER_TARGET=production depper status
+#
+# No base [deploy].host is set on purpose, so a command without a target fails and lists
+# the available targets instead of deploying to the wrong place.
+
+[service]
+name = "targets"
+command = "python3 server.py"
+restart = "on-failure"
+
+[deploy]
+keep_releases = 5
+
+[env]
+HOST = "127.0.0.1"
+PORT = "8080"
+GREETING = "hello"
+
+[health]
+url = "http://127.0.0.1:8080/health"
+expect_status = 200
+
+# Staging: its own host, a distinct service name, and debug-friendly settings.
+[targets.staging]
+host = "deploy@203.0.113.20"
+name = "targets-staging"
+known_hosts = "~/.ssh/depper_staging_known_hosts"
+
+[targets.staging.env]
+GREETING = "hello from staging"
+
+# Production: more retained releases, pinned to committed content, with secrets.
+[targets.production]
+host = "deploy@203.0.113.10"
+known_hosts = "~/.ssh/depper_production_known_hosts"
+keep_releases = 10
+source = "git"
+
+[targets.production.env]
+GREETING = "hello from production"
+
+[targets.production.secrets]
+file = ".env.production"
+
+[targets.production.endpoint]
+url = "http://203.0.113.10:8080"

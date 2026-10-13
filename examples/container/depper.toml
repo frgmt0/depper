@@ -1,0 +1,26 @@
+# Container service built on the host from this directory's Dockerfile.
+
+[service]
+name = "container-demo"
+restart = "on-failure"
+
+[deploy]
+host = "deploy@203.0.113.10"
+
+[container]
+engine = "docker"               # or "podman"
+build = "."
+dockerfile = "Dockerfile"
+# Publish on the loopback interface only; the health check runs on the host.
+ports = ["127.0.0.1:8080:8080"]
+
+[env]
+GREETING = "hello from a container"
+
+# Optional secrets (see the README); the file must exist when this table is present.
+# [secrets]
+# file = ".env.production"
+
+[health]
+url = "http://127.0.0.1:8080/health"
+expect_status = 200
