@@ -262,10 +262,14 @@ func TestHostStatus(t *testing.T) {
 	out := "@@depper-host-status\nuser=deploy\nrecord=" + base64.StdEncoding.EncodeToString(recJSON) + "\nlinger=1\nusermgr=1\ncmd_rsync=/usr/bin/rsync\nstatus_done=1\n"
 	app, stdout, _ := testApp(nil)
 	app.Exec = &transporttest.Recorder{Handler: func(c transporttest.Call) (transport.Result, error) {
+		if strings.Contains(strings.Join(c.Args, " "), "PubkeyAuthentication=no") {
+			// The probe of the offered methods (sshd -T is not readable).
+			return transport.Result{}, &transport.CommandError{Program: "ssh", ExitCode: 255, Stderr: "Permission denied (publickey,password)."}
+		}
 		return transport.Result{Stdout: out}, nil
 	}}
-	// The recorded ssh hardening cannot be confirmed (no sshd -T as the
-	// deploy user): a warning, not a failure.
+	// The recorded ssh hardening is not in effect (sshd offers passwords):
+	// a warning, not a failure.
 	if code := Run(context.Background(), app, []string{"--json", "host", "status", repo}); code != 0 {
 		t.Fatalf("exit %d", code)
 	}
@@ -281,7 +285,7 @@ func TestHostStatus(t *testing.T) {
 		t.Errorf("status = %+v", doc)
 	}
 	calls := app.Exec.(*transporttest.Recorder).Calls()
-	if len(calls) != 1 || !strings.Contains(strings.Join(calls[0].Args, " "), "-- deploy@203.0.113.7 sh -s") {
+	if len(calls) != 3 || !strings.Contains(strings.Join(calls[0].Args, " "), "-- deploy@203.0.113.7 sh -s") || !strings.Contains(strings.Join(calls[2].Args, " "), "-- root@203.0.113.7 true") {
 		t.Errorf("status did not connect as the deploy user: %v", calls)
 	}
 }
