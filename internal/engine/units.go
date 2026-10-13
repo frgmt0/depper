@@ -48,12 +48,11 @@ func ComposeProject(cfg *config.Config) string {
 	return strings.NewReplacer(".", "_").Replace(strings.ToLower(cfg.ContainerName()))
 }
 
-// containerImage is the image a build/image-mode release runs.
+// containerImage is the image a build/image-mode release runs: its own
+// per-release tag (image mode tags the pulled image during setup), so a
+// rollback or restore runs exactly the image that release was deployed with.
 func containerImage(cfg *config.Config, releaseID string) string {
-	if cfg.Container.Mode() == config.ModeBuild {
-		return cfg.ImageRef(releaseID)
-	}
-	return cfg.Container.Image
+	return cfg.ImageRef(releaseID)
 }
 
 func execLine(words ...string) string {
@@ -64,14 +63,64 @@ func execLine(words ...string) string {
 	return strings.Join(quoted, " ")
 }
 
+// ContainerEnvArgsVar is the variable depper adds to the environment file in
+// build/image mode: "--env KEY ..." for every key. The unit expands it
+// unquoted in ExecStart= (systemd splits it into words), so the container
+// gets exactly the configured keys, with values taken from the unit's
+// EnvironmentFile= through the engine process' environment. Values never
+// pass through an --env-file, whose format cannot carry line breaks (and,
+// for podman, leading quotes); the key list lives in the environment file,
+// so `depper secrets push` can add or remove keys without touching the
+// unit.
+const ContainerEnvArgsVar = "DEPPER_CONTAINER_ENV_ARGS"
+
+// MaxContainerEnvValue is the largest value accepted in container mode
+// (values travel in the engine's process environment and its API request).
+const MaxContainerEnvValue = 60 << 10
+
+// CheckContainerEnv validates values for container mode: the reserved
+// ContainerEnvArgsVar name and the value size limit. Errors name the key,
+// never the value.
+func CheckContainerEnv(values map[string]string) error {
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if k == ContainerEnvArgsVar {
+			return fmt.Errorf("environment variable %s is reserved by depper in container mode; rename it", k)
+		}
+		if len(values[k]) > MaxContainerEnvValue {
+			return fmt.Errorf("environment variable %s is %d bytes; container mode accepts values up to 60 KiB", k, len(values[k]))
+		}
+	}
+	return nil
+}
+
+// ContainerEnvArgs returns "--env KEY" for every key, sorted.
+func ContainerEnvArgs(values map[string]string) string {
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	words := make([]string, 0, 2*len(keys))
+	for _, k := range keys {
+		words = append(words, "--env", k)
+	}
+	return strings.Join(words, " ")
+}
+
 // ContainerUnit renders the unit for [container] build/image/compose modes.
-// enginePath is the absolute engine path on the host.
+// enginePath is the absolute engine path on the host. Every mode reads the
+// environment through EnvironmentFile=; see ContainerEnvArgsVar (build,
+// image) and runSetup (compose) for how it reaches the containers.
 func ContainerUnit(cfg *config.Config, base, enginePath, releaseID string) (string, error) {
 	c := cfg.Container
 	if c == nil {
 		return "", fmt.Errorf("[container] is not configured")
 	}
-	envFile := base + "/.depper/container.env"
 	lines := []string{
 		"[Unit]",
 		"Description=depper: " + cfg.Service.Name,
@@ -80,36 +129,40 @@ func ContainerUnit(cfg *config.Config, base, enginePath, releaseID string) (stri
 		"[Service]",
 		"Type=simple",
 		"WorkingDirectory=" + unit.Path(base+"/current"),
+		"EnvironmentFile=" + unit.Path(base+"/.depper/environment"),
 	}
 	switch c.Mode() {
 	case config.ModeCompose:
+		// --env-file /dev/null: interpolate ${VAR} only from the process
+		// environment (EnvironmentFile= above), never from a .env file in
+		// the release; `environment: [KEY]` passes values through as well.
 		project := ComposeProject(cfg)
 		lines = append(lines,
-			"EnvironmentFile="+unit.Path(base+"/.depper/environment"),
-			"ExecStart="+execLine(enginePath, "compose", "-p", project, "-f", c.Compose, "--env-file", envFile, "up", "--build", "--remove-orphans"),
-			"ExecStop="+execLine(enginePath, "compose", "-p", project, "-f", c.Compose, "down"),
+			"ExecStart="+execLine(enginePath, "compose", "-p", project, "-f", c.Compose, "--env-file", "/dev/null", "up", "--build", "--remove-orphans"),
+			"ExecStop="+execLine(enginePath, "compose", "-p", project, "-f", c.Compose, "--env-file", "/dev/null", "down"),
 		)
 	default:
 		name := cfg.ContainerName()
-		run := []string{enginePath, "run", "--rm", "--name", name, "--env-file", envFile}
+		run := execLine(enginePath, "run", "--rm", "--name", name) + " $" + ContainerEnvArgsVar
+		var rest []string
 		for _, p := range c.Ports {
-			run = append(run, "-p", p)
+			rest = append(rest, "-p", p)
 		}
 		for _, v := range c.Volumes {
-			run = append(run, "-v", v)
+			rest = append(rest, "-v", v)
 		}
-		run = append(run, c.Args...)
-		run = append(run, containerImage(cfg, releaseID))
+		rest = append(rest, c.Args...)
+		rest = append(rest, containerImage(cfg, releaseID))
 		if c.Command != "" {
 			words, err := SplitWords(c.Command)
 			if err != nil {
 				return "", fmt.Errorf("[container].command: %w", err)
 			}
-			run = append(run, words...)
+			rest = append(rest, words...)
 		}
 		lines = append(lines,
 			"ExecStartPre=-"+execLine(enginePath, "rm", "-f", name),
-			"ExecStart="+execLine(run...),
+			"ExecStart="+run+" "+execLine(rest...),
 			"ExecStop="+execLine(enginePath, "stop", name),
 		)
 	}
@@ -132,28 +185,6 @@ func RenderUnit(cfg *config.Config, l *Layout, releaseID string) (string, error)
 		return "", fmt.Errorf("%s is not installed on the deploy host (required by [container])", cfg.Container.Engine)
 	}
 	return ContainerUnit(cfg, l.Base, l.EnginePath, releaseID)
-}
-
-// ContainerEnvFile renders values for `--env-file`: one KEY=VALUE per line,
-// sorted, values literal. That format cannot carry line breaks, so a value
-// containing CR, LF, or NUL is rejected (naming the key, never the value).
-func ContainerEnvFile(values map[string]string) (string, error) {
-	keys := make([]string, 0, len(values))
-	for k := range values {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	for _, k := range keys {
-		if shell.HasLineBreak(values[k]) {
-			return "", fmt.Errorf("environment variable %s has a multi-line value, which the container --env-file format cannot carry; store it on one line (for example base64-encoded)", k)
-		}
-		b.WriteString(k)
-		b.WriteByte('=')
-		b.WriteString(values[k])
-		b.WriteByte('\n')
-	}
-	return b.String(), nil
 }
 
 // SplitWords splits a command string into words with POSIX shell quoting

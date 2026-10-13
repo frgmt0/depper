@@ -372,13 +372,121 @@ func TestLockAndUnlock(t *testing.T) {
 	if res, err := e.BreakLock(ctx, false); err != nil || res.Removed {
 		t.Errorf("unlock without lock = %+v, %v", res, err)
 	}
-	// An old lock (by its info) is removed without --force.
+	// Staleness uses the host's clock and the lock directory's mtime: a
+	// client clock far in the future does not make a fresh lock stale...
 	if err := other.Lock(ctx, l); err != nil {
 		t.Fatal(err)
 	}
-	e.Now = func() time.Time { return time.Now().Add(StaleLockAge + time.Minute) }
-	if res, err := e.BreakLock(ctx, false); err != nil || !res.Removed || !res.Lock.Stale {
+	e.Now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+	if _, err := e.BreakLock(ctx, false); err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Errorf("client clock skew made a fresh lock stale: %v", err)
+	}
+	// ...while a lock not refreshed for StaleLockAge is removed without
+	// --force.
+	old := time.Now().Add(-StaleLockAge - time.Minute)
+	if err := os.Chtimes(h.path(base+"/.depper/lock"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	res, err = e.BreakLock(ctx, false)
+	if err != nil || !res.Removed || !res.Lock.Stale || res.Lock.AgeSeconds < int64(StaleLockAge/time.Second) {
 		t.Errorf("stale unlock = %+v, %v", res, err)
+	}
+}
+
+// Unlock removes only the lock this engine took (by token) and fails
+// loudly otherwise; BreakLock removes only the lock it inspected.
+func TestLockOwnershipToken(t *testing.T) {
+	h := newFakeHost(t)
+	e := h.Engine(loadConfig(t, processRepo(t)))
+	ctx := context.Background()
+	deploy(t, e, DeployOptions{})
+	l := mustProbe(t, e)
+
+	a := h.Engine(e.Config)
+	if err := a.Lock(ctx, l); err != nil {
+		t.Fatal(err)
+	}
+	info := h.read(base + "/.depper/lock/info")
+	if !strings.Contains(info, `"token":"`+a.held.token+`"`) || len(a.held.token) != 32 {
+		t.Fatalf("lock info = %s", info)
+	}
+	// Someone breaks the lock and another operation takes it.
+	if _, err := e.BreakLock(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	b := h.Engine(e.Config)
+	b.Holder = "other@host"
+	if err := b.Lock(ctx, l); err != nil {
+		t.Fatal(err)
+	}
+	err := a.Unlock(ctx, l)
+	if err == nil || !strings.Contains(err.Error(), "now held by someone else") {
+		t.Fatalf("unlock of a lock taken over = %v", err)
+	}
+	if !strings.Contains(h.read(base+"/.depper/lock/info"), "other@host") {
+		t.Error("the other operation's lock was removed")
+	}
+	// BreakLock refuses when the lock changed hands after it was read.
+	if err := e.Remote.Run(ctx, releaseScript(l.Lock(), strings.Repeat("0", 32))); err == nil {
+		t.Errorf("release with a stale token = %v", err)
+	}
+	if !h.exists(base + "/.depper/lock/info") {
+		t.Fatal("a release with the wrong token removed the lock")
+	}
+	if err := b.Unlock(ctx, l); err != nil || h.exists(base+"/.depper/lock") {
+		t.Fatalf("owner unlock = %v", err)
+	}
+	// The lock vanished entirely.
+	if err := a.Lock(ctx, l); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(h.path(base + "/.depper/lock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Unlock(ctx, l); err == nil || !strings.Contains(err.Error(), "removed by someone else") {
+		t.Errorf("unlock of a removed lock = %v", err)
+	}
+	checkScriptSyntax(t, h.Exec.Scripts())
+}
+
+// A held lock is refreshed (its directory touched) while the operation
+// runs, so a long step never makes it look stale.
+func TestWithLockRefreshesTheLock(t *testing.T) {
+	h := newFakeHost(t)
+	e := h.Engine(loadConfig(t, processRepo(t)))
+	ctx := context.Background()
+	deploy(t, e, DeployOptions{})
+	l := mustProbe(t, e)
+	e.LockRefresh = 50 * time.Millisecond
+	lockDir := h.path(base + "/.depper/lock")
+	err := e.WithLock(ctx, l, func() error {
+		old := time.Now().Add(-time.Hour)
+		if err := os.Chtimes(lockDir, old, old); err != nil {
+			return err
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if st, err := os.Stat(lockDir); err == nil && time.Since(st.ModTime()) < time.Minute {
+				return nil
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return errors.New("the lock was not refreshed")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.exists(base + "/.depper/lock") {
+		t.Error("lock not released")
+	}
+	// Remote setup scripts also keep the lock fresh from the host itself.
+	e.held = &heldLock{path: l.Lock(), token: strings.Repeat("a", 32)}
+	lines := strings.Join(e.lockKeepaliveLines(), "\n")
+	e.held = nil
+	for _, want := range []string{"kill -0 $$", `touch "$depper_lock"`, `"token":"` + strings.Repeat("a", 32) + `"`, "trap"} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("keepalive lines lack %q:\n%s", want, lines)
+		}
 	}
 }
 

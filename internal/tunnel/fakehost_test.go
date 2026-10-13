@@ -280,7 +280,16 @@ func (h *fakeHost) Run(ctx context.Context, c transport.Cmd) (transport.Result, 
 			// An inherited force flag that depper must clear.
 			"TUNNEL_FORCE_PROVISIONING_DNS=true",
 		}
-		return transport.Local{}.Run(ctx, transport.Cmd{Args: []string{h.shell, "-s"}, Stdin: bytes.NewReader(data), Capture: c.Capture, Stdout: c.Stdout, Stderr: c.Stderr, Dir: h.Home, Env: env})
+		// Root/login-noise emulates a login shell printing text first.
+		noise, _ := os.ReadFile(filepath.Join(h.Root, "login-noise"))
+		if !c.Capture && c.Stdout != nil && len(noise) > 0 {
+			_, _ = c.Stdout.Write(noise)
+		}
+		res, err := transport.Local{}.Run(ctx, transport.Cmd{Args: []string{h.shell, "-s"}, Stdin: bytes.NewReader(data), Capture: c.Capture, Stdout: c.Stdout, Stderr: c.Stderr, Dir: h.Home, Env: env})
+		if c.Capture {
+			res.Stdout = string(noise) + res.Stdout
+		}
+		return res, err
 	case "rsync":
 		args := []string{"rsync", "-a"}
 		var positional []string
@@ -300,13 +309,14 @@ func (h *fakeHost) Run(ctx context.Context, c transport.Cmd) (transport.Result, 
 			h.t.Errorf("unexpected rsync %q", c.Args)
 			return transport.Result{}, &transport.CommandError{Program: "rsync", ExitCode: 2}
 		}
+		// host:/abs/path/, never quoted (rsync >= 3.2.4 keeps quotes literally).
 		dest := positional[1]
-		start := strings.Index(dest, ":'")
-		if start < 0 || !strings.HasSuffix(dest, "'/") {
+		start := strings.Index(dest, ":/")
+		if start < 0 || !strings.HasSuffix(dest, "/") || strings.ContainsAny(dest, "'\"\\ ") {
 			h.t.Errorf("unexpected rsync destination %q", dest)
 			return transport.Result{}, &transport.CommandError{Program: "rsync", ExitCode: 2}
 		}
-		args = append(args, positional[0], dest[start+2:len(dest)-2]+"/")
+		args = append(args, positional[0], dest[start+1:])
 		return transport.Local{}.Run(ctx, transport.Cmd{Args: args, Capture: c.Capture, Stdout: c.Stdout, Stderr: c.Stderr})
 	}
 	return transport.Local{}.Run(ctx, c)

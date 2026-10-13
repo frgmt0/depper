@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -101,5 +102,55 @@ func TestControlHelpers(t *testing.T) {
 	}
 	if !HasControl("a\tb") || !HasControl("a\x7f") || HasControl("plain ü") {
 		t.Error("HasControl misclassifies")
+	}
+}
+
+func TestIsSafePath(t *testing.T) {
+	good := []string{"/srv/api", "/home/u/.local/share/depper/api", "/a-b_c.d/e", "/srv/a+b@c", "/srv/api/releases/release-20261012T100000Z-0123abcd/"}
+	bad := []string{"", "/", "//", "srv/api", "~/x", "/srv/a b", "/srv/a'b", "/srv/a\"b", "/srv/a%b", "/srv/a$b", "/srv/a:b", "/srv/a*b", "/srv/a\nb", "/srv/ü", "/srv/a\\b", "/srv/a,b"}
+	for _, p := range good {
+		if !IsSafePath(p) {
+			t.Errorf("IsSafePath(%q) = false", p)
+		}
+	}
+	for _, p := range bad {
+		if IsSafePath(p) {
+			t.Errorf("IsSafePath(%q) = true", p)
+		}
+	}
+}
+
+// A wrapped script that arrives truncated must run nothing at all.
+func TestWrapRunsNothingWhenTruncated(t *testing.T) {
+	sh := "sh"
+	if p, err := exec.LookPath("dash"); err == nil {
+		sh = p
+	}
+	dir := t.TempDir()
+	marker := dir + "/ran"
+	script := Wrap(Script("set -eu", "touch "+Quote(marker), "echo second"))
+	if !strings.HasPrefix(script, "set +xv\n{\n") || !strings.HasSuffix(script, "\n}\n") {
+		t.Fatalf("Wrap = %q", script)
+	}
+	truncated := script[:strings.Index(script, "echo second")]
+	cmd := exec.Command(sh, "-s")
+	cmd.Stdin = strings.NewReader(truncated)
+	if err := cmd.Run(); err == nil {
+		t.Error("truncated script succeeded")
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("truncated script ran its first command")
+	}
+	cmd = exec.Command(sh, "-s")
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil || string(out) != "second\n" {
+		t.Fatalf("full script: %v %q", err, out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Error("full script did not run")
+	}
+	if Wrap("echo x") != "set +xv\n{\necho x\n}\n" {
+		t.Errorf("Wrap without trailing newline = %q", Wrap("echo x"))
 	}
 }

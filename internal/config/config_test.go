@@ -443,11 +443,14 @@ command = "serve --port 80"
 	for name, contents := range bad {
 		expectError(t, name, contents, "")
 	}
-	// Build mode lowercases the name for the image tag; image mode never tags.
+	// Build and image mode lowercase the name for the per-release image tag.
 	if got := mustLoad(t, "[service]\nname = \"API\"\n[deploy]\nhost = \"server\"\n[container]\nbuild = \".\"\n").ImageRef("r1"); got != "depper/api:r1" {
 		t.Errorf("ImageRef = %q", got)
 	}
-	mustLoad(t, "[service]\nname = \"API\"\n[deploy]\nhost = \"server\"\n[container]\nimage = \"nginx\"\n")
+	if got := mustLoad(t, "[service]\nname = \"API\"\n[deploy]\nhost = \"server\"\n[container]\nimage = \"nginx\"\n").ImageRef("r1"); got != "depper/api:r1" {
+		t.Errorf("image-mode ImageRef = %q", got)
+	}
+	expectError(t, "trailing dash image", "[service]\nname = \"api-\"\n[deploy]\nhost = \"server\"\n[container]\nimage = \"nginx\"\n", "image name")
 }
 
 func TestEndpointAndHealth(t *testing.T) {
@@ -723,5 +726,33 @@ func TestNameHelpers(t *testing.T) {
 	}
 	if cfg.DefaultBaseRel() != ".local/share/depper/api" || cfg.LegacyDefaultBaseRel() != ".local/share/deployer/api" {
 		t.Error("base paths")
+	}
+}
+
+// ssh splits UserKnownHostsFile at whitespace, so paths with whitespace are
+// refused for both keys and both CI overrides.
+func TestSSHFilePathsRejectWhitespace(t *testing.T) {
+	expectError(t, "identity with space", minimal+"identity_file = \"/keys/my key\"\n", `identity_file .*whitespace`)
+	expectError(t, "known_hosts with space", minimal+"known_hosts = \"/keys/known hosts\"\n", `known_hosts .*whitespace`)
+	expectError(t, "known_hosts with tab", minimal+"known_hosts = \"/keys/known\\thosts\"\n", `known_hosts`)
+	repo := repoWith(t, FileName, minimal)
+	for _, name := range []string{EnvSSHKeyFile, EnvKnownHostsKey} {
+		_, err := LoadTarget(repo, "", func(n string) (string, bool) { return "/ci/my file", n == name })
+		if err == nil || !strings.Contains(err.Error(), name) || !strings.Contains(err.Error(), "whitespace") {
+			t.Errorf("%s with a space: %v", name, err)
+		}
+	}
+}
+
+// [deploy].path is used unquoted (rsync destination, unit paths), so only a
+// conservative alphabet is accepted.
+func TestDeployPathAlphabet(t *testing.T) {
+	for _, bad := range []string{"/srv/my app", "/srv/a:b", "/srv/a$b", "/srv/ü", "/", "relative"} {
+		expectError(t, "path "+bad, minimal+"path = \""+bad+"\"\n", "path must be an absolute remote path")
+	}
+	for _, good := range []string{"/srv/api", "/srv/a+b@c_d.e-f"} {
+		if cfg := mustLoad(t, minimal+"path = \""+good+"\"\n"); cfg.Deploy.Path != good {
+			t.Errorf("path = %q", cfg.Deploy.Path)
+		}
 	}
 }

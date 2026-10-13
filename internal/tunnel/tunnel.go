@@ -196,8 +196,11 @@ func inspect(ctx context.Context, e *engine.Engine, l *engine.Layout) (cloudflar
 	if err != nil {
 		return "", nil, err
 	}
+	// Anything a login shell printed before the script ran precedes the
+	// @@cloudflared marker and is skipped.
 	head, raw, ok := strings.Cut(out, "@@state\n")
-	path, found := strings.CutPrefix(head, "@@cloudflared\n")
+	found := strings.HasPrefix(head, "@@cloudflared\n") || strings.Contains(head, "\n@@cloudflared\n")
+	path := engine.FromMarker(head, "@@cloudflared")
 	if !ok || !found {
 		return "", nil, fmt.Errorf("remote host returned an invalid tunnel state response")
 	}
@@ -368,7 +371,7 @@ func (m *Manager) installUnit(ctx context.Context, e *engine.Engine, l *engine.L
 		`  echo 'Refusing to overwrite an unowned tunnel unit' >&2`,
 		`  exit 1`,
 		`fi`,
-		`mv -f "$candidate" "$unit"`,
+		`mv -Tf "$candidate" "$unit"`,
 		"systemctl --user daemon-reload",
 		"systemctl --user enable "+shell.Quote(unitName)+" >/dev/null",
 		"systemctl --user restart "+shell.Quote(unitName),
@@ -405,13 +408,14 @@ func (m *Manager) connected(ctx context.Context, e *engine.Engine, cf *cloudflar
 	lines = append(lines,
 		"unset TUNNEL_FORCE_PROVISIONING_DNS",
 		"systemctl --user is-active --quiet "+shell.Quote(unitName)+" || { echo "+shell.Quote(unitName+" is not active after restart")+" >&2; exit 1; }",
+		"echo "+listMarker,
 		shell.Quote(cf.path)+" tunnel list --output json 2>/dev/null || true",
 	)
 	out, err := e.Remote.Capture(ctx, shell.Script(lines...))
 	if err != nil {
 		return false, err
 	}
-	tunnels, err := parseList(out)
+	tunnels, err := parseList(engine.FromMarker(out, listMarker))
 	if err != nil {
 		return false, nil
 	}
@@ -472,7 +476,7 @@ func Logs(ctx context.Context, e *engine.Engine, lines int, w io.Writer) error {
 // Stop disables and stops the connector unit. The tunnel, its state, and
 // its DNS route are kept; a later deploy starts the connector again.
 func Stop(ctx context.Context, e *engine.Engine) error {
-	l, err := e.Probe(ctx, false)
+	l, err := e.ProbeForChange(ctx)
 	if err != nil {
 		return err
 	}

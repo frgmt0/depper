@@ -35,6 +35,12 @@ type ReleaseMetadata struct {
 	GitDirty      *bool  `json:"git_dirty"`
 	DepperVersion string `json:"depper_version"`
 	DeployedBy    string `json:"deployed_by"`
+	// Image is the configured [container].image (image mode only; omitted
+	// otherwise).
+	Image string `json:"image,omitempty"`
+	// ImageDigest is the pulled image's repository digest
+	// (repo@sha256:...), when the engine reports one (image mode only).
+	ImageDigest string `json:"image_digest,omitempty"`
 }
 
 // ShortCommit returns the first 12 characters of the commit.

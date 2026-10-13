@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -30,29 +31,41 @@ command = "serve --label 'a b'"
 
 func TestContainerBuildDeployAndImagePruning(t *testing.T) {
 	h := newFakeHost(t)
-	repo := writeRepo(t, containerToml, map[string]string{"Dockerfile": "FROM scratch\n", ".env": "TOKEN=" + sentinel + "\n"})
+	repo := writeRepo(t, containerToml, map[string]string{"Dockerfile": "FROM scratch\n", ".env": "TOKEN=" + sentinel + "\nMULTI=\"line one\nline two\"\nQUOTED='\"starts with a quote'\n"})
 	e := h.Engine(loadConfig(t, repo))
 	ctx := context.Background()
+	// Images of another service whose name lowercases to the same
+	// repository ("Web"), and an unlabelled one, must survive pruning.
+	foreign := "depper/web:release-20200101T000000Z-0000beef depper.service=Web\ndepper/web:release-20200101T000000Z-0000cafe -\n"
+	writeFile(t, filepath.Join(h.Root, "docker-images"), foreign)
 	r1 := deploy(t, e, DeployOptions{Env: EnvSource{File: filepath.Join(repo, ".env")}})
 	docker := h.Root + "/remote-bin/docker"
 	unitFile := h.read(".config/systemd/user/depper-web.service")
 	for _, want := range []string{
+		"EnvironmentFile=" + h.path(".local/share/depper/web") + "/.depper/environment",
 		`ExecStartPre=-"` + docker + `" "rm" "-f" "depper-web"`,
-		`ExecStart="` + docker + `" "run" "--rm" "--name" "depper-web" "--env-file" "` + h.path(".local/share/depper/web") + `/.depper/container.env" "-p" "127.0.0.1:8080:8080" "-v" "/srv/data:/data:ro" "--memory" "256m" "depper/web:` + r1.Release + `" "serve" "--label" "a b"`,
+		`ExecStart="` + docker + `" "run" "--rm" "--name" "depper-web" $DEPPER_CONTAINER_ENV_ARGS "-p" "127.0.0.1:8080:8080" "-v" "/srv/data:/data:ro" "--memory" "256m" "depper/web:` + r1.Release + `" "serve" "--label" "a b"`,
 		`ExecStop="` + docker + `" "stop" "depper-web"`,
 	} {
 		if !strings.Contains(unitFile, want) {
 			t.Errorf("unit missing %s\n%s", want, unitFile)
 		}
 	}
-	if strings.Contains(unitFile, "EnvironmentFile=") {
-		t.Error("build-mode unit should pass the environment with --env-file only")
+	if strings.Contains(unitFile, "--env-file") || strings.Contains(unitFile, sentinel) {
+		t.Error("unit uses an --env-file or contains a value")
 	}
-	cenv := h.read(".local/share/depper/web/.depper/container.env")
-	if cenv != "PORT=8080\nTOKEN="+sentinel+"\n" || h.mode(".local/share/depper/web/.depper/container.env") != 0o600 {
-		t.Errorf("container.env = %q", cenv)
+	// Values (multi-line, leading quotes) live only in the EnvironmentFile;
+	// the container gets them by name.
+	envFile := h.read(".local/share/depper/web/.depper/environment")
+	for _, want := range []string{`DEPPER_CONTAINER_ENV_ARGS="--env MULTI --env PORT --env QUOTED --env TOKEN"`, "MULTI=\"line one\nline two\"", `QUOTED="\"starts with a quote"`, `TOKEN="` + sentinel + `"`} {
+		if !strings.Contains(envFile, want) {
+			t.Errorf("environment file lacks %q:\n%s", want, envFile)
+		}
 	}
-	if !strings.Contains(h.log("docker.log"), "build -t depper/web:"+r1.Release+" -f Dockerfile .") {
+	if h.exists(".local/share/depper/web/.depper/container.env") {
+		t.Error("container.env is still written")
+	}
+	if !strings.Contains(h.log("docker.log"), "build -t depper/web:"+r1.Release+" --label depper.service=web -f Dockerfile .") {
 		t.Errorf("docker log = %s", h.log("docker.log"))
 	}
 	r2 := deploy(t, e, DeployOptions{Env: EnvSource{File: filepath.Join(repo, ".env")}})
@@ -64,6 +77,9 @@ func TestContainerBuildDeployAndImagePruning(t *testing.T) {
 	if strings.Contains(images, r1.Release) || !strings.Contains(images, r2.Release) || !strings.Contains(images, r3.Release) {
 		t.Errorf("images = %q", images)
 	}
+	if !strings.Contains(images, foreign) {
+		t.Errorf("another service's or unlabelled images were pruned: %q", images)
+	}
 	// Rollback in build mode reuses the release's image tag.
 	if _, err := e.Rollback(ctx, ""); err != nil {
 		t.Fatal(err)
@@ -71,37 +87,113 @@ func TestContainerBuildDeployAndImagePruning(t *testing.T) {
 	if !strings.Contains(h.read(".config/systemd/user/depper-web.service"), "depper/web:"+r2.Release) {
 		t.Error("rollback did not restore the release's image")
 	}
-	// Multi-line values are rejected before any remote command.
+	// Oversized values are rejected (by name) before any remote command.
 	h.Exec.calls, h.Exec.stdin = nil, nil
-	_, err := e.Deploy(ctx, DeployOptions{Env: EnvSource{Stdin: strings.NewReader("KEY=\"a\nb\"\n")}})
-	if err == nil || !strings.Contains(err.Error(), "KEY has a multi-line value") || len(h.Exec.Argv()) != 0 {
-		t.Errorf("multiline err = %v, calls %v", err, h.Exec.Argv())
+	_, err := e.Deploy(ctx, DeployOptions{Env: EnvSource{Stdin: strings.NewReader("BIG=" + strings.Repeat("v", 61<<10) + "\n")}})
+	if err == nil || !strings.Contains(err.Error(), "BIG") || !strings.Contains(err.Error(), "60 KiB") || len(h.Exec.Argv()) != 0 {
+		t.Errorf("oversized err = %v, calls %v", err, h.Exec.Argv())
 	}
 	checkScriptSyntax(t, h.Exec.Scripts())
+}
+
+// Image mode tags the pulled image per release, records its digest, runs
+// the tag, and rolls back to the exact image of the earlier release.
+func TestImageModeTagsPerRelease(t *testing.T) {
+	h := newFakeHost(t)
+	toml := "[service]\nname = \"web\"\n[deploy]\nhost = \"fakehost\"\nkeep_releases = 2\n[container]\nimage = \"nginx:1.25\"\n"
+	repo := writeRepo(t, toml, map[string]string{"index.html": "hi\n"})
+	e := h.Engine(loadConfig(t, repo))
+	ctx := context.Background()
+	digest := "nginx@sha256:" + strings.Repeat("ab", 32)
+	writeFile(t, filepath.Join(h.Root, "image-digests"), "registry.example/other@sha256:"+strings.Repeat("cd", 32)+"\n"+digest+"\n")
+	r1 := deploy(t, e, DeployOptions{})
+	log := h.log("docker.log")
+	if !strings.Contains(log, "pull nginx:1.25\ntag nginx:1.25 depper/web:"+r1.Release) {
+		t.Errorf("docker log = %s", log)
+	}
+	if unitFile := h.read(".config/systemd/user/depper-web.service"); !strings.Contains(unitFile, `"depper/web:`+r1.Release+`"`) || strings.Contains(unitFile, `"nginx:1.25"`) {
+		t.Errorf("unit does not run the per-release tag:\n%s", unitFile)
+	}
+	var meta ReleaseMetadata
+	if err := json.Unmarshal([]byte(h.read(".local/share/depper/web/releases/"+r1.Release+"/"+ReleaseMetadataName)), &meta); err != nil || meta.Image != "nginx:1.25" || meta.ImageDigest != digest {
+		t.Errorf("metadata = %+v (%v)", meta, err)
+	}
+	if r1.Metadata == nil || r1.Metadata.ImageDigest != digest {
+		t.Errorf("result metadata = %+v", r1.Metadata)
+	}
+	r2 := deploy(t, e, DeployOptions{})
+	if _, err := e.Rollback(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if unitFile := h.read(".config/systemd/user/depper-web.service"); !strings.Contains(unitFile, "depper/web:"+r1.Release) {
+		t.Errorf("rollback does not run the earlier release's image:\n%s", unitFile)
+	}
+	deploy(t, e, DeployOptions{})
+	deploy(t, e, DeployOptions{})
+	if images := h.log("docker-images"); strings.Contains(images, r1.Release) || strings.Contains(images, r2.Release) {
+		t.Errorf("per-release tags of pruned releases kept: %q", images)
+	}
+	checkScriptSyntax(t, h.Exec.Scripts())
+}
+
+func TestChooseDigest(t *testing.T) {
+	a := "docker.io/library/nginx@sha256:" + strings.Repeat("a", 64)
+	b := "ghcr.io/acme/api@sha256:" + strings.Repeat("b", 64)
+	for _, tc := range []struct {
+		image string
+		lines []string
+		want  string
+	}{
+		{"nginx:1.25", []string{b, a}, a},
+		{"ghcr.io/acme/api:v1", []string{a, b}, b},
+		{"localhost:5000/x", []string{"junk", "x@sha256:short"}, ""},
+		{"other", []string{b}, b},
+	} {
+		if got := chooseDigest(tc.image, tc.lines); got != tc.want {
+			t.Errorf("chooseDigest(%q) = %q, want %q", tc.image, got, tc.want)
+		}
+	}
 }
 
 func TestComposeUnit(t *testing.T) {
 	h := newFakeHost(t)
 	toml := "[service]\nname = \"Shop.App\"\n[deploy]\nhost = \"fakehost\"\n[container]\nengine = \"podman\"\ncompose = \"compose.yaml\"\n"
-	repo := writeRepo(t, toml, map[string]string{"compose.yaml": "services: {}\n"})
+	repo := writeRepo(t, toml, map[string]string{"compose.yaml": "services: {}\n", ".env": "STRAY=from-dotenv-file\n"})
 	cfg := loadConfig(t, repo)
 	h.writeExec("remote-bin/podman", strings.Replace(fakeDocker, "docker.log", "podman.log", 1))
 	e := h.Engine(cfg)
-	deploy(t, e, DeployOptions{})
+	deploy(t, e, DeployOptions{Env: EnvSource{Stdin: strings.NewReader("TOKEN=" + sentinel + "\n")}})
 	podman := h.Root + "/remote-bin/podman"
 	unitFile := h.read(".config/systemd/user/depper-Shop.App.service")
-	envFile := h.path(".local/share/depper/Shop.App") + "/.depper/container.env"
 	for _, want := range []string{
 		"EnvironmentFile=" + h.path(".local/share/depper/Shop.App") + "/.depper/environment",
-		`ExecStart="` + podman + `" "compose" "-p" "depper-shop_app" "-f" "compose.yaml" "--env-file" "` + envFile + `" "up" "--build" "--remove-orphans"`,
-		`ExecStop="` + podman + `" "compose" "-p" "depper-shop_app" "-f" "compose.yaml" "down"`,
+		`ExecStart="` + podman + `" "compose" "-p" "depper-shop_app" "-f" "compose.yaml" "--env-file" "/dev/null" "up" "--build" "--remove-orphans"`,
+		`ExecStop="` + podman + `" "compose" "-p" "depper-shop_app" "-f" "compose.yaml" "--env-file" "/dev/null" "down"`,
 	} {
 		if !strings.Contains(unitFile, want) {
 			t.Errorf("unit missing %s\n%s", want, unitFile)
 		}
 	}
-	if !strings.Contains(h.log("podman.log"), "compose -p depper-shop_app -f compose.yaml --env-file") {
+	if !strings.Contains(h.log("podman.log"), "compose -p depper-shop_app -f compose.yaml --env-file /dev/null config --quiet") {
 		t.Errorf("podman log = %s", h.log("podman.log"))
+	}
+	if h.exists(".local/share/depper/Shop.App/.depper/container.env") || strings.Contains(h.read(".local/share/depper/Shop.App/.depper/environment"), ContainerEnvArgsVar) {
+		t.Error("compose mode wrote container.env or the --env argument list")
+	}
+	// The compose setup gets the values as process environment (on stdin).
+	found := false
+	for _, s := range h.Exec.Scripts() {
+		if strings.Contains(s, "config --quiet") {
+			found = strings.Contains(s, "export TOKEN="+sentinel)
+		}
+	}
+	if !found {
+		t.Error("compose setup does not export the environment")
+	}
+	for _, argv := range h.Exec.Argv() {
+		if strings.Contains(argv, sentinel) {
+			t.Error("a secret value reached argv")
+		}
 	}
 }
 

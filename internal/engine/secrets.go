@@ -79,31 +79,36 @@ type EnvPushResult struct {
 	Health  *HealthResult `json:"health"`
 }
 
-// readCurrent returns the current release id.
+// readCurrent returns the current release id. It fails when the installed
+// unit was written by an older depper that read container.env (which this
+// version no longer writes): such a deployment needs a deploy first.
 func (e *Engine) readCurrent(ctx context.Context, l *Layout) (string, error) {
 	out, err := e.Remote.Capture(ctx, shell.Script(
 		"set +xv", "set -eu",
 		"base="+shell.Quote(l.Base),
+		"unit="+unitPathExpr(e.Config.UnitName()),
+		`if test -f "$unit" && grep -Fq -e /.depper/container.env "$unit"; then echo "This deployment was made by an older depper that used container.env; run depper deploy once before pushing secrets" >&2; exit 1; fi`,
+		`echo @@current`,
 		`if test -L "$base/current"; then readlink "$base/current"; fi`,
 	))
 	if err != nil {
 		return "", err
 	}
-	return releaseFromLink(out), nil
+	return releaseFromLink(FromMarker(out, "@@current")), nil
 }
 
-// PushEnvironment replaces only the environment (environment file, its
-// manifest, and the container env file) under the lock, with a transaction
+// PushEnvironment replaces only the environment (environment file and its
+// manifest) under the lock, with a transaction
 // backup; it restarts the unit and waits for health, restoring the previous
 // environment and restarting again on failure. No release is created. env
 // comes from LoadEnvironment.
 func (e *Engine) PushEnvironment(ctx context.Context, env *dotenv.Environment) (*EnvPushResult, error) {
 	if e.Config.Container != nil {
-		if _, err := ContainerEnvFile(env.Values); err != nil {
+		if err := CheckContainerEnv(env.Values); err != nil {
 			return nil, err
 		}
 	}
-	l, err := e.Probe(ctx, false)
+	l, err := e.ProbeForChange(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -146,12 +151,10 @@ func (e *Engine) pushLocked(ctx context.Context, l *Layout, env *dotenv.Environm
 	lines = append(lines, `test -f "$unit" || { echo "The service unit is not installed; run depper deploy first" >&2; exit 1; }`)
 	lines = append(lines, backupLines()...)
 	lines = append(lines,
-		"mv -f "+candidate("environment")+` "$meta/environment"`,
-		"mv -f "+candidate("environment.manifest")+` "$meta/environment.manifest"`,
+		`: > "$tx/`+InterruptedMarker+`"`,
+		"mv -Tf "+candidate("environment")+` "$meta/environment"`,
+		"mv -Tf "+candidate("environment.manifest")+` "$meta/environment.manifest"`,
 	)
-	if artifacts.Container != nil {
-		lines = append(lines, "mv -f "+candidate("container.env")+` "$meta/container.env"`)
-	}
 	lines = append(lines, "systemctl --user restart "+shell.Quote(e.Config.UnitName()))
 	e.printf("Updating the environment of %s (%s)\n", e.Config.Service.Name, changes.Summary())
 	health, err := func() (*HealthResult, error) {
@@ -164,13 +167,14 @@ func (e *Engine) pushLocked(ctx context.Context, l *Layout, env *dotenv.Environm
 	if err != nil {
 		cctx := withoutCancel(ctx)
 		if rerr := e.Remote.Run(cctx, e.restoreScript(l, txID)); rerr != nil {
-			return fmt.Errorf("environment update failed: %v; restoring the previous environment also failed: %v (backup kept in %s)", err, rerr, l.Transaction(txID))
+			return e.restoreFailedError("environment update", err, rerr, l.Transaction(txID), current)
 		}
 		e.removeTransaction(cctx, l, txID)
 		return fmt.Errorf("environment update failed and the previous environment was restored: %w", err)
 	}
 	commit := e.txLines(l, txID)
 	commit = append(commit, snapshotLines(current)...)
+	commit = append(commit, clearInterruptedLines()...)
 	commit = append(commit, `rm -rf "$tx"`)
 	if err := e.Remote.Run(ctx, shell.Script(commit...)); err != nil {
 		return fmt.Errorf("the environment was updated, but recording it for rollback failed: %w", err)

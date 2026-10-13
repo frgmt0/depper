@@ -17,6 +17,18 @@ import (
 // deletes its transaction directory, which bounds how long old secret values
 // are retained.
 
+// InterruptedMarker is created in a transaction directory when the
+// operation starts changing the live configuration, and removed when it is
+// committed or restored. A marker that survives means the automatic restore
+// failed; `depper rollback` then restores that transaction first.
+const InterruptedMarker = "interrupted"
+
+// clearInterruptedLines remove every interrupted marker (after a commit, the
+// live state is known-good again).
+func clearInterruptedLines() []string {
+	return []string{`rm -f "$meta"/transactions/*/` + InterruptedMarker}
+}
+
 // txLines starts a transaction script: systemd session variables, a private
 // umask, and the variables base, meta, tx, and unit.
 func (e *Engine) txLines(l *Layout, txID string) []string {
@@ -72,16 +84,17 @@ func (e *Engine) restoreScript(l *Layout, txID string) string {
 	lines = append(lines,
 		// Without a backup directory nothing was replaced yet.
 		`if ! test -d "$tx"; then exit 0; fi`,
-		`restore_file() { if test -f "$tx/$2"; then cp -p "$tx/$2" "$1.restore"; mv -f "$1.restore" "$1"; elif test -f "$tx/no-$2"; then rm -f "$1"; fi; }`,
+		`restore_file() { if test -f "$tx/$2"; then cp -p "$tx/$2" "$1.restore"; mv -Tf "$1.restore" "$1"; elif test -f "$tx/no-$2"; then rm -f "$1"; fi; }`,
 		`restore_link() { if test -f "$tx/$2"; then rm -f "$base/.$2.restore"; ln -s "$(cat "$tx/$2")" "$base/.$2.restore"; mv -Tf "$base/.$2.restore" "$1"; elif test -f "$tx/no-$2"; then rm -f "$1"; fi; }`,
 		`restore_file "$meta/environment" environment`,
 		`restore_file "$meta/environment.manifest" environment.manifest`,
 		`restore_file "$meta/container.env" container.env`,
-		`if test -f "$tx/unit"; then cp -p "$tx/unit" "$unit.restore"; mv -f "$unit.restore" "$unit"; elif test -f "$tx/no-unit"; then systemctl --user disable --now `+unitName+` || true; rm -f "$unit"; fi`,
+		`if test -f "$tx/unit"; then cp -p "$tx/unit" "$unit.restore"; mv -Tf "$unit.restore" "$unit"; elif test -f "$tx/no-unit"; then systemctl --user disable --now `+unitName+` || true; rm -f "$unit"; fi`,
 		`restore_link "$base/current" current`,
 		`restore_link "$base/previous" previous`,
 		"systemctl --user daemon-reload",
 		`if test -f "$tx/unit"; then systemctl --user restart `+unitName+`; fi`,
+		`rm -f "$tx/`+InterruptedMarker+`"`,
 	)
 	return shell.Script(lines...)
 }
@@ -99,6 +112,6 @@ func snapshotLines(releaseID string) []string {
 		`for name in environment environment.manifest container.env; do if test -f "$meta/$name"; then cp -p "$meta/$name" "$snap.next/$name"; fi; done`,
 		`cp -p "$unit" "$snap.next/unit"`,
 		`rm -rf "$snap"`,
-		`mv "$snap.next" "$snap"`,
+		`mv -Tf "$snap.next" "$snap"`,
 	}
 }

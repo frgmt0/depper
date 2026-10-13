@@ -481,3 +481,23 @@ func TestParseState(t *testing.T) {
 		t.Errorf("empty name accepted: %v", err)
 	}
 }
+
+// Text a login shell prints before the script runs (motd, rc files) must not
+// break the state, cloudflared path, or tunnel list parsing.
+func TestLoginShellNoiseIsIgnored(t *testing.T) {
+	h := newFakeHost(t)
+	h.writeFile("login-noise", "Welcome!\nstate=noise\n[{\"name\":\"x\"}]\n")
+	e, _ := h.Engine(tunnelToml)
+	m, _ := newManager()
+	ctx := context.Background()
+	state, err := m.Run(ctx, e)
+	if err != nil {
+		t.Fatalf("run with login noise: %v\n%s", err, h.Out)
+	}
+	if state.ID != tunnelID {
+		t.Errorf("state = %+v", state)
+	}
+	if _, err := m.Run(ctx, e); err != nil {
+		t.Fatalf("second run with login noise: %v\n%s", err, h.Out)
+	}
+}

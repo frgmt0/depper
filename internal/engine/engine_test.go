@@ -44,8 +44,8 @@ func recorderEngine(cfg *config.Config, handler func(transporttest.Call) (transp
 func TestProbeRejectsInvalidPathAndLegacyLayout(t *testing.T) {
 	cfg := testConfig(t, "[service]\nname = \"api\"\ncommand = \"x\"\n[deploy]\nhost = \"server\"\n")
 	for _, tc := range []struct{ out, want string }{
-		{"base=relative/path\nhome=/h\nlayout=none\ntunnel=no\n", "invalid deployment path"},
-		{"base=/srv/a b\nhome=/h\nlayout=none\ntunnel=no\n", "invalid deployment path"},
+		{"base=relative/path\nhome=/h\nlayout=none\ntunnel=no\n", "is not supported"},
+		{"base=/srv/a b\nhome=/h\nlayout=none\ntunnel=no\n", "is not supported"},
 		{"base=/srv/api\nbase=/x\nlayout=none\n", "invalid deployment probe"},
 		{"base=/srv/api\nhome=/h\nlayout=weird\ntunnel=no\n", "invalid deployment probe"},
 		{"base=/srv/api\nhome=/h\nlayout=legacy\ntunnel=no\n", "depper migrate"},
@@ -78,7 +78,7 @@ func TestUploadScriptIsPrivateAtomicAndNeverContainsTheValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"umask 077", "test ! -L", "mktemp", "trap", `mv -f "$temporary" "$destination"`, "base64 -d", "chmod 600"} {
+	for _, want := range []string{"umask 077", "test ! -L", "mktemp", "trap", `mv -Tf "$temporary" "$destination"`, "base64 -d", "chmod 600"} {
 		if !strings.Contains(script, want) {
 			t.Errorf("upload script missing %q", want)
 		}
@@ -99,7 +99,7 @@ func TestSetupAndHealthScriptsExportOnlyEnvAndNeverSourceSecrets(t *testing.T) {
 	cfg := testConfig(t, "[service]\nname = \"api\"\ncommand = \"x\"\n[deploy]\nhost = \"server\"\nsetup = [\"python3 setup.py\"]\n[env]\nPAYLOAD = \"$(printf should-not-run)\"\nSAFE = \"yes\"\n[health]\ncommand = \"python3 health.py\"\n")
 	e, rec := recorderEngine(cfg, nil)
 	l := &Layout{Base: "/srv/api", State: LayoutDepper}
-	if err := e.runSetup(context.Background(), l, "/srv/api/releases/r1", "r1"); err != nil {
+	if err := e.runSetup(context.Background(), l, "/srv/api/releases/r1", "r1", map[string]string{"TOKEN": sentinel}); err != nil {
 		t.Fatal(err)
 	}
 	setup := rec.Scripts()[0]
@@ -159,16 +159,38 @@ func TestProcessUnitEscaping(t *testing.T) {
 	}
 }
 
-func TestContainerEnvFile(t *testing.T) {
-	got, err := ContainerEnvFile(map[string]string{"B": `say "hi" $X`, "A": "1"})
-	if err != nil || got != "A=1\nB=say \"hi\" $X\n" {
-		t.Errorf("got %q, %v", got, err)
+// Container values reach the engine through the unit's EnvironmentFile and
+// `--env KEY` pass-through; only names appear in the arguments, multi-line
+// and quoted values are fine, and oversized values are refused by key name.
+func TestContainerEnvArgsAndLimits(t *testing.T) {
+	values := map[string]string{"B": "'quoted' \"value\"\nwith a newline", "A": "1"}
+	if got := ContainerEnvArgs(values); got != "--env A --env B" {
+		t.Errorf("ContainerEnvArgs = %q", got)
 	}
-	for _, bad := range []string{"a\nb", "a\rb", "a\x00b"} {
-		_, err := ContainerEnvFile(map[string]string{"SECRET": bad})
-		if err == nil || !strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), bad) {
-			t.Errorf("value %q: err = %v", bad, err)
-		}
+	if err := CheckContainerEnv(values); err != nil {
+		t.Errorf("multi-line / quoted values rejected: %v", err)
+	}
+	big := strings.Repeat("x", MaxContainerEnvValue+1)
+	err := CheckContainerEnv(map[string]string{"HUGE": big, "A": "1"})
+	if err == nil || !strings.Contains(err.Error(), "HUGE") || !strings.Contains(err.Error(), "60 KiB") || strings.Contains(err.Error(), "xxxx") {
+		t.Errorf("oversized value: %v", err)
+	}
+	if err := CheckContainerEnv(map[string]string{"OK": strings.Repeat("x", MaxContainerEnvValue)}); err != nil {
+		t.Errorf("60 KiB value rejected: %v", err)
+	}
+	if err := CheckContainerEnv(map[string]string{ContainerEnvArgsVar: "x"}); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Errorf("reserved name: %v", err)
+	}
+	cfg := testConfig(t, "[service]\nname = \"web\"\n[deploy]\nhost = \"server\"\n[container]\nimage = \"nginx:1.25\"\n")
+	a, err := BuildEnvArtifacts(cfg, []byte(strings.Repeat("s", SaltBytes)), values, time.Unix(0, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body := string(a.Environment); !strings.Contains(body, ContainerEnvArgsVar+`="--env A --env B"`) || !strings.Contains(body, "B=\"'quoted' \\\"value\\\"\nwith a newline\"") {
+		t.Errorf("environment file:\n%s", body)
+	}
+	if len(a.Manifest.Keys) != 2 {
+		t.Errorf("manifest fingerprints the internal variable: %v", a.Manifest.KeyNames())
 	}
 }
 

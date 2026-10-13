@@ -87,8 +87,16 @@ func TestMigrateDefaultLayoutAndRollbackAfterwards(t *testing.T) {
 		t.Errorf("result = %+v", res)
 	}
 	newBase := h.path(base)
-	if h.exists(".local/share/deployer/api") || !h.exists(base+"/.depper") || h.exists(base+"/.deployer") {
-		t.Error("base not moved / metadata not renamed")
+	if !h.exists(base+"/.depper") || h.exists(base+"/.deployer") || h.exists(base+"/.depper/"+MigrationMarker) {
+		t.Error("base not moved / metadata not renamed / marker left")
+	}
+	// The old default base is now a relative compatibility link, so
+	// absolute paths inside the releases keep resolving.
+	if h.link(".local/share/deployer/api") != "../depper/api" || h.read(".local/share/deployer/api/releases/"+legacyR1+"/app.py") != legacyR1+"\n" {
+		t.Error("compatibility link missing or wrong")
+	}
+	if !strings.Contains(strings.Join(res.Plan, "\n"), "virtualenv") {
+		t.Errorf("plan does not explain the compatibility link: %q", res.Plan)
 	}
 	if h.link(base+"/current") != "releases/"+legacyR2 || h.link(base+"/previous") != "releases/"+legacyR1 || h.exists(base+"/.depper/previous") {
 		t.Error("current/previous not converted to relative links")
@@ -205,5 +213,133 @@ func TestMigrateWithoutLegacyDeployment(t *testing.T) {
 	e := h.Engine(loadConfig(t, processRepo(t)))
 	if _, err := e.Migrate(context.Background(), false); err == nil || !strings.Contains(err.Error(), "no Python deployer deployment") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// failureInjector is a wrapper for a remote command that fails when its
+// arguments match the glob in FAKE_ROOT/fail-<name>.
+func failureInjector(name string) string {
+	return "#!/bin/sh\n" +
+		`if test -f "$FAKE_ROOT/fail-` + name + `"; then pat=$(cat "$FAKE_ROOT/fail-` + name + `"); case "$*" in $pat) echo "injected ` + name + ` failure" >&2; exit 1 ;; esac; fi` + "\n" +
+		`exec /bin/` + name + ` "$@"` + "\n"
+}
+
+// migratedState is a normalized snapshot of everything a migration
+// produces (deployment tree, units, systemd state), for comparing hosts.
+func migratedState(t *testing.T, h *fakeHost) map[string]string {
+	t.Helper()
+	state := map[string]string{}
+	norm := func(s string) string { return strings.ReplaceAll(s, h.Root, "ROOT") }
+	for _, top := range []string{filepath.Join(h.Home, ".local/share"), filepath.Join(h.Home, ".config/systemd/user"), filepath.Join(h.Root, "systemd")} {
+		err := filepath.Walk(top, func(p string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			rel := norm(p)
+			switch {
+			case strings.HasSuffix(p, ".started-unit"):
+			case info.Mode()&os.ModeSymlink != 0:
+				target, _ := os.Readlink(p)
+				state[rel] = "L:" + norm(target)
+			case info.IsDir():
+				state[rel] = "D"
+			default:
+				data, _ := os.ReadFile(p)
+				state[rel] = "F:" + norm(string(data))
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return state
+}
+
+// An interrupted migration (failure injected at several points) is resumed
+// by running `depper migrate` again; the end state equals a clean
+// migration, and rollback works afterwards.
+func TestMigrateResumesAfterInterruption(t *testing.T) {
+	clean := newFakeHost(t)
+	buildLegacy(t, clean, ".local/share/deployer/api")
+	ce := clean.Engine(loadConfig(t, processRepo(t)))
+	if _, err := ce.Migrate(context.Background(), false); err != nil {
+		t.Fatalf("clean migration: %v\n%s", err, clean.Out)
+	}
+	want := migratedState(t, clean)
+
+	points := []struct {
+		name, command, pattern string
+		legacyRestarted        bool
+		probe                  string
+	}{
+		{"before moving the base", "mkdir", "-p */.local/share/depper", true, "depper migrate"},
+		{"after moving before the compatibility link", "ln", "-s ../depper/api *", true, "depper migrate"},
+		{"after renaming the metadata", "chmod", "700 */.local/share/depper/api/.depper", false, "interrupted"},
+		{"while adding start scripts", "cp", "*/.depper-start.sh", false, "interrupted"},
+		{"when starting the new unit", "systemctl", "--user restart depper-api.service", false, "interrupted"},
+	}
+	for _, p := range points {
+		t.Run(p.name, func(t *testing.T) {
+			h := newFakeHost(t)
+			buildLegacy(t, h, ".local/share/deployer/api")
+			if p.command != "systemctl" {
+				h.writeExec("remote-bin/"+p.command, failureInjector(p.command))
+			}
+			e := h.Engine(loadConfig(t, processRepo(t)))
+			ctx := context.Background()
+			writeFile(t, filepath.Join(h.Root, "fail-"+p.command), p.pattern)
+			_, err := e.Migrate(ctx, false)
+			if err == nil || !strings.Contains(err.Error(), "run `depper migrate` again") {
+				t.Fatalf("injected failure: %v\n%s", err, h.Out)
+			}
+			if restarted := strings.Contains(err.Error(), "units were restarted"); restarted != p.legacyRestarted {
+				t.Errorf("legacy restart reported = %v (%v)", restarted, err)
+			}
+			if p.legacyRestarted && (!h.exists("../systemd/deployer-api.service.active") || !h.exists("../systemd/deployer-api.service.enabled")) {
+				t.Error("legacy unit not restarted while .deployer still exists")
+			}
+			if h.exists(base+"/.depper/lock") || h.exists(base+"/.deployer/lock") || h.exists(".local/share/deployer/api/.deployer/lock") {
+				t.Error("migration lock left behind")
+			}
+			if _, err := e.Status(ctx); err == nil || !strings.Contains(err.Error(), p.probe) {
+				t.Errorf("status during an interrupted migration = %v", err)
+			}
+			if _, err := e.Deploy(ctx, DeployOptions{}); err == nil || !strings.Contains(err.Error(), "depper migrate") {
+				t.Errorf("deploy during an interrupted migration = %v", err)
+			}
+			plan, err := e.Migrate(ctx, true)
+			if err != nil || !strings.Contains(plan.Plan[0], "resume the interrupted migration") {
+				t.Errorf("dry run while interrupted = %+v (%v)", plan, err)
+			}
+			if err := os.Remove(filepath.Join(h.Root, "fail-"+p.command)); err != nil {
+				t.Fatal(err)
+			}
+			res, err := e.Migrate(ctx, false)
+			if err != nil || res.Status != "migrated" || res.Health == nil || !res.Health.OK {
+				t.Fatalf("resumed migration = %+v, %v\n%s", res, err, h.Out)
+			}
+			got := migratedState(t, h)
+			for k, v := range want {
+				if got[k] != v {
+					t.Errorf("%s: got %.200q, want %.200q", k, got[k], v)
+				}
+			}
+			for k := range got {
+				if _, ok := want[k]; !ok {
+					t.Errorf("unexpected %s = %.200q", k, got[k])
+				}
+			}
+			if again, err := e.Migrate(ctx, false); err != nil || again.Status != "already-migrated" {
+				t.Errorf("third migrate = %+v (%v)", again, err)
+			}
+			if _, err := e.Rollback(ctx, ""); err != nil {
+				t.Fatalf("rollback after resumed migration: %v", err)
+			}
+			if h.link(base+"/current") != "releases/"+legacyR1 || h.read(base+"/.depper/environment") != "TOKEN=\"one\"\n" {
+				t.Error("rollback after a resumed migration did not restore the previous release")
+			}
+			checkScriptSyntax(t, h.Exec.Scripts())
+		})
 	}
 }

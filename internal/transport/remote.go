@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"strings"
+
+	"github.com/frgmt0/depper/internal/shell"
 )
 
 // RemoteShell is the command ssh runs on the host; scripts arrive on its
@@ -43,8 +45,11 @@ func (r *Remote) rsync() string {
 }
 
 // ScriptArgs returns the argv used to run a script (the script is sent on
-// stdin): ssh <options> -- <host> 'sh -s'.
+// stdin): ssh <options> -T -- <host> 'sh -s'.
 func (r *Remote) ScriptArgs() []string { return r.Target.SSHArgs(r.ssh(), RemoteShell) }
+
+// Every script is sent through shell.Wrap, so the remote shell parses it
+// completely before running any of it.
 
 // Run executes script with `sh -s` on the host, streaming its output to
 // Remote.Stdout / Remote.Stderr.
@@ -58,14 +63,14 @@ func (r *Remote) Stream(ctx context.Context, script string, w io.Writer) error {
 	if w == nil {
 		w = r.Stdout
 	}
-	_, err := r.Exec.Run(ctx, Cmd{Args: r.ScriptArgs(), Stdin: strings.NewReader(script), Stdout: w, Stderr: r.Stderr})
+	_, err := r.Exec.Run(ctx, Cmd{Args: r.ScriptArgs(), Stdin: strings.NewReader(shell.Wrap(script)), Stdout: w, Stderr: r.Stderr})
 	return err
 }
 
 // Capture executes script on the host and returns its stdout. On failure
 // the *CommandError carries the remote stderr.
 func (r *Remote) Capture(ctx context.Context, script string) (string, error) {
-	res, err := r.Exec.Run(ctx, Cmd{Args: r.ScriptArgs(), Stdin: strings.NewReader(script), Capture: true})
+	res, err := r.Exec.Run(ctx, Cmd{Args: r.ScriptArgs(), Stdin: strings.NewReader(shell.Wrap(script)), Capture: true})
 	return res.Stdout, err
 }
 

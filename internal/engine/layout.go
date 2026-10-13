@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/frgmt0/depper/internal/config"
 	"github.com/frgmt0/depper/internal/shell"
 )
 
@@ -14,6 +15,9 @@ const (
 	LayoutDepper = "depper" // a depper deployment (<base>/.depper)
 	LayoutLegacy = "legacy" // only a Python deployer deployment
 	LayoutBoth   = "both"   // both layouts exist
+	// LayoutMigrating: a `depper migrate` was interrupted (marker in
+	// <base>/.depper); rerunning it finishes the migration.
+	LayoutMigrating = "migrating"
 )
 
 // Layout is the resolved remote deployment directory and what the probe
@@ -56,7 +60,9 @@ func (l *Layout) Manifest() string { return l.Meta() + "/environment.manifest" }
 // Salt is <base>/.depper/fingerprint.salt.
 func (l *Layout) Salt() string { return l.Meta() + "/fingerprint.salt" }
 
-// ContainerEnv is <base>/.depper/container.env (docker --env-file format).
+// ContainerEnv is <base>/.depper/container.env, the --env-file of older
+// depper versions (removed by the next deploy; kept in old transaction
+// backups so rolling back to such a release still works).
 func (l *Layout) ContainerEnv() string { return l.Meta() + "/container.env" }
 
 // Lock is the lock directory <base>/.depper/lock.
@@ -77,20 +83,61 @@ func (l *Layout) Previous() string { return l.Base + "/previous" }
 // Deployed reports whether a depper deployment exists.
 func (l *Layout) Deployed() bool { return l.State == LayoutDepper || l.State == LayoutBoth }
 
-// baseAssignments returns shell assignments for the depper base and the
-// legacy (Python deployer) base.
-func (e *Engine) baseAssignments() (base, legacy string) {
-	if p := e.Config.Deploy.Path; p != "" {
+// MigrationMarker is the file (inside the metadata directory) that marks a
+// `depper migrate` in progress; it moves with the metadata directory.
+const MigrationMarker = "migration-in-progress"
+
+// CompatLinkTarget is the relative target of the compatibility symlink that
+// `depper migrate` leaves at the Python deployer's default base
+// (~/.local/share/deployer/<name> -> ../depper/<name>).
+func CompatLinkTarget(cfg *config.Config) string { return "../depper/" + cfg.Service.Name }
+
+// BaseAssignments returns shell words for the depper base and the legacy
+// (Python deployer) base of cfg.
+func BaseAssignments(cfg *config.Config) (base, legacy string) {
+	if p := cfg.Deploy.Path; p != "" {
 		q := shell.Quote(p)
 		return q, q
 	}
 	// Service names are validated ([A-Za-z0-9_.-]), safe inside double quotes.
-	return `"$HOME/` + e.Config.DefaultBaseRel() + `"`, `"$HOME/` + e.Config.LegacyDefaultBaseRel() + `"`
+	return `"$HOME/` + cfg.DefaultBaseRel() + `"`, `"$HOME/` + cfg.LegacyDefaultBaseRel() + `"`
 }
 
+func (e *Engine) baseAssignments() (base, legacy string) { return BaseAssignments(e.Config) }
+
+// LayoutDetectionLines set $state to none, depper, legacy, both, or
+// migrating from $base and $legacy (shared by the probe and doctor):
+//
+//   - the compatibility symlink `depper migrate` leaves at the legacy default
+//     base is not a legacy layout (it points at the depper base);
+//   - <base>/.deployer is a legacy layout (a migration that moved the base
+//     but did not rename the metadata yet);
+//   - a migration marker in <base>/.depper means `depper migrate` was
+//     interrupted and must be run again.
+func LayoutDetectionLines(cfg *config.Config) []string {
+	return []string{
+		`compat=no`,
+		`if test -L "$legacy" && test "$(readlink "$legacy")" = ` + shell.Quote(CompatLinkTarget(cfg)) + `; then compat=yes; fi`,
+		`has_new=no; if test -d "$base/.depper"; then has_new=yes; fi`,
+		`has_legacy=no`,
+		`if test "$compat" = no && { test -e "$legacy/.deployer" || test -L "$legacy/.deployer"; }; then has_legacy=yes; fi`,
+		`if test -e "$base/.deployer" || test -L "$base/.deployer"; then has_legacy=yes; fi`,
+		`if test -e "$HOME/.config/systemd/user/"` + shell.Quote(cfg.LegacyUnitName()) + `; then has_legacy=yes; fi`,
+		`if test -f "$base/.depper/` + MigrationMarker + `"; then state=migrating`,
+		`elif test "$has_new" = yes && test "$has_legacy" = yes; then state=both`,
+		`elif test "$has_new" = yes; then state=depper`,
+		`elif test "$has_legacy" = yes; then state=legacy`,
+		`else state=none; fi`,
+	}
+}
+
+// probeMarker introduces the probe's key=value output, so anything a login
+// shell prints first (motd, rc files) is ignored.
+const probeMarker = "@@probe"
+
 // probeScript detects the layout (folding in the legacy check) and, when
-// create is set and no legacy-only layout was found, creates the private
-// metadata directories.
+// create is set and a plain depper (or empty) layout was found, creates the
+// private metadata directories.
 func (e *Engine) probeScript(create bool) string {
 	base, legacy := e.baseAssignments()
 	lines := []string{
@@ -101,28 +148,22 @@ func (e *Engine) probeScript(create bool) string {
 		"legacy=" + legacy,
 		`home=$HOME`,
 		refuseSymlink(`"$base/.depper"`, "deployment metadata directory"),
-		`has_new=no; if test -d "$base/.depper"; then has_new=yes; fi`,
-		`has_legacy=no`,
-		`if test -e "$legacy/.deployer" || test -L "$legacy/.deployer"; then has_legacy=yes; fi`,
-		`if test -e "$HOME/.config/systemd/user/"` + shell.Quote(e.Config.LegacyUnitName()) + `; then has_legacy=yes; fi`,
-		`if test "$has_new" = yes && test "$has_legacy" = yes; then state=both`,
-		`elif test "$has_new" = yes; then state=depper`,
-		`elif test "$has_legacy" = yes; then state=legacy`,
-		`else state=none; fi`,
 	}
+	lines = append(lines, LayoutDetectionLines(e.Config)...)
 	if create {
 		lines = append(lines,
-			`if test "$state" != legacy; then`,
+			`if test "$state" = none || test "$state" = depper; then`,
 			`  mkdir -p "$base/releases" "$base/.depper/transactions"`,
 			"  "+refuseSymlink(`"$base/.depper/transactions"`, "deployment transaction directory"),
 			"  "+refuseSymlink(`"$base/releases"`, "releases directory"),
 			`  chmod 700 "$base/.depper" "$base/.depper/transactions"`,
-			`  if test "$state" = none; then state=depper; fi`,
+			`  state=depper`,
 			`fi`,
 		)
 	}
 	lines = append(lines,
 		`tunnel=no; if test -s "$base/.depper/tunnel.json"; then tunnel=yes; fi`,
+		`echo `+probeMarker,
 		`printf 'base=%s\n' "$base"`,
 		`printf 'home=%s\n' "$home"`,
 		`printf 'layout=%s\n' "$state"`,
@@ -134,10 +175,35 @@ func (e *Engine) probeScript(create bool) string {
 	return shell.Script(lines...)
 }
 
+// afterMarker returns the output after the first line equal to marker, and
+// whether that line was found. Output a login shell printed before the
+// script ran is skipped this way.
+func afterMarker(out, marker string) (string, bool) {
+	if strings.HasPrefix(out, marker+"\n") {
+		return out[len(marker)+1:], true
+	}
+	if i := strings.Index(out, "\n"+marker+"\n"); i >= 0 {
+		return out[i+len(marker)+2:], true
+	}
+	return "", false
+}
+
+// FromMarker returns the output after the first line equal to marker, or
+// the whole output when there is no such line. Scripts print a marker line
+// before their machine-readable output, so whatever a login shell prints
+// first (motd, rc files) is skipped.
+func FromMarker(out, marker string) string {
+	if body, ok := afterMarker(out, marker); ok {
+		return body
+	}
+	return out
+}
+
 // parseProbe validates probe output.
 func parseProbe(out string, wantEngine bool) (*Layout, error) {
+	body := FromMarker(out, probeMarker)
 	values := map[string]string{}
-	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+	for _, line := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
 		key, value, ok := strings.Cut(line, "=")
 		if !ok {
 			return nil, fmt.Errorf("remote host returned an invalid deployment probe")
@@ -148,11 +214,11 @@ func parseProbe(out string, wantEngine bool) (*Layout, error) {
 		values[key] = value
 	}
 	l := &Layout{Base: values["base"], Home: values["home"], State: values["layout"], TunnelOwned: values["tunnel"] == "yes", EnginePath: values["engine"]}
-	if !shell.IsPlainPath(l.Base) || strings.HasSuffix(l.Base, "/") {
-		return nil, fmt.Errorf("remote host returned an invalid deployment path")
+	if !shell.IsSafePath(l.Base) || strings.HasSuffix(l.Base, "/") {
+		return nil, fmt.Errorf("the deployment path on the host (%q) is not supported: depper needs an absolute path made only of %s; set [deploy].path", l.Base, shell.SafePathChars)
 	}
 	switch l.State {
-	case LayoutNone, LayoutDepper, LayoutLegacy, LayoutBoth:
+	case LayoutNone, LayoutDepper, LayoutLegacy, LayoutBoth, LayoutMigrating:
 	default:
 		return nil, fmt.Errorf("remote host returned an invalid deployment probe")
 	}
@@ -162,11 +228,25 @@ func parseProbe(out string, wantEngine bool) (*Layout, error) {
 	return l, nil
 }
 
-// Probe resolves the remote base path and reports the deployment layout.
-// With create, the depper metadata directories are created (never when only
-// a legacy layout exists). A legacy-only layout is an error pointing at
-// `depper migrate`.
+// Probe resolves the remote base path and reports the deployment layout,
+// for read-only commands. With create (deploy, tunnel), the depper metadata
+// directories are created and the probe refuses like ProbeForChange.
+//
+// A legacy-only layout or an interrupted migration is an error pointing at
+// `depper migrate`. When both layouts exist, read-only use proceeds with a
+// warning; changes are refused (see ProbeForChange).
 func (e *Engine) Probe(ctx context.Context, create bool) (*Layout, error) {
+	return e.probe(ctx, create, create)
+}
+
+// ProbeForChange is Probe for commands that change the deployment without
+// creating it (rollback, secrets push, restart, stop, unlock, tunnel stop):
+// it also refuses when both a depper and a legacy layout exist.
+func (e *Engine) ProbeForChange(ctx context.Context) (*Layout, error) {
+	return e.probe(ctx, false, true)
+}
+
+func (e *Engine) probe(ctx context.Context, create, change bool) (*Layout, error) {
 	out, err := e.Remote.Capture(ctx, e.probeScript(create))
 	if err != nil {
 		return nil, err
@@ -175,8 +255,16 @@ func (e *Engine) Probe(ctx context.Context, create bool) (*Layout, error) {
 	if err != nil {
 		return nil, err
 	}
-	if l.State == LayoutLegacy {
+	switch l.State {
+	case LayoutLegacy:
 		return nil, fmt.Errorf("found a deployment made by the Python deployer for %s; run `depper migrate` to convert it", e.Config.Service.Name)
+	case LayoutMigrating:
+		return nil, fmt.Errorf("a `depper migrate` of %s was interrupted; run `depper migrate` again to finish it", e.Config.Service.Name)
+	case LayoutBoth:
+		if change {
+			return nil, fmt.Errorf("both a depper deployment (%s/.depper) and a Python deployer deployment exist for %s; refusing to change either. Run `depper migrate --dry-run` for details and remove the one you no longer need", l.Base, e.Config.Service.Name)
+		}
+		e.printf("Warning: both a depper deployment (%s/.depper) and a Python deployer deployment exist for %s; changes are refused until one is removed (see `depper migrate --dry-run`).\n", l.Base, e.Config.Service.Name)
 	}
 	return l, nil
 }

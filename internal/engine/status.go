@@ -173,7 +173,7 @@ func (e *Engine) Control(ctx context.Context, action string) error {
 	if action != "restart" && action != "stop" {
 		return fmt.Errorf("unsupported action %q", action)
 	}
-	l, err := e.Probe(ctx, false)
+	l, err := e.ProbeForChange(ctx)
 	if err != nil {
 		return err
 	}

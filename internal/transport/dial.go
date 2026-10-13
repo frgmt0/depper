@@ -13,8 +13,18 @@ import (
 	"time"
 )
 
+// ForwardReadyMarker is the stderr line `ssh -W` prints (through
+// LocalCommand) once it has connected and authenticated, so DialContext can
+// tell the SSH handshake apart from the forwarded request.
+const ForwardReadyMarker = "depper-forward-ready"
+
 // DialArgs returns the argv for `ssh -W host:port`, which forwards the
 // process's stdio to addr as seen from the deploy host.
+//
+// ssh runs LocalCommand after connecting and authenticating; it prints
+// ForwardReadyMarker on stderr (stdout is the forwarded stream). Connection
+// multiplexing is disabled because a multiplexed client never runs
+// LocalCommand.
 func (r *Remote) DialArgs(addr string) ([]string, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -24,14 +34,21 @@ func (r *Remote) DialArgs(addr string) ([]string, error) {
 		return nil, fmt.Errorf("invalid forward address %q", addr)
 	}
 	args := append([]string{r.ssh()}, r.Target.SSHOptions()...)
+	args = append(args,
+		"-o", "ControlPath=none",
+		"-o", "PermitLocalCommand=yes",
+		"-o", "LocalCommand=echo "+ForwardReadyMarker+" 1>&2",
+	)
 	return append(args, "-W", net.JoinHostPort(host, port), "--", r.Target.Host), nil
 }
 
 // DialContext opens `ssh -W addr` and returns its stdio as a net.Conn,
 // suitable as an http.Transport DialContext (network must be tcp, tcp4 or
 // tcp6). It always spawns the real ssh program (Remote.SSHProgram), not
-// Remote.Exec. ctx is checked before the process starts; the connection then
-// lives until Close (use deadlines or Close to bound it).
+// Remote.Exec. DialContext returns once ssh reports that it is connected
+// (ForwardReadyMarker), when ssh exits (its error), or when ctx is done; so
+// a deadline on ctx bounds the SSH handshake only. The connection then lives
+// until Close (use deadlines or Close to bound it).
 //
 // When the forward fails, Read/Write return a *CommandError carrying ssh's
 // stderr; IsForwardingProhibited distinguishes a server that disallows
@@ -49,7 +66,30 @@ func (r *Remote) DialContext(ctx context.Context, network, addr string) (net.Con
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return startStdioConn(args, addr)
+	c, err := startStdioConn(args, addr)
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case <-c.ready:
+		return c, nil
+	case <-c.done:
+		// ssh exited before connecting (or before LocalCommand ran).
+		select {
+		case <-c.ready:
+			return c, nil
+		default:
+		}
+		err := c.exitError(0)
+		_ = c.Close()
+		if err == nil {
+			err = fmt.Errorf("%s exited before the forward to %s was established", c.program, addr)
+		}
+		return nil, err
+	case <-ctx.Done():
+		_ = c.Close()
+		return nil, ctx.Err()
+	}
 }
 
 // IsForwardingProhibited reports whether err shows the SSH server refused
@@ -75,13 +115,56 @@ type stdioConn struct {
 	addr    string
 	r       *os.File // read end of the child's stdout
 	w       *os.File // write end of the child's stdin
-	stderr  *TailBuffer
+	stderr  *readyWriter
+	ready   chan struct{}
 	done    chan struct{}
 	waitErr error
 	once    sync.Once
 }
 
-func startStdioConn(args []string, addr string) (net.Conn, error) {
+// readyWriter keeps ssh's stderr (in a TailBuffer) except the
+// ForwardReadyMarker line, whose arrival closes ready.
+type readyWriter struct {
+	tail  *TailBuffer
+	ready chan struct{}
+	mu    sync.Mutex
+	line  []byte
+	seen  bool
+}
+
+func (w *readyWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, b := range p {
+		w.line = append(w.line, b)
+		if b != '\n' {
+			continue
+		}
+		w.flushLine()
+	}
+	return len(p), nil
+}
+
+// flushLine moves the buffered line to the tail, unless it is the marker.
+func (w *readyWriter) flushLine() {
+	line := w.line
+	w.line = nil
+	if !w.seen && strings.TrimRight(string(line), "\r\n") == ForwardReadyMarker {
+		w.seen = true
+		close(w.ready)
+		return
+	}
+	_, _ = w.tail.Write(line)
+}
+
+// String returns the retained stderr, including an unterminated last line.
+func (w *readyWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.tail.String() + string(w.line)
+}
+
+func startStdioConn(args []string, addr string) (*stdioConn, error) {
 	outR, outW, err := os.Pipe()
 	if err != nil {
 		return nil, err
@@ -92,9 +175,15 @@ func startStdioConn(args []string, addr string) (net.Conn, error) {
 		outW.Close()
 		return nil, err
 	}
-	c := &stdioConn{program: args[0], addr: addr, r: outR, w: inW, stderr: &TailBuffer{Max: stderrTail}, done: make(chan struct{})}
+	ready := make(chan struct{})
+	c := &stdioConn{program: args[0], addr: addr, r: outR, w: inW, ready: ready, done: make(chan struct{}),
+		stderr: &readyWriter{tail: &TailBuffer{Max: stderrTail}, ready: ready}}
 	c.cmd = exec.Command(args[0], args[1:]...)
 	c.cmd.Stdin, c.cmd.Stdout, c.cmd.Stderr = inR, outW, c.stderr
+	// A leftover child holding ssh's stderr open must not keep Wait (and
+	// so Close) blocked.
+	c.cmd.WaitDelay = WaitDelay
+	ownProcessGroup(c.cmd)
 	err = c.cmd.Start()
 	inR.Close()
 	outW.Close()
@@ -113,15 +202,19 @@ func startStdioConn(args []string, addr string) (net.Conn, error) {
 	return c, nil
 }
 
-// exitError waits briefly for ssh to exit and returns a *CommandError if it
-// exited unsuccessfully.
+// exitError waits up to wait for ssh to exit and returns a *CommandError if
+// it exited unsuccessfully.
 func (c *stdioConn) exitError(wait time.Duration) error {
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	select {
-	case <-c.done:
-	case <-timer.C:
-		return nil
+	if wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-c.done:
+		case <-timer.C:
+			return nil
+		}
+	} else {
+		<-c.done
 	}
 	var exitErr *exec.ExitError
 	if errors.As(c.waitErr, &exitErr) {
@@ -151,12 +244,13 @@ func (c *stdioConn) Write(b []byte) (int, error) {
 }
 
 // Close closes both pipes and reaps ssh, killing it if it does not exit
-// promptly.
+// promptly. It returns within about 2*WaitDelay: Wait itself gives up on
+// leftover pipe holders after WaitDelay.
 func (c *stdioConn) Close() error {
 	c.once.Do(func() {
 		c.w.Close()
 		c.r.Close()
-		timer := time.NewTimer(2 * time.Second)
+		timer := time.NewTimer(WaitDelay)
 		defer timer.Stop()
 		select {
 		case <-c.done:

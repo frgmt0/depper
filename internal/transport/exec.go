@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/frgmt0/depper/internal/shell"
 )
@@ -83,7 +84,17 @@ type Local struct{}
 
 const stderrTail = 64 << 10
 
+// WaitDelay bounds how long a cancelled or exited command may keep running
+// (or keep its output pipes open through a leftover child) before it is
+// killed and its pipes are closed.
+const WaitDelay = 2 * time.Second
+
 // Run implements Executor.
+//
+// The process runs in its own process group, so a terminal Ctrl-C reaches
+// only depper, which cancels ctx: the command then gets WaitDelay to finish
+// on its own (for ssh, the remote command) before it is killed. Run returns
+// only after the process has exited.
 func (Local) Run(ctx context.Context, c Cmd) (Result, error) {
 	if len(c.Args) == 0 {
 		return Result{}, errors.New("transport: empty command")
@@ -93,6 +104,9 @@ func (Local) Run(ctx context.Context, c Cmd) (Result, error) {
 	cmd.Dir = c.Dir
 	cmd.Env = c.Env
 	cmd.Stdin = c.Stdin
+	cmd.WaitDelay = WaitDelay
+	cmd.Cancel = func() error { return nil }
+	ownProcessGroup(cmd)
 	var stdout, stderr bytes.Buffer
 	tail := &TailBuffer{Max: stderrTail}
 	if c.Capture {
@@ -109,11 +123,11 @@ func (Local) Run(ctx context.Context, c Cmd) (Result, error) {
 	if errors.Is(err, exec.ErrNotFound) {
 		return result, &NotFoundError{Program: program}
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return result, fmt.Errorf("%s: %w", program, ctxErr)
+	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return result, fmt.Errorf("%s: %w", program, ctxErr)
-		}
 		cerr := &CommandError{Program: program, ExitCode: exitErr.ExitCode(), Stderr: result.Stderr, Stdout: result.Stdout}
 		if !c.Capture {
 			cerr.Stderr, cerr.Streamed = tail.String(), true

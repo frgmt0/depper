@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/frgmt0/depper/internal/config"
@@ -168,16 +171,50 @@ func isForwardingProhibited(err error) bool {
 	return transport.IsForwardingProhibited(err) || strings.Contains(err.Error(), "administratively prohibited")
 }
 
+// minDialTimeout is the least time the SSH handshake of a forwarded url
+// check gets (DialTimeout).
+const minDialTimeout = 15 * time.Second
+
+// DialTimeout bounds the SSH connection and authentication of a forwarded
+// url check: max(15s, [health].timeout). [health].timeout itself bounds only
+// the HTTP exchange (request, response headers, and body) after ssh is
+// connected.
+func DialTimeout(h *config.Health) time.Duration {
+	if h.Timeout > minDialTimeout {
+		return h.Timeout
+	}
+	return minDialTimeout
+}
+
 // checkURLForward requests the URL through `ssh -W`, from the host's network
 // view. It returns an error only when forwarding itself is refused or ssh
-// cannot run; connection failures are an unhealthy result.
+// cannot connect or run; connection failures are an unhealthy result.
 func (e *Engine) checkURLForward(ctx context.Context) (*HealthResult, error) {
 	h := e.Config.Health
 	r := &HealthResult{Check: CheckURL, Method: MethodForward, Target: h.URL, Body: json.RawMessage("null"), CheckedAt: e.now().Format(time.RFC3339)}
+	dialTimeout := DialTimeout(h)
+	var dialTimedOut atomic.Bool
 	client := &http.Client{
-		Timeout: h.Timeout,
 		Transport: &http.Transport{
-			DialContext:       e.Remote.DialContext,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dctx, cancel := context.WithTimeout(ctx, dialTimeout)
+				defer cancel()
+				conn, err := e.Remote.DialContext(dctx, network, addr)
+				if err != nil {
+					if dctx.Err() != nil && ctx.Err() == nil {
+						dialTimedOut.Store(true)
+						return nil, fmt.Errorf("ssh did not connect to the deploy host within %s", dialTimeout)
+					}
+					return nil, err
+				}
+				// From here on, [health].timeout bounds writing the request
+				// and reading the response headers and body.
+				if err := conn.SetDeadline(time.Now().Add(h.Timeout)); err != nil {
+					conn.Close()
+					return nil, err
+				}
+				return conn, nil
+			},
 			DisableKeepAlives: true,
 			Proxy:             nil,
 		},
@@ -193,7 +230,7 @@ func (e *Engine) checkURLForward(ctx context.Context) (*HealthResult, error) {
 	resp, err := client.Do(req)
 	if err != nil {
 		var nf *transport.NotFoundError
-		if isForwardingProhibited(err) || errors.As(err, &nf) {
+		if isForwardingProhibited(err) || errors.As(err, &nf) || dialTimedOut.Load() {
 			return nil, err
 		}
 		var cerr *transport.CommandError
@@ -205,13 +242,20 @@ func (e *Engine) checkURLForward(ctx context.Context) (*HealthResult, error) {
 		}
 		r.LatencyMS = time.Since(start).Milliseconds()
 		r.Error = limitError(unwrapURLError(err))
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			r.Error = "no complete response within " + seconds(h.Timeout) + "s"
+		}
 		return r, nil
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, BodyLimit))
+	body, rerr := io.ReadAll(io.LimitReader(resp.Body, BodyLimit))
 	r.LatencyMS = time.Since(start).Milliseconds()
 	r.Status = resp.StatusCode
 	r.Body = encodeBody(body)
+	if rerr != nil && errors.Is(rerr, os.ErrDeadlineExceeded) {
+		r.Error = "the response body was not complete within " + seconds(h.Timeout) + "s"
+		return r, nil
+	}
 	r.OK = statusOK(h, resp.StatusCode)
 	if !r.OK {
 		r.Error = e.statusError(resp.StatusCode)
@@ -295,16 +339,25 @@ func (e *Engine) checkURLCurl(ctx context.Context) (*HealthResult, error) {
 	return r, nil
 }
 
+// healthOutputMarker precedes the health command's output, so anything a
+// login shell printed before the script ran is not taken as the body.
+const healthOutputMarker = "@@health-output"
+
 // commandScript runs the health command in the current release with only
-// [env] exported (never the secrets file).
+// [env] exported (never the secrets file). The command's exit status 255 is
+// reported as 254, so 255 always means that ssh itself failed.
 func (e *Engine) commandScript(l *Layout) string {
+	command := shell.Quote(e.Config.Health.Command)
 	lines := append([]string{"set +xv"}, shell.Prelude()...)
 	lines = append(lines, shell.Exports(e.Config.Env)...)
 	lines = append(lines,
 		"cd "+shell.Quote(l.Current()),
+		`echo `+healthOutputMarker,
+		"rc=0",
 		// coreutils timeout enforces [health].timeout on the host when present.
-		"if command -v timeout >/dev/null 2>&1; then exec timeout "+seconds(e.Config.Health.Timeout)+" /bin/sh -lc "+shell.Quote(e.Config.Health.Command)+"; fi",
-		"exec /bin/sh -lc "+shell.Quote(e.Config.Health.Command),
+		"if command -v timeout >/dev/null 2>&1; then timeout "+seconds(e.Config.Health.Timeout)+" /bin/sh -lc "+command+" || rc=$?; else /bin/sh -lc "+command+" || rc=$?; fi",
+		`if test "$rc" -eq 255; then exit 254; fi`,
+		`exit "$rc"`,
 	)
 	return shell.Script(lines...)
 }
@@ -317,7 +370,7 @@ func (e *Engine) checkCommand(ctx context.Context, l *Layout) (*HealthResult, er
 	start := time.Now()
 	out, err := e.Remote.Capture(cctx, e.commandScript(l))
 	r.LatencyMS = time.Since(start).Milliseconds()
-	r.Body = encodeBody([]byte(out))
+	r.Body = encodeBody([]byte(FromMarker(out, healthOutputMarker)))
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
@@ -328,17 +381,23 @@ func (e *Engine) checkCommand(ctx context.Context, l *Layout) (*HealthResult, er
 			return nil, err
 		}
 		if errors.As(err, &cerr) {
-			if cerr.ExitCode == 255 {
+			switch cerr.ExitCode {
+			case 255:
 				// ssh itself failed (connection), not the command.
 				return nil, err
-			}
-			if cerr.ExitCode == 124 {
+			case 124:
 				r.Error = "health command timed out after " + seconds(h.Timeout) + "s"
 				return r, nil
 			}
 			msg := strings.TrimSpace(cerr.Stderr)
 			if msg == "" {
-				msg = fmt.Sprintf("health command exited with status %d", cerr.ExitCode)
+				code := cerr.ExitCode
+				if code == 254 {
+					code = 255 // remapped by commandScript; may also be a real 254
+					msg = fmt.Sprintf("health command exited with status %d (or 254)", code)
+				} else {
+					msg = fmt.Sprintf("health command exited with status %d", code)
+				}
 			}
 			r.Error = limitError(msg)
 			return r, nil
@@ -403,11 +462,12 @@ func parseUnitState(out string) *UnitState {
 // UnitState reads the app unit's systemd state.
 func (e *Engine) UnitState(ctx context.Context) (*UnitState, error) {
 	lines := append([]string{"set +xv"}, shell.Prelude()...)
+	lines = append(lines, "echo @@unit-state")
 	out, err := e.Remote.Capture(ctx, shell.Script(append(lines, unitShowLines(e.Config.UnitName())...)...))
 	if err != nil {
 		return nil, err
 	}
-	return parseUnitState(out), nil
+	return parseUnitState(FromMarker(out, "@@unit-state")), nil
 }
 
 // WaitHealthy waits for the restarted unit to become healthy. Without

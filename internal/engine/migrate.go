@@ -42,12 +42,24 @@ type legacyTx struct {
 	HasCur  bool
 }
 
+// Metadata locations reported by the inspection (legacyInspection.Kind).
+const (
+	metaNone    = "none"    // no legacy metadata found
+	metaLegacy  = "legacy"  // <legacy>/.deployer: not migrated yet
+	metaMoved   = "moved"   // <base>/.deployer: base moved, not renamed yet
+	metaRenamed = "renamed" // <base>/.depper with a migration marker
+)
+
 // legacyInspection is what the read-only inspection found.
 type legacyInspection struct {
-	Base, Legacy, Home    string
-	New, Old, OldSymlink  bool
+	Base, Legacy, Home string
+	// Kind is where the metadata directory is (meta* constants) and
+	// MetaDir its path.
+	Kind, MetaDir         string
+	New, OldSymlink       bool
 	BaseExists, OldLock   bool
 	AppUnit, AppActive    bool
+	AppEnabled            bool
 	TunnelUnit            bool
 	TunnelEnabled         bool
 	NewAppUnit, NewTunnel bool
@@ -55,10 +67,27 @@ type legacyInspection struct {
 	Cloudflared           string
 	Tunnel                *legacyTunnelState
 	Current, Previous     string
-	PreviousTx            string
-	Releases              []string
-	StartScripts          map[string]bool // release -> has .deployer-start.sh only
-	Transactions          []legacyTx
+	// PreviousLink is <base>/previous (written by an interrupted migration).
+	PreviousLink string
+	PreviousTx   string
+	// Marker holds the facts recorded when the migration started; nil when
+	// no migration is in progress.
+	Marker       map[string]string
+	Releases     []string
+	StartScripts map[string]bool // release -> has .deployer-start.sh only
+	Transactions []legacyTx
+}
+
+// resuming reports an interrupted migration.
+func (in *legacyInspection) resuming() bool { return in.Marker != nil }
+
+// compatLinkLines set $compat to yes when $legacy is depper's compatibility
+// symlink.
+func (e *Engine) compatLinkLines() []string {
+	return []string{
+		`compat=no`,
+		`if test -L "$legacy" && test "$(readlink "$legacy")" = ` + shell.Quote(CompatLinkTarget(e.Config)) + `; then compat=yes; fi`,
+	}
 }
 
 func (e *Engine) inspectScript() string {
@@ -71,20 +100,26 @@ func (e *Engine) inspectScript() string {
 		return "if " + test + "; then echo " + name + "=yes; else echo " + name + "=no; fi"
 	}
 	lines := append([]string{"set +xv"}, shell.Prelude()...)
+	lines = append(lines, "base="+base, "legacy="+legacy)
+	lines = append(lines, e.compatLinkLines()...)
 	lines = append(lines,
-		"base="+base,
-		"legacy="+legacy,
-		`old="$legacy/.deployer"`,
+		// Where the metadata is: still at the legacy base, at the new base
+		// but not renamed (interrupted), renamed with the migration marker
+		// (interrupted), or nowhere.
+		`if test "$compat" = no && { test -d "$legacy/.deployer" || test -L "$legacy/.deployer"; }; then kind=legacy; src=$legacy; md="$legacy/.deployer"`,
+		`elif test -d "$base/.deployer" && ! test -L "$base/.deployer"; then kind=moved; src=$base; md="$base/.deployer"`,
+		`elif test -f "$base/.depper/`+MigrationMarker+`"; then kind=renamed; src=$base; md="$base/.depper"`,
+		`else kind=none; src=$legacy; md="$legacy/.deployer"; fi`,
 		`echo @@paths`,
-		`printf 'base=%s\nlegacy=%s\nhome=%s\n' "$base" "$legacy" "$HOME"`,
+		`printf 'base=%s\nlegacy=%s\nhome=%s\nkind=%s\nmeta=%s\n' "$base" "$legacy" "$HOME" "$kind" "$md"`,
 		`echo @@flags`,
 		flag("new", `test -e "$base/.depper" || test -L "$base/.depper"`),
-		flag("old", `test -d "$old" && ! test -L "$old"`),
-		flag("old_symlink", `test -L "$old"`),
+		flag("old_symlink", `test -L "$md"`),
 		flag("base_exists", `test -e "$base" || test -L "$base"`),
-		flag("old_lock", `test -e "$old/lock"`),
+		flag("old_lock", `test -e "$md/lock"`),
 		flag("app_unit", "test -f "+appUnit),
 		flag("app_active", "systemctl --user is-active --quiet "+shell.Quote(e.Config.LegacyUnitName())+" 2>/dev/null"),
+		flag("app_enabled", "systemctl --user is-enabled --quiet "+shell.Quote(e.Config.LegacyUnitName())+" 2>/dev/null"),
 		flag("tunnel_unit", "test -f "+tunnelUnit),
 		flag("tunnel_enabled", "systemctl --user is-enabled --quiet "+shell.Quote(e.Config.LegacyTunnelUnitName())+" 2>/dev/null"),
 		flag("new_app_unit", "test -e "+newApp),
@@ -94,19 +129,22 @@ func (e *Engine) inspectScript() string {
 		`echo @@cloudflared`,
 		`command -v cloudflared 2>/dev/null || true`,
 		`echo @@tunnel_json`,
-		`if test -f "$old/tunnel.json" && ! test -L "$old/tunnel.json"; then head -c 65536 "$old/tunnel.json"; echo; fi`,
+		`if test -f "$md/tunnel.json" && ! test -L "$md/tunnel.json"; then head -c 65536 "$md/tunnel.json"; echo; fi`,
 		`echo @@current`,
-		`if test -L "$legacy/current"; then readlink "$legacy/current"; fi`,
+		`if test -L "$src/current"; then readlink "$src/current"; fi`,
 		`echo @@previous`,
-		`if test -L "$old/previous"; then readlink "$old/previous"; fi`,
+		`if test -L "$md/previous"; then readlink "$md/previous"; fi`,
+		`echo @@previous_link`,
+		`if test -L "$src/previous"; then readlink "$src/previous"; fi`,
 		`echo @@previous_transaction`,
-		`if test -f "$old/previous-transaction"; then head -c 4096 "$old/previous-transaction"; echo; fi`,
-		`for d in "$legacy"/releases/*; do`,
+		`if test -f "$md/previous-transaction"; then head -c 4096 "$md/previous-transaction"; echo; fi`,
+		`if test -f "$md/`+MigrationMarker+`" && ! test -L "$md/`+MigrationMarker+`"; then echo @@marker; head -c 4096 "$md/`+MigrationMarker+`"; echo; fi`,
+		`for d in "$src"/releases/*; do`,
 		`  test -d "$d" || continue`,
 		`  printf '@@release %s\n' "${d##*/}"`,
 		`  if test -f "$d/.deployer-start.sh" && ! test -e "$d/`+StartScriptName+`"; then echo start=yes; else echo start=no; fi`,
 		`done`,
-		`for t in "$old"/transactions/*; do`,
+		`for t in "$md"/transactions/*; do`,
 		`  test -d "$t" || continue`,
 		`  printf '@@tx %s\n' "${t##*/}"`,
 		`  if test -f "$t/unit"; then echo unit=yes; printf 'restart=%s\n' "$(sed -n 's/^Restart=//p' "$t/unit" | head -n 1)"; else echo unit=no; fi`,
@@ -133,13 +171,13 @@ func parseInspection(out string) (*legacyInspection, error) {
 		switch {
 		case s.Name == "paths":
 			m := kv(body)
-			in.Base, in.Legacy, in.Home = m["base"], m["legacy"], m["home"]
+			in.Base, in.Legacy, in.Home, in.Kind, in.MetaDir = m["base"], m["legacy"], m["home"], m["kind"], m["meta"]
 		case s.Name == "flags":
 			m := kv(body)
 			yes := func(k string) bool { return m[k] == "yes" }
-			in.New, in.Old, in.OldSymlink = yes("new"), yes("old"), yes("old_symlink")
+			in.New, in.OldSymlink = yes("new"), yes("old_symlink")
 			in.BaseExists, in.OldLock = yes("base_exists"), yes("old_lock")
-			in.AppUnit, in.AppActive = yes("app_unit"), yes("app_active")
+			in.AppUnit, in.AppActive, in.AppEnabled = yes("app_unit"), yes("app_active"), yes("app_enabled")
 			in.TunnelUnit, in.TunnelEnabled = yes("tunnel_unit"), yes("tunnel_enabled")
 			in.NewAppUnit, in.NewTunnel = yes("new_app_unit"), yes("new_tunnel_unit")
 		case s.Name == "app_restart":
@@ -158,8 +196,12 @@ func parseInspection(out string) (*legacyInspection, error) {
 			in.Current = strings.TrimSpace(body)
 		case s.Name == "previous":
 			in.Previous = strings.TrimSpace(body)
+		case s.Name == "previous_link":
+			in.PreviousLink = strings.TrimSpace(body)
 		case s.Name == "previous_transaction":
 			in.PreviousTx = strings.TrimSpace(body)
+		case s.Name == "marker":
+			in.Marker = kv(body)
 		case strings.HasPrefix(s.Name, "release "):
 			id := strings.TrimPrefix(s.Name, "release ")
 			if !ValidReleaseID(id) {
@@ -180,9 +222,17 @@ func parseInspection(out string) (*legacyInspection, error) {
 		}
 	}
 	for _, p := range []string{in.Base, in.Legacy} {
-		if !shell.IsPlainPath(p) || strings.HasSuffix(p, "/") {
-			return nil, fmt.Errorf("remote host returned an invalid deployment path")
+		if !shell.IsSafePath(p) || strings.HasSuffix(p, "/") {
+			return nil, fmt.Errorf("the deployment path on the host (%q) is not supported: depper needs an absolute path made only of %s", p, shell.SafePathChars)
 		}
+	}
+	switch {
+	case in.Kind == metaLegacy && in.MetaDir == in.Legacy+"/.deployer":
+	case in.Kind == metaMoved && in.MetaDir == in.Base+"/.deployer":
+	case in.Kind == metaRenamed && in.MetaDir == in.Base+"/.depper":
+	case in.Kind == metaNone:
+	default:
+		return nil, fmt.Errorf("remote host returned an invalid migration inspection")
 	}
 	sort.Strings(in.Releases)
 	return in, nil
@@ -204,42 +254,81 @@ type migration struct {
 	previous    string
 	previousTx  string
 	moveBase    bool
+	appRestart  string
+	appActive   bool
+	appEnabled  bool
+	hasTunnel   bool // the legacy tunnel connector unit exists (or existed)
+	tunnelOn    bool // ... and was enabled
 	tunnelUnit  string
 	tunnelYAML  string
 	startCopies []string
 }
 
+// marker is the content of the migration marker: the facts about the
+// legacy units recorded before they were stopped, so a resumed migration
+// restores the same state.
+func (m *migration) marker() string {
+	yn := func(b bool) string {
+		if b {
+			return "yes"
+		}
+		return "no"
+	}
+	return shell.Script(
+		"app_restart="+m.appRestart,
+		"app_active="+yn(m.appActive),
+		"app_enabled="+yn(m.appEnabled),
+		"tunnel_unit="+yn(m.hasTunnel),
+		"tunnel_enabled="+yn(m.tunnelOn),
+	)
+}
+
 func (e *Engine) planMigration(in *legacyInspection) (*migration, error) {
 	cfg := e.Config
 	if in.OldSymlink {
-		return nil, fmt.Errorf("refusing a symlinked legacy metadata directory (%s/.deployer)", in.Legacy)
+		return nil, fmt.Errorf("refusing a symlinked legacy metadata directory (%s)", in.MetaDir)
 	}
-	if in.New && in.Old {
-		return nil, fmt.Errorf("both a depper deployment (%s/.depper) and a Python deployer deployment (%s/.deployer) exist; refusing to migrate. Remove one of them manually", in.Base, in.Legacy)
+	if (in.Kind == metaLegacy || in.Kind == metaMoved) && in.New {
+		return nil, fmt.Errorf("both a depper deployment (%s/.depper) and a Python deployer deployment (%s) exist; refusing to migrate. Remove one of them manually", in.Base, in.MetaDir)
 	}
-	if !in.Old {
+	if in.Kind == metaNone {
 		if in.AppUnit {
 			return nil, fmt.Errorf("the legacy unit %s exists but there is no legacy deployment directory at %s; remove the unit manually", cfg.LegacyUnitName(), in.Legacy)
 		}
 		return nil, nil
 	}
+	resume := in.resuming()
 	if in.OldLock {
-		return nil, fmt.Errorf("a Python deployer operation is running or left a stale lock (%s/.deployer/lock); wait for it or remove the lock directory", in.Legacy)
+		return nil, fmt.Errorf("a Python deployer or depper operation is running or left a stale lock (%s/lock); wait for it, or remove that lock directory if nothing is running, then run `depper migrate` again", in.MetaDir)
 	}
-	if in.NewAppUnit || in.NewTunnel {
+	if !resume && (in.NewAppUnit || in.NewTunnel) {
 		return nil, fmt.Errorf("depper units for %s already exist in ~/.config/systemd/user; refusing to overwrite them", cfg.Service.Name)
 	}
 	m := &migration{in: in, moveBase: in.Base != in.Legacy}
-	if m.moveBase && in.BaseExists {
+	if m.moveBase && in.Kind == metaLegacy && in.BaseExists {
 		return nil, fmt.Errorf("%s already exists; refusing to move the legacy deployment over it", in.Base)
+	}
+	if resume {
+		f := in.Marker
+		m.appRestart = validRestart(f["app_restart"], cfg.Service.Restart)
+		m.appActive, m.appEnabled = f["app_active"] == "yes", f["app_enabled"] == "yes"
+		m.hasTunnel = in.TunnelUnit || f["tunnel_unit"] == "yes"
+		m.tunnelOn = f["tunnel_enabled"] == "yes"
+	} else {
+		m.appRestart = validRestart(in.AppRestart, cfg.Service.Restart)
+		m.appActive, m.appEnabled = in.AppActive, in.AppEnabled
+		m.hasTunnel, m.tunnelOn = in.TunnelUnit, in.TunnelEnabled
 	}
 	if in.Current != "" {
 		if m.current = releaseFromLink(in.Current); m.current == "" {
 			return nil, fmt.Errorf("the legacy current link (%s) does not point at a release; refusing to migrate", in.Current)
 		}
 	}
-	if in.Previous != "" {
+	switch {
+	case in.Previous != "":
 		m.previous = releaseFromLink(in.Previous)
+	case resume && in.PreviousLink != "":
+		m.previous = releaseFromLink(in.PreviousLink)
 	}
 	if in.PreviousTx != "" {
 		id := path.Base(in.PreviousTx)
@@ -257,7 +346,7 @@ func (e *Engine) planMigration(in *legacyInspection) (*migration, error) {
 			return nil, fmt.Errorf("remote host returned an invalid home directory for cloudflared")
 		}
 		m.tunnelYAML = CloudflaredConfig(t.ID, in.Home, t.Hostname, t.Service)
-		if in.TunnelUnit {
+		if m.hasTunnel {
 			if !shell.IsPlainPath(in.Cloudflared) {
 				return nil, fmt.Errorf("cloudflared is not installed at a safe absolute path on the deploy host; it is required to migrate the tunnel connector")
 			}
@@ -270,14 +359,22 @@ func (e *Engine) planMigration(in *legacyInspection) (*migration, error) {
 		}
 	}
 	units := cfg.LegacyUnitName()
-	if in.TunnelUnit {
+	if m.hasTunnel {
 		units += " and " + cfg.LegacyTunnelUnitName()
+	}
+	if resume {
+		m.plan = append(m.plan, "resume the interrupted migration (marker "+in.MetaDir+"/"+MigrationMarker+"); every step below is skipped when already done")
 	}
 	m.plan = append(m.plan, "stop and disable "+units)
 	if m.moveBase {
-		m.plan = append(m.plan, "move "+in.Legacy+" to "+in.Base)
+		if in.Kind == metaLegacy {
+			m.plan = append(m.plan, "move "+in.Legacy+" to "+in.Base)
+		}
+		m.plan = append(m.plan, "link "+in.Legacy+" -> "+CompatLinkTarget(cfg)+" (relative), so absolute paths recorded inside existing releases keep working (for example the interpreter paths in a Python virtualenv's scripts)")
 	}
-	m.plan = append(m.plan, "rename "+in.Base+"/.deployer to .depper")
+	if in.Kind != metaRenamed {
+		m.plan = append(m.plan, "rename "+in.Base+"/.deployer to .depper")
+	}
 	if m.current != "" {
 		m.plan = append(m.plan, "point current at releases/"+m.current+" (relative)")
 	}
@@ -305,7 +402,7 @@ func (e *Engine) planMigration(in *legacyInspection) (*migration, error) {
 	}
 	m.plan = append(m.plan, "remove "+units+" and reload systemd")
 	start := "start " + cfg.UnitName()
-	if m.tunnelUnit != "" && in.TunnelEnabled {
+	if m.tunnelUnit != "" && m.tunnelOn {
 		start += " and " + cfg.TunnelUnitName()
 	}
 	m.plan = append(m.plan, start)
@@ -317,10 +414,14 @@ func writeLines(dest, content, mode string) []string {
 	return []string{
 		"printf %s " + shell.Quote(base64.StdEncoding.EncodeToString([]byte(content))) + " | base64 -d > " + dest + ".depper-new",
 		"chmod " + mode + " " + dest + ".depper-new",
-		"mv -f " + dest + ".depper-new " + dest,
+		"mv -Tf " + dest + ".depper-new " + dest,
 	}
 }
 
+// migrateScript converts the layout. Every step is idempotent and guarded,
+// so running it again after an interruption resumes and completes the
+// migration. The marker (written into the metadata directory first, and
+// moved with it) is removed only at the very end.
 func (e *Engine) migrateScript(m *migration) string {
 	cfg := e.Config
 	in := m.in
@@ -334,21 +435,45 @@ func (e *Engine) migrateScript(m *migration) string {
 		"legacy="+shell.Quote(in.Legacy),
 		`meta="$base/.depper"`,
 		"unit="+unitPathExpr(cfg.UnitName()),
+	)
+	lines = append(lines, e.compatLinkLines()...)
+	lines = append(lines,
+		`if test "$compat" = no && test -d "$legacy/.deployer"; then md="$legacy/.deployer"`,
+		`elif test -d "$base/.deployer"; then md="$base/.deployer"`,
+		`elif test -d "$meta"; then md="$meta"`,
+		`else echo "The deployment metadata directory is missing" >&2; exit 1; fi`,
+		`if ! test -f "$md/`+MigrationMarker+`"; then`,
+	)
+	for _, line := range writeLines(`"$md/`+MigrationMarker+`"`, m.marker(), "600") {
+		lines = append(lines, "  "+line)
+	}
+	lines = append(lines,
+		`fi`,
 		`mkdir -p "$(dirname "$unit")"`,
 		"systemctl --user disable --now "+shell.Quote(cfg.LegacyUnitName())+" >/dev/null 2>&1 || true",
 	)
-	if in.TunnelUnit {
+	if m.hasTunnel {
 		lines = append(lines, "systemctl --user disable --now "+shell.Quote(cfg.LegacyTunnelUnitName())+" >/dev/null 2>&1 || true")
 	}
 	if m.moveBase {
+		link := shell.Quote(CompatLinkTarget(cfg))
 		lines = append(lines,
-			`test ! -e "$base" || { echo "The depper deployment directory already exists" >&2; exit 1; }`,
-			`mkdir -p "$(dirname "$base")"`,
-			`mv "$legacy" "$base"`,
+			`if test "$compat" = no && test -d "$legacy/.deployer"; then`,
+			`  test ! -e "$base" || { echo "The depper deployment directory already exists" >&2; exit 1; }`,
+			`  mkdir -p "$(dirname "$base")"`,
+			`  mv -T "$legacy" "$base"`,
+			`fi`,
+			// Compatibility link: absolute paths inside existing releases
+			// (virtualenv shebangs, generated configs) keep resolving.
+			`if ! test -e "$legacy" && ! test -L "$legacy"; then ln -s `+link+` "$legacy"`,
+			`elif ! { test -L "$legacy" && test "$(readlink "$legacy")" = `+link+`; }; then echo "Warning: $legacy exists, so the compatibility link to the moved deployment was not created" >&2; fi`,
 		)
 	}
 	lines = append(lines,
-		`mv "$base/.deployer" "$meta"`,
+		`if test -d "$base/.deployer"; then`,
+		`  test ! -e "$meta" || { echo "Both $base/.deployer and $meta exist; refusing to continue" >&2; exit 1; }`,
+		`  mv -T "$base/.deployer" "$meta"`,
+		`fi`,
 		`chmod 700 "$meta"`,
 		`mkdir -p "$meta/transactions" "$base/releases"`,
 		`chmod 700 "$meta/transactions"`,
@@ -384,8 +509,7 @@ func (e *Engine) migrateScript(m *migration) string {
 		rel := `"$base/releases/"` + shell.Quote(id)
 		lines = append(lines, "cp -p "+rel+`"/.deployer-start.sh" `+rel+`"/`+StartScriptName+`"`)
 	}
-	restart := validRestart(in.AppRestart, cfg.Service.Restart)
-	lines = append(lines, writeLines(`"$unit"`, ProcessUnit(cfg.Service.Name, restart, in.Base), "600")...)
+	lines = append(lines, writeLines(`"$unit"`, ProcessUnit(cfg.Service.Name, m.appRestart, in.Base), "600")...)
 	if m.tunnelYAML != "" {
 		lines = append(lines, writeLines(`"$meta/cloudflared.yml"`, m.tunnelYAML, "600")...)
 	}
@@ -401,16 +525,72 @@ func (e *Engine) migrateScript(m *migration) string {
 		lines = append(lines, snapshotLines(m.current)...)
 		lines = append(lines, "systemctl --user restart "+shell.Quote(cfg.UnitName()))
 	}
-	if m.tunnelUnit != "" && in.TunnelEnabled {
+	if m.tunnelUnit != "" && m.tunnelOn {
 		lines = append(lines, "systemctl --user enable --now "+shell.Quote(cfg.TunnelUnitName())+" >/dev/null")
 	}
+	lines = append(lines, `rm -f "$meta/`+MigrationMarker+`"`)
 	return shell.Script(lines...)
+}
+
+// legacyRestartScript restarts the legacy units after a failed migration,
+// as long as the Python deployer's metadata (.deployer) still exists and
+// its unit files are still installed. It prints "restarted" when it did.
+func (e *Engine) legacyRestartScript(m *migration) string {
+	cfg := e.Config
+	appOld := `"$HOME/.config/systemd/user/"` + shell.Quote(cfg.LegacyUnitName())
+	tunnelOld := `"$HOME/.config/systemd/user/"` + shell.Quote(cfg.LegacyTunnelUnitName())
+	lines := append([]string{"set +xv"}, shell.Prelude()...)
+	lines = append(lines,
+		"base="+shell.Quote(m.in.Base),
+		"legacy="+shell.Quote(m.in.Legacy),
+	)
+	lines = append(lines, e.compatLinkLines()...)
+	lines = append(lines,
+		`if ! { test "$compat" = no && test -d "$legacy/.deployer"; } && ! test -d "$base/.deployer"; then exit 0; fi`,
+		`if ! test -f `+appOld+`; then exit 0; fi`,
+		"systemctl --user daemon-reload",
+	)
+	if m.appEnabled {
+		lines = append(lines, "systemctl --user enable "+shell.Quote(cfg.LegacyUnitName())+" >/dev/null")
+	}
+	if m.appActive {
+		lines = append(lines, "systemctl --user start "+shell.Quote(cfg.LegacyUnitName()))
+	}
+	if m.hasTunnel && m.tunnelOn {
+		lines = append(lines, "if test -f "+tunnelOld+"; then systemctl --user enable --now "+shell.Quote(cfg.LegacyTunnelUnitName())+" >/dev/null; fi")
+	}
+	lines = append(lines, "echo restarted")
+	return shell.Script(lines...)
+}
+
+// migrationUnlockScript releases the migration lock wherever the metadata
+// directory (which contains the lock) ended up, only while it still carries
+// token.
+func migrationUnlockScript(in *legacyInspection, token string) string {
+	candidates := []string{in.Legacy + "/.deployer/lock", in.Base + "/.deployer/lock", in.Base + "/.depper/lock"}
+	quoted := make([]string, len(candidates))
+	for i, c := range candidates {
+		quoted[i] = shell.Quote(c)
+	}
+	return shell.Script(
+		"set +xv",
+		"set -eu",
+		`removed=no`,
+		`for lock in `+strings.Join(quoted, " ")+`; do`,
+		`  if test -d "$lock" && ! test -L "$lock" && grep -Fq -e `+shell.Quote(tokenPattern(token))+` "$lock/info" 2>/dev/null; then rm -f "$lock/info"; rmdir "$lock"; removed=yes; break; fi`,
+		`done`,
+		`test "$removed" = yes || { echo "The migration lock is now held by someone else (or was removed); it was not removed" >&2; exit 1; }`,
+	)
 }
 
 // Migrate converts a deployment made by the Python deployer into the depper
 // layout: it stops the legacy units, moves or renames the metadata, rewrites
 // links, transaction backups, and units, and restarts. With dryRun it only
 // inspects the host (read-only) and returns the plan.
+//
+// An interrupted migration is detected (migration marker) and resumed by
+// running Migrate again; if a migration fails while the legacy metadata
+// still exists, the legacy units are restarted.
 func (e *Engine) Migrate(ctx context.Context, dryRun bool) (*MigrateResult, error) {
 	out, err := e.Remote.Capture(ctx, e.inspectScript())
 	if err != nil {
@@ -437,22 +617,38 @@ func (e *Engine) Migrate(ctx context.Context, dryRun bool) (*MigrateResult, erro
 		result.Status = "planned"
 		return result, nil
 	}
-	legacyLock := in.Legacy + "/.deployer/lock"
-	if err := e.lockAt(ctx, legacyLock); err != nil {
+	if err := e.lockAt(ctx, in.MetaDir+"/lock"); err != nil {
 		return nil, err
 	}
+	token := e.held.token
 	l := &Layout{Base: in.Base, Home: in.Home, State: LayoutDepper}
-	e.printf("Migrating %s from %s to %s\n", e.Config.Service.Name, in.Legacy, in.Base)
+	if in.resuming() {
+		e.printf("Resuming the interrupted migration of %s from %s to %s\n", e.Config.Service.Name, in.Legacy, in.Base)
+	} else {
+		e.printf("Migrating %s from %s to %s\n", e.Config.Service.Name, in.Legacy, in.Base)
+	}
 	runErr := e.Remote.Run(ctx, e.migrateScript(m))
-	unlockScript := shell.Script(
-		"set +xv", "set -eu",
-		`for lock in `+shell.Quote(l.Lock())+" "+shell.Quote(legacyLock)+`; do if test -d "$lock"; then rm -f "$lock/info"; rmdir "$lock"; fi; done`,
-	)
-	if uerr := e.Remote.Run(withoutCancel(ctx), unlockScript); uerr != nil {
+	cctx := withoutCancel(ctx)
+	restarted := false
+	if runErr != nil {
+		rout, rerr := e.Remote.Capture(cctx, e.legacyRestartScript(m))
+		switch {
+		case rerr != nil:
+			runErr = joinErrors(runErr, "restarting the legacy units failed", rerr)
+		case strings.Contains(rout, "restarted"):
+			restarted = true
+		}
+	}
+	if _, uerr := e.Remote.Capture(cctx, migrationUnlockScript(in, token)); uerr != nil {
 		runErr = joinErrors(runErr, "releasing the migration lock failed", uerr)
 	}
+	e.held = nil
 	if runErr != nil {
-		return nil, fmt.Errorf("migration failed; inspect %s and %s on the host: %w", in.Legacy, in.Base, runErr)
+		hint := "run `depper migrate` again to finish it (it resumes where it stopped)"
+		if restarted {
+			hint = "the Python deployer's units were restarted; " + hint
+		}
+		return nil, fmt.Errorf("migration failed; %s. Details: %w", hint, runErr)
 	}
 	result.Status = "migrated"
 	if m.current != "" {

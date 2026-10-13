@@ -47,13 +47,24 @@ func runScript(ctx context.Context, e *engine.Engine, script string) error {
 	return err
 }
 
+// listMarker precedes `cloudflared tunnel list` JSON, so output a login
+// shell printed first is not parsed as part of it.
+const listMarker = "@@tunnel-list"
+
 // list returns `cloudflared tunnel list --output json`, parsed locally.
 func (c *cloudflaredCLI) list(ctx context.Context) ([]listedTunnel, error) {
-	out, err := c.e.Remote.Capture(ctx, c.script("tunnel", "list", "--output", "json"))
+	script := shell.Script(
+		"set +xv",
+		"set -eu",
+		"unset TUNNEL_FORCE_PROVISIONING_DNS",
+		"echo "+listMarker,
+		shell.Quote(c.path)+" "+shell.Join("tunnel", "list", "--output", "json"),
+	)
+	out, err := c.e.Remote.Capture(ctx, script)
 	if err != nil {
 		return nil, err
 	}
-	return parseList(out)
+	return parseList(engine.FromMarker(out, listMarker))
 }
 
 // create runs `cloudflared tunnel create NAME`. Its stdout can carry

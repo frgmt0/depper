@@ -5,11 +5,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/frgmt0/depper/internal/config"
+	"github.com/frgmt0/depper/internal/engine"
 	"github.com/frgmt0/depper/internal/transport"
 	"github.com/frgmt0/depper/internal/transport/transporttest"
 )
@@ -32,7 +33,6 @@ func runWith(t *testing.T, cfg *config.Config, out string, runErr error) (*Repor
 	d := &Doctor{
 		Config: cfg,
 		Remote: transport.NewRemote(rec, cfg.SSHTarget()),
-		Now:    func() time.Time { return time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC) },
 	}
 	return d.Run(context.Background()), rec
 }
@@ -113,6 +113,7 @@ func TestIndividualChecks(t *testing.T) {
 		{"bad disk", with(healthyFacts, "disk_kb", ""), "disk", Warn, "could not determine"},
 		{"legacy layout", with(healthyFacts, "layout", "legacy"), "layout", Warn, "depper migrate"},
 		{"both layouts", with(healthyFacts, "layout", "both"), "layout", Warn, "both"},
+		{"interrupted migration", with(healthyFacts, "layout", "migrating"), "layout", Warn, "interrupted"},
 		{"no deployment", with(healthyFacts, "layout", "none"), "layout", Pass, "no deployment yet"},
 	}
 	for _, tt := range tests {
@@ -126,10 +127,14 @@ func TestIndividualChecks(t *testing.T) {
 	}
 }
 
+// Lock staleness uses the deploy host's clock: its `date +%s` against the
+// lock directory's mtime (refreshed by running operations), never the
+// client clock or the info's created_at.
 func TestLockChecks(t *testing.T) {
 	held := with(healthyFacts, "lock", "held")
-	info := func(created string) string {
-		return with(held, "lock_info", `{"created_at":"`+created+`","holder":"me@laptop","pid":42,"command":"deploy"}`)
+	info := with(held, "lock_info", `{"created_at":"2020-01-01T00:00:00Z","holder":"me@laptop","pid":42,"command":"deploy"}`)
+	age := func(facts string, seconds int) string {
+		return with(with(facts, "lock_now", "1800000000"), "lock_mtime", strconv.Itoa(1800000000-seconds))
 	}
 	tests := []struct {
 		name   string
@@ -137,11 +142,12 @@ func TestLockChecks(t *testing.T) {
 		status Status
 		detail string
 	}{
-		{"fresh lock from info", info("2026-01-01T11:55:00Z"), Pass, "in progress by `depper deploy` (me@laptop, pid 42)"},
-		{"stale lock from info", info("2026-01-01T11:30:00Z"), Warn, "depper unlock"},
-		{"stale lock without info", with(held, "lock_old", "yes"), Warn, "stale"},
-		{"fresh lock without info", with(held, "lock_old", "no"), Pass, "in progress"},
-		{"stale dir but fresh info wins", with(with(info("2026-01-01T11:59:00Z"), "lock_old", "yes"), "lock", "held"), Pass, "in progress"},
+		{"fresh lock (old created_at, recently refreshed)", age(info, 60), Pass, "in progress by `depper deploy` (me@laptop, pid 42) since 2020-01-01T00:00:00Z, last refreshed 1m0s ago"},
+		{"stale lock", age(info, 16*60), Warn, "depper unlock"},
+		{"exactly 15 minutes is stale", age(held, 15*60), Warn, "stale"},
+		{"stale without info", with(held, "lock_old", "yes"), Warn, "stale"},
+		{"fresh without clock facts", with(held, "lock_old", "no"), Pass, "in progress"},
+		{"clock facts win over find", with(age(held, 30), "lock_old", "yes"), Pass, "in progress"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -253,10 +259,14 @@ func TestScriptRunsUnderPOSIXShell(t *testing.T) {
 	if facts["lock_old"] != "no" {
 		t.Errorf("lock_old = %q (directory was just created)", facts["lock_old"])
 	}
-	report := (&Doctor{Config: baseConfig(), Now: func() time.Time { return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC) }}).evaluate(facts)
+	if age, stale := engine.LockAge(facts["lock_now"], facts["lock_mtime"], facts["lock_old"]); age < 0 || age > 60 || stale {
+		t.Errorf("lock age = %d stale=%v from %v", age, stale, facts)
+	}
+	// The info says 2020, but the directory was just created: not stale.
+	report := (&Doctor{Config: baseConfig()}).evaluate(facts)
 	for _, c := range report {
-		if c.Name == "lock" && c.Status != Warn {
-			t.Errorf("lock = %+v, want stale warning from info created_at", c)
+		if c.Name == "lock" && c.Status != Pass {
+			t.Errorf("lock = %+v, want an in-progress lock (host clock and directory mtime)", c)
 		}
 	}
 }
@@ -265,5 +275,70 @@ func TestParseFacts(t *testing.T) {
 	facts := ParseFacts("a=1\nnoise\nb=x=y\r\na=2\n=bad\n")
 	if facts["a"] != "2" || facts["b"] != "x=y" || len(facts) != 2 {
 		t.Errorf("facts = %v", facts)
+	}
+}
+
+// Doctor classifies layouts exactly like the engine's probe: the
+// compatibility link left by `depper migrate` is not a legacy layout, a
+// moved-but-not-renamed base is legacy, and a migration marker means an
+// interrupted migration.
+func TestScriptLayoutDetection(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh")
+	}
+	run := func(t *testing.T, home string) map[string]string {
+		t.Helper()
+		cmd := exec.Command(sh, "-s")
+		cmd.Env = []string{"HOME=" + home, "PATH=" + os.Getenv("PATH")}
+		cmd.Stdin = strings.NewReader("echo 'motd: layout=legacy'\n" + Script(baseConfig()))
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("script failed: %v\n%s", err, out)
+		}
+		return ParseFacts(string(out))
+	}
+	mkdir := func(t *testing.T, p string) {
+		t.Helper()
+		if err := os.MkdirAll(p, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	home := t.TempDir()
+	base := filepath.Join(home, ".local/share/depper/api")
+	mkdir(t, filepath.Join(base, ".depper"))
+	mkdir(t, filepath.Join(home, ".local/share/deployer"))
+	if err := os.Symlink("../depper/api", filepath.Join(home, ".local/share/deployer/api")); err != nil {
+		t.Fatal(err)
+	}
+	if got := run(t, home)["layout"]; got != "depper" {
+		t.Errorf("compatibility link: layout = %q", got)
+	}
+	if err := os.WriteFile(filepath.Join(base, ".depper", "migration-in-progress"), []byte("app_active=yes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := run(t, home)["layout"]; got != "migrating" {
+		t.Errorf("marker: layout = %q", got)
+	}
+	if err := os.RemoveAll(filepath.Join(base, ".depper")); err != nil {
+		t.Fatal(err)
+	}
+	mkdir(t, filepath.Join(base, ".deployer"))
+	if got := run(t, home)["layout"]; got != "legacy" {
+		t.Errorf("moved base: layout = %q", got)
+	}
+}
+
+// Text a login shell prints before the facts marker is ignored.
+func TestFactsAfterMarkerOnly(t *testing.T) {
+	report, _ := runWith(t, baseConfig(), "doctor=1\nlayout=legacy\nrsync=\n@@doctor\n"+healthyFacts, nil)
+	if c := byName(report, "layout"); c.Status != Pass {
+		t.Errorf("layout = %+v", c)
+	}
+	if c := byName(report, "rsync"); c.Status != Pass {
+		t.Errorf("rsync = %+v", c)
+	}
+	if !strings.Contains(Script(baseConfig()), "echo @@doctor\n") {
+		t.Error("script prints no facts marker")
 	}
 }

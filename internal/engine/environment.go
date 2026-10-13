@@ -20,7 +20,7 @@ type EnvSource struct {
 
 // LoadEnvironment reads the merged environment ([env] overlaid by the
 // dotenv source) without contacting the host, and validates it for the
-// runtime mode (container env files cannot carry multi-line values).
+// runtime mode (see CheckContainerEnv).
 func LoadEnvironment(cfg *config.Config, src EnvSource) (*dotenv.Environment, error) {
 	configured := ""
 	if cfg.Secrets != nil {
@@ -31,7 +31,7 @@ func LoadEnvironment(cfg *config.Config, src EnvSource) (*dotenv.Environment, er
 		return nil, err
 	}
 	if cfg.Container != nil {
-		if _, err := ContainerEnvFile(env.Values); err != nil {
+		if err := CheckContainerEnv(env.Values); err != nil {
 			return nil, err
 		}
 	}
@@ -39,40 +39,38 @@ func LoadEnvironment(cfg *config.Config, src EnvSource) (*dotenv.Environment, er
 }
 
 // EnvArtifacts are the files written together whenever the environment
-// changes: the systemd EnvironmentFile, its manifest, and (container mode)
-// the --env-file.
+// changes: the systemd EnvironmentFile and its manifest.
 type EnvArtifacts struct {
 	Environment []byte
 	Manifest    *Manifest
-	// Container is nil outside container mode.
-	Container []byte
 }
 
-// BuildEnvArtifacts renders the environment files for values.
+// BuildEnvArtifacts renders the environment files for values. In build and
+// image mode the environment file also carries ContainerEnvArgsVar (not a
+// user variable: it is not fingerprinted or listed).
 func BuildEnvArtifacts(cfg *config.Config, salt []byte, values map[string]string, now time.Time) (*EnvArtifacts, error) {
-	body := []byte(unit.EnvironmentFile(values))
-	a := &EnvArtifacts{Environment: body, Manifest: NewManifest(salt, body, values, now)}
-	if cfg.Container != nil {
-		c, err := ContainerEnvFile(values)
-		if err != nil {
+	fileValues := values
+	if mode := cfg.Mode(); mode == config.ModeBuild || mode == config.ModeImage {
+		if err := CheckContainerEnv(values); err != nil {
 			return nil, err
 		}
-		a.Container = []byte(c)
+		fileValues = make(map[string]string, len(values)+1)
+		for k, v := range values {
+			fileValues[k] = v
+		}
+		fileValues[ContainerEnvArgsVar] = ContainerEnvArgs(values)
 	}
-	return a, nil
+	body := []byte(unit.EnvironmentFile(fileValues))
+	return &EnvArtifacts{Environment: body, Manifest: NewManifest(salt, body, values, now)}, nil
 }
 
 // envCandidates are the artifacts as <file>.next-<id> candidates next to the
 // live files (all mode 600).
 func envCandidates(l *Layout, a *EnvArtifacts, id string) []UploadFile {
-	files := []UploadFile{
+	return []UploadFile{
 		{Contents: a.Environment, Destination: l.Environment() + ".next-" + id, Mode: "600"},
 		{Contents: a.Manifest.Encode(), Destination: l.Manifest() + ".next-" + id, Mode: "600"},
 	}
-	if a.Container != nil {
-		files = append(files, UploadFile{Contents: a.Container, Destination: l.ContainerEnv() + ".next-" + id, Mode: "600"})
-	}
-	return files
 }
 
 // prepareEnvironment reads the secrets state, creates the salt if needed,

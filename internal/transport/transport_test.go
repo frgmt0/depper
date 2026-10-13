@@ -38,7 +38,7 @@ func TestSSHOptions(t *testing.T) {
 
 func TestScriptArgsUsePOSIXShAndEndOptions(t *testing.T) {
 	r := transport.NewRemote(nil, transport.Target{Host: "deploy@host.example", Port: 22})
-	want := []string{"ssh", "-p", "22", "-o", "BatchMode=yes", "--", "deploy@host.example", "sh -s"}
+	want := []string{"ssh", "-p", "22", "-o", "BatchMode=yes", "-T", "--", "deploy@host.example", "sh -s"}
 	if got := r.ScriptArgs(); !reflect.DeepEqual(got, want) {
 		t.Errorf("ScriptArgs = %q", got)
 	}
@@ -50,10 +50,10 @@ func TestRsyncArgs(t *testing.T) {
 		target transport.Target
 		dest   string
 	}{
-		{"alias", transport.Target{Host: "desktop"}, "desktop:'/srv/api/releases/r1'/"},
-		{"ipv4 user", transport.Target{Host: "u@203.0.113.10"}, "u@203.0.113.10:'/srv/api/releases/r1'/"},
-		{"ipv6", transport.Target{Host: "2001:db8::10"}, "[2001:db8::10]:'/srv/api/releases/r1'/"},
-		{"ipv6 user", transport.Target{Host: "deploy@2001:db8::10"}, "deploy@[2001:db8::10]:'/srv/api/releases/r1'/"},
+		{"alias", transport.Target{Host: "desktop"}, "desktop:/srv/api/releases/r1/"},
+		{"ipv4 user", transport.Target{Host: "u@203.0.113.10"}, "u@203.0.113.10:/srv/api/releases/r1/"},
+		{"ipv6", transport.Target{Host: "2001:db8::10"}, "[2001:db8::10]:/srv/api/releases/r1/"},
+		{"ipv6 user", transport.Target{Host: "deploy@2001:db8::10"}, "deploy@[2001:db8::10]:/srv/api/releases/r1/"},
 	}
 	for _, tc := range cases {
 		r := transport.NewRemote(nil, tc.target)
@@ -79,7 +79,7 @@ func TestRsyncShellQuotesForRsyncSplitter(t *testing.T) {
 
 func TestRsyncRefusesNonPlainRemotePath(t *testing.T) {
 	r := transport.NewRemote(nil, transport.Target{Host: "h"})
-	for _, dest := range []string{"relative", "/a b", "/a'b", "~/x", "/a%b"} {
+	for _, dest := range []string{"relative", "/a b", "/a'b", "~/x", "/a%b", "/a\"b", "/a:b", "/a$b", "/", "//"} {
 		if _, err := r.RsyncArgs("/repo", dest, nil); err == nil {
 			t.Errorf("RsyncArgs accepted %q", dest)
 		}
@@ -111,7 +111,7 @@ func TestRemoteSendsScriptsOnStdinOnly(t *testing.T) {
 			t.Error("script leaked into argv")
 		}
 	}
-	if got := rec.Scripts(); len(got) != 2 || got[0] != "set -eu\nprintf secret-not-in-argv\n" {
+	if got := rec.Scripts(); len(got) != 2 || got[0] != "set +xv\n{\nset -eu\nprintf secret-not-in-argv\n}\n" {
 		t.Errorf("Scripts = %q", got)
 	}
 }
@@ -122,7 +122,7 @@ func TestDryRunPrintsQuotedCommandWithoutStdin(t *testing.T) {
 	if err := r.Run(context.Background(), "TOKEN=secret\n"); err != nil {
 		t.Fatal(err)
 	}
-	if got := out.String(); got != "DRY RUN: ssh -o BatchMode=yes -- desktop 'sh -s'\n" {
+	if got := out.String(); got != "DRY RUN: ssh -o BatchMode=yes -T -- desktop 'sh -s'\n" {
 		t.Errorf("dry run output = %q", got)
 	}
 }
@@ -183,7 +183,7 @@ func TestDialArgs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"ssh", "-p", "2222", "-o", "BatchMode=yes", "-W", "[::1]:8080", "--", "desktop"}
+	want := []string{"ssh", "-p", "2222", "-o", "BatchMode=yes", "-o", "ControlPath=none", "-o", "PermitLocalCommand=yes", "-o", "LocalCommand=echo depper-forward-ready 1>&2", "-W", "[::1]:8080", "--", "desktop"}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("DialArgs = %q", args)
 	}
@@ -205,7 +205,8 @@ func fakeSSH(t *testing.T, body string) *transport.Remote {
 }
 
 func TestDialContextCarriesHTTPOverStdio(t *testing.T) {
-	r := fakeSSH(t, `cr=$(printf '\r')
+	r := fakeSSH(t, `echo depper-forward-ready >&2
+cr=$(printf '\r')
 while IFS= read -r line; do
   [ "$line" = "$cr" ] && break
   [ -z "$line" ] && break
@@ -228,7 +229,8 @@ printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\
 }
 
 func TestDialContextReportsProhibitedForwarding(t *testing.T) {
-	r := fakeSSH(t, `echo "channel 0: open failed: administratively prohibited: open failed" >&2
+	r := fakeSSH(t, `echo depper-forward-ready >&2
+echo "channel 0: open failed: administratively prohibited: open failed" >&2
 echo "stdio forwarding failed" >&2
 exit 255
 `)
@@ -248,7 +250,8 @@ exit 255
 }
 
 func TestDialContextConnectionRefusedIsNotProhibited(t *testing.T) {
-	r := fakeSSH(t, `echo "channel 0: open failed: connect failed: Connection refused" >&2
+	r := fakeSSH(t, `echo depper-forward-ready >&2
+echo "channel 0: open failed: connect failed: Connection refused" >&2
 exit 255
 `)
 	conn, err := r.DialContext(context.Background(), "tcp", "127.0.0.1:8080")
@@ -263,7 +266,7 @@ exit 255
 }
 
 func TestDialContextDeadlineAndClose(t *testing.T) {
-	r := fakeSSH(t, "exec sleep 30\n")
+	r := fakeSSH(t, "echo depper-forward-ready >&2\nexec sleep 30\n")
 	conn, err := r.DialContext(context.Background(), "tcp", "127.0.0.1:1")
 	if err != nil {
 		t.Fatal(err)
@@ -284,5 +287,101 @@ func TestDialContextDeadlineAndClose(t *testing.T) {
 	}
 	if _, err := r.DialContext(context.Background(), "udp", "127.0.0.1:1"); err == nil {
 		t.Error("udp accepted")
+	}
+}
+
+func TestDialContextReturnsSSHFailureBeforeReady(t *testing.T) {
+	r := fakeSSH(t, "echo 'deploy@fake-host: Permission denied (publickey).' >&2\nexit 255\n")
+	_, err := r.DialContext(context.Background(), "tcp", "127.0.0.1:8080")
+	var cerr *transport.CommandError
+	if !errors.As(err, &cerr) || cerr.ExitCode != 255 || !strings.Contains(cerr.Stderr, "Permission denied") {
+		t.Fatalf("dial error = %#v", err)
+	}
+}
+
+// The dial context bounds only the SSH handshake: a forward that never
+// becomes ready fails at the dial deadline.
+func TestDialContextBoundsHandshakeOnly(t *testing.T) {
+	r := fakeSSH(t, "exec sleep 30\n")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := r.DialContext(ctx, "tcp", "127.0.0.1:8080")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("dial error = %v", err)
+	}
+	if time.Since(start) > 10*time.Second {
+		t.Error("dial did not stop at the deadline")
+	}
+
+	// A slow handshake that does become ready is not charged to the request.
+	r = fakeSSH(t, "sleep 1\necho depper-forward-ready >&2\nexec cat\n")
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := r.DialContext(ctx, "tcp", "127.0.0.1:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte("ping\n")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "ping\n" {
+		t.Fatalf("echo = %q, %v", buf, err)
+	}
+}
+
+// Close must not hang when a leftover child keeps ssh's stderr open.
+func TestDialCloseWithLeftoverChild(t *testing.T) {
+	r := fakeSSH(t, "echo depper-forward-ready >&2\nsleep 30 &\nexec sleep 30\n")
+	conn, err := r.DialContext(context.Background(), "tcp", "127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_ = conn.Close()
+	if d := time.Since(start); d > 3*transport.WaitDelay+time.Second {
+		t.Errorf("Close took %s", d)
+	}
+}
+
+// A background child that inherits the output pipes must not keep Run
+// waiting after the command itself exited.
+func TestLocalRunWaitDelay(t *testing.T) {
+	start := time.Now()
+	res, err := transport.Local{}.Run(context.Background(), transport.Cmd{Args: []string{"sh", "-c", "sleep 30 & echo started"}, Capture: true})
+	if d := time.Since(start); d > transport.WaitDelay+5*time.Second {
+		t.Fatalf("Run took %s", d)
+	}
+	if !strings.Contains(res.Stdout, "started") {
+		t.Errorf("stdout = %q (%v)", res.Stdout, err)
+	}
+}
+
+// Cancelling gives the command WaitDelay to finish, then kills it, and
+// reports the cancellation (never a plain command failure).
+func TestLocalRunCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	_, err := transport.Local{}.Run(ctx, transport.Cmd{Args: []string{"sh", "-c", "exec sleep 30"}, Capture: true})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v", err)
+	}
+	if d := time.Since(start); d < transport.WaitDelay || d > transport.WaitDelay+5*time.Second {
+		t.Errorf("Run returned after %s, want about %s", d, transport.WaitDelay)
+	}
+	// A command that finishes within the grace period is not killed.
+	ctx, cancel = context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	dir := t.TempDir()
+	_, err = transport.Local{}.Run(ctx, transport.Cmd{Args: []string{"sh", "-c", "sleep 0.5; touch " + dir + "/finished"}, Capture: true})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, serr := os.Stat(dir + "/finished"); serr != nil {
+		t.Error("command was killed before WaitDelay elapsed")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/frgmt0/depper/internal/dotenv"
 	"github.com/frgmt0/depper/internal/shell"
@@ -237,14 +238,17 @@ func (d *deployLayer) parse(t map[string]any, label, repo string) error {
 				return errorf("%s.%s may not contain control characters", label, f.key)
 			}
 			p := localPath(*value, repo)
+			if err := checkSSHFilePath(p, label+"."+f.key); err != nil {
+				return err
+			}
 			*f.dst = &p
 		}
 	}
 	if d.path, err = optString(t, "path", label); err != nil {
 		return err
 	}
-	if d.path != nil && !shell.IsPlainPath(*d.path) {
-		return errorf("%s.path must be an absolute, plain remote path (no spaces, quotes, backslashes, or percent signs)", label)
+	if d.path != nil && !shell.IsSafePath(*d.path) {
+		return errorf("%s.path must be an absolute remote path made only of %s", label, shell.SafePathChars)
 	}
 	if d.setup, d.setupSet, err = optStringList(t, "setup", label); err != nil {
 		return err
@@ -770,6 +774,17 @@ func (t *targetLayer) parse(table map[string]any, label, repo string) error {
 		if err := t.health.parse(sub, label[:len(label)-1]+".health]"); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// checkSSHFilePath rejects whitespace in a local file path that ssh receives
+// as an option value: ssh splits UserKnownHostsFile at whitespace (into
+// several files), and the same paths also travel through rsync's -e
+// splitter. Quoting cannot fix the former, so such paths are refused.
+func checkSSHFilePath(p, label string) error {
+	if strings.ContainsFunc(p, unicode.IsSpace) {
+		return errorf("%s %q contains whitespace, which ssh cannot use in this option; move the file to a path without spaces", label, p)
 	}
 	return nil
 }

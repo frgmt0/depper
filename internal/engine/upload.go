@@ -28,8 +28,8 @@ func uploadLines(f UploadFile) ([]string, error) {
 	if !uploadModes[f.Mode] {
 		return nil, fmt.Errorf("invalid upload mode %q", f.Mode)
 	}
-	if !shell.IsPlainPath(f.Destination) {
-		return nil, fmt.Errorf("refusing to upload to a non-plain remote path")
+	if !shell.IsSafePath(f.Destination) {
+		return nil, fmt.Errorf("refusing to upload to remote path %q (only %s are supported)", f.Destination, shell.SafePathChars)
 	}
 	encoded := base64.StdEncoding.EncodeToString(f.Contents)
 	return []string{
@@ -41,7 +41,7 @@ func uploadLines(f UploadFile) ([]string, error) {
 		`trap 'rm -f "$temporary"' EXIT HUP INT TERM`,
 		"printf %s " + shell.Quote(encoded) + ` | base64 -d > "$temporary"`,
 		"chmod " + f.Mode + ` "$temporary"`,
-		`mv -f "$temporary" "$destination"`,
+		`mv -Tf "$temporary" "$destination"`,
 		"trap - EXIT HUP INT TERM",
 	}, nil
 }

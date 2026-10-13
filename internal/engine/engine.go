@@ -56,6 +56,16 @@ type Engine struct {
 	// PID is recorded in lock info.
 	PID int
 
+	// LockRefresh is how often a held lock is refreshed (touched) while an
+	// operation runs; 0 disables refreshing.
+	LockRefresh time.Duration
+
+	// lastStamp is the last id timestamp issued (see newStamp).
+	lastStamp time.Time
+
+	// held is the deployment lock this engine holds.
+	held *heldLock
+
 	// forwardingProhibited caches that the host refused `ssh -W`, so later
 	// url checks go straight to remote curl.
 	forwardingProhibited bool
@@ -67,16 +77,17 @@ func New(cfg *config.Config, remote *transport.Remote, local transport.Executor,
 		out = io.Discard
 	}
 	return &Engine{
-		Config: cfg,
-		Remote: remote,
-		Local:  local,
-		Out:    out,
-		Now:    time.Now,
-		Sleep:  sleepContext,
-		Rand:   rand.Reader,
-		Settle: DefaultSettle,
-		Holder: localHolder(),
-		PID:    os.Getpid(),
+		Config:      cfg,
+		Remote:      remote,
+		Local:       local,
+		Out:         out,
+		Now:         time.Now,
+		Sleep:       sleepContext,
+		Rand:        rand.Reader,
+		Settle:      DefaultSettle,
+		LockRefresh: DefaultLockRefresh,
+		Holder:      localHolder(),
+		PID:         os.Getpid(),
 	}
 }
 
@@ -136,30 +147,72 @@ func (e *Engine) randomHex(n int) (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// releaseIDRe matches release identifiers (also those of the Python
-// deployer, which used the same format).
-var releaseIDRe = regexp.MustCompile(`^release-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$`)
+// releaseIDRe matches release identifiers: release-YYYYMMDDTHHMMSS.mmmZ-<hex>
+// (depper), and the second-resolution form without .mmm (older depper
+// versions and the Python deployer).
+var releaseIDRe = regexp.MustCompile(`^release-[0-9]{8}T[0-9]{6}(\.[0-9]{3})?Z-[0-9a-f]{8}$`)
 
 // ValidReleaseID reports whether id is a well-formed release identifier.
 func ValidReleaseID(id string) bool { return releaseIDRe.MatchString(id) }
 
-// newReleaseID returns release-YYYYMMDDTHHMMSSZ-<8 hex>.
+// idStampLayouts parse the timestamp part of release and transaction ids.
+var idStampLayouts = []string{"20060102T150405.000Z", "20060102T150405Z"}
+
+// idTime returns the time encoded in a <kind>-<stamp>-<hex> id (zero when
+// it has none).
+func idTime(id string) time.Time {
+	_, rest, ok := strings.Cut(id, "-")
+	if !ok {
+		return time.Time{}
+	}
+	stamp, _, _ := strings.Cut(rest, "-")
+	for _, layout := range idStampLayouts {
+		if t, err := time.Parse(layout, stamp); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+// idNewer orders ids newest first: by their encoded time (millisecond
+// resolution; second resolution for older ids), then by the id.
+func idNewer(a, b string) bool {
+	ta, tb := idTime(a), idTime(b)
+	if !ta.Equal(tb) {
+		return ta.After(tb)
+	}
+	return a > b
+}
+
+// newStamp returns the id timestamp (millisecond resolution), strictly after
+// any stamp this engine issued before, so ids made in quick succession
+// still sort in creation order.
+func (e *Engine) newStamp() string {
+	t := e.now().Truncate(time.Millisecond)
+	if !t.After(e.lastStamp) {
+		t = e.lastStamp.Add(time.Millisecond)
+	}
+	e.lastStamp = t
+	return t.Format("20060102T150405.000Z")
+}
+
+// newReleaseID returns release-YYYYMMDDTHHMMSS.mmmZ-<8 hex>.
 func (e *Engine) newReleaseID() (string, error) {
 	suffix, err := e.randomHex(4)
 	if err != nil {
 		return "", err
 	}
-	return "release-" + e.now().Format("20060102T150405Z") + "-" + suffix, nil
+	return "release-" + e.newStamp() + "-" + suffix, nil
 }
 
-// newTransactionID returns <kind>-YYYYMMDDTHHMMSSZ-<8 hex> for transactions
-// that are not tied to a release (secrets push, rollback).
+// newTransactionID returns <kind>-YYYYMMDDTHHMMSS.mmmZ-<8 hex> for
+// transactions that are not tied to a release (secrets push, rollback).
 func (e *Engine) newTransactionID(kind string) (string, error) {
 	suffix, err := e.randomHex(4)
 	if err != nil {
 		return "", err
 	}
-	return kind + "-" + e.now().Format("20060102T150405Z") + "-" + suffix, nil
+	return kind + "-" + e.newStamp() + "-" + suffix, nil
 }
 
 // unitPathExpr is the shell expression for the app unit file path.

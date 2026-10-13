@@ -213,7 +213,9 @@ func (c *Config) LegacyTunnelUnitName() string {
 func (c *Config) ContainerName() string { return "depper-" + c.Service.Name }
 
 // ImageRef is the local image tag for a release: depper/<name>:<release>
-// (name lowercased; validated as an image component when Build is used).
+// (name lowercased; validated as an image component when Build or Image is
+// used). Image mode tags the pulled image with it so every release keeps
+// running the exact image it was deployed with.
 func (c *Config) ImageRef(releaseID string) string {
 	return "depper/" + strings.ToLower(c.Service.Name) + ":" + releaseID
 }
@@ -473,6 +475,9 @@ func (p *Project) ResolveWithEnv(target string, lookup func(string) (string, boo
 		if err != nil {
 			return nil, errorf("%s is not a valid path: %v", override.name, err)
 		}
+		if err := checkSSHFilePath(abs, override.name); err != nil {
+			return nil, err
+		}
 		*override.dest = abs
 	}
 
@@ -483,8 +488,8 @@ func (p *Project) ResolveWithEnv(target string, lookup func(string) (string, boo
 		}
 		cfg.Health = h
 	}
-	if cfg.Container != nil && cfg.Container.Build != "" && !imageNameR.MatchString(strings.ToLower(cfg.Service.Name)) {
-		return nil, errorf("[service].name %q cannot be used as an image name for [container].build (use lowercase letters, digits, and single separators)", cfg.Service.Name)
+	if cfg.Container != nil && (cfg.Container.Build != "" || cfg.Container.Image != "") && !imageNameR.MatchString(strings.ToLower(cfg.Service.Name)) {
+		return nil, errorf("[service].name %q cannot be used as an image name for [container].build or .image (use lowercase letters, digits, and single separators)", cfg.Service.Name)
 	}
 	return cfg, nil
 }

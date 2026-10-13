@@ -72,10 +72,11 @@ func (t Target) RsyncHost() string {
 }
 
 // SSHArgs returns argv for running remoteCommand on the host:
-// ssh <options> -- <host> <remoteCommand>.
+// ssh <options> -T -- <host> <remoteCommand>. -T: scripts never get a
+// pseudo-terminal (no tty echo, no CR/LF translation, no prompts).
 func (t Target) SSHArgs(program, remoteCommand string) []string {
 	args := append([]string{program}, t.SSHOptions()...)
-	args = append(args, "--", t.Host)
+	args = append(args, "-T", "--", t.Host)
 	if remoteCommand != "" {
 		args = append(args, remoteCommand)
 	}
@@ -101,11 +102,14 @@ func rsyncWord(w string) string {
 }
 
 // RsyncArgs returns argv that copies the contents of the local directory src
-// into remoteDir on the host. remoteDir must be a plain absolute path; it is
-// single-quoted because rsync hands it to the remote shell.
+// into remoteDir on the host. remoteDir must pass shell.IsSafePath and is
+// passed unquoted: rsync >= 3.2.4 protects its arguments from the remote
+// shell (and would turn quotes into literal path characters), while older
+// versions hand the path to the remote shell, where the safe alphabet needs
+// no quoting either.
 func (t Target) RsyncArgs(program, sshProgram, src, remoteDir string, excludes []string) ([]string, error) {
-	if !shell.IsPlainPath(remoteDir) {
-		return nil, fmt.Errorf("refusing rsync to a non-plain remote path %q", remoteDir)
+	if !shell.IsSafePath(remoteDir) {
+		return nil, fmt.Errorf("refusing rsync to remote path %q: only absolute paths made of %s are supported", remoteDir, shell.SafePathChars)
 	}
 	if src == "" {
 		return nil, fmt.Errorf("rsync source directory is empty")
@@ -119,8 +123,5 @@ func (t Target) RsyncArgs(program, sshProgram, src, remoteDir string, excludes [
 		}
 	}
 	dir := strings.TrimRight(remoteDir, "/")
-	if dir == "" {
-		dir = "/"
-	}
-	return append(args, strings.TrimRight(src, "/")+"/", t.RsyncHost()+":'"+dir+"'/"), nil
+	return append(args, strings.TrimRight(src, "/")+"/", t.RsyncHost()+":"+dir+"/"), nil
 }

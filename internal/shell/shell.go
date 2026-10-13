@@ -4,6 +4,7 @@
 package shell
 
 import (
+	"regexp"
 	"sort"
 	"strings"
 	"unicode"
@@ -99,4 +100,30 @@ func HasControl(s string) bool {
 		}
 	}
 	return false
+}
+
+// safePathRe is the alphabet of remote deployment paths: rsync (>= 3.2.4
+// protects its arguments and would escape any quoting), systemd path
+// directives, and probe output all take these paths unquoted.
+var safePathRe = regexp.MustCompile(`^/[A-Za-z0-9._@+/-]+$`)
+
+// IsSafePath reports whether s is an absolute remote path made only of
+// letters, digits, and . _ @ + / - characters. Deployment base, release, and
+// rsync destination paths must pass it; they are used without quoting.
+func IsSafePath(s string) bool {
+	return safePathRe.MatchString(s) && strings.Trim(s, "/") != ""
+}
+
+// SafePathChars describes IsSafePath's alphabet for error messages.
+const SafePathChars = "letters, digits, and . _ @ + / -"
+
+// Wrap makes script safe to stream to `sh -s`: tracing is switched off
+// first, then the whole body is one { ... } group, which the shell parses
+// completely before running any of it. A connection that drops while the
+// script is being sent therefore runs nothing instead of a truncated prefix.
+func Wrap(script string) string {
+	if !strings.HasSuffix(script, "\n") {
+		script += "\n"
+	}
+	return "set +xv\n{\n" + script + "}\n"
 }

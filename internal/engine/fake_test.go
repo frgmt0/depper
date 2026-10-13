@@ -74,6 +74,11 @@ host:
 	if p, err := exec.LookPath("dash"); err == nil {
 		shellProgram = p
 	}
+	// FAKE_ROOT/login-noise emulates a login shell that prints text (motd,
+	// rc files) before the script runs.
+	if noise, err := os.ReadFile(filepath.Join(root, "login-noise")); err == nil {
+		_, _ = os.Stdout.Write(noise)
+	}
 	cmd := exec.Command(shellProgram, "-s")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	cmd.Dir = filepath.Join(root, "home")
@@ -99,6 +104,13 @@ host:
 // forwarding; FAKE_ROOT/http-status (+ http-body) answers one HTTP request;
 // otherwise the connection is refused.
 func fakeForward(root, addr string) int {
+	// Real ssh prints this (LocalCommand) once connected and authenticated;
+	// FAKE_ROOT/forward-delay (milliseconds) emulates a slow handshake.
+	if raw, err := os.ReadFile(filepath.Join(root, "forward-delay")); err == nil {
+		ms, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+	fmt.Fprintln(os.Stderr, transport.ForwardReadyMarker)
 	if _, err := os.Stat(filepath.Join(root, "forward-prohibited")); err == nil {
 		fmt.Fprintln(os.Stderr, "channel 0: open failed: administratively prohibited: open failed")
 		fmt.Fprintln(os.Stderr, "stdio forwarding failed")
@@ -115,6 +127,11 @@ func fakeForward(root, addr string) int {
 		return 255
 	}
 	_ = os.WriteFile(filepath.Join(root, "http-last-request"), []byte(addr+" "+req.Method+" "+req.URL.Path), 0o644)
+	// FAKE_ROOT/response-delay (milliseconds) emulates a slow application.
+	if raw, err := os.ReadFile(filepath.Join(root, "response-delay")); err == nil {
+		ms, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
 	body, _ := os.ReadFile(filepath.Join(root, "http-body"))
 	status, _ := strconv.Atoi(strings.TrimSpace(string(statusRaw)))
 	fmt.Fprintf(os.Stdout, "HTTP/1.1 %d %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", status, http.StatusText(status), len(body), body)
@@ -141,13 +158,15 @@ func fakeRsyncMain(args []string) int {
 		fmt.Fprintf(os.Stderr, "fake rsync: unexpected arguments %q\n", args)
 		return 2
 	}
+	// The destination must be host:/abs/path/ with nothing quoted: rsync
+	// >= 3.2.4 would keep quotes as literal path characters.
 	dest := positional[1]
-	colon := strings.Index(dest, ":'")
-	if colon < 0 || !strings.HasSuffix(dest, "'/") {
+	colon := strings.Index(dest, ":/")
+	if colon < 0 || !strings.HasSuffix(dest, "/") || strings.ContainsAny(dest, "'\"\\ ") {
 		fmt.Fprintf(os.Stderr, "fake rsync: unexpected destination %q\n", dest)
 		return 2
 	}
-	local := dest[colon+2:len(dest)-2] + "/"
+	local := dest[colon+1:]
 	_ = os.WriteFile(filepath.Join(os.Getenv("FAKE_ROOT"), "rsync-args"), []byte(strings.Join(args, "\n")), 0o644)
 	cmd := exec.Command("rsync", append(out, positional[0], local)...)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
@@ -159,6 +178,7 @@ func fakeRsyncMain(args []string) int {
 }
 
 const fakeSystemctl = `#!/bin/sh
+if test -f "$FAKE_ROOT/fail-systemctl"; then pat=$(cat "$FAKE_ROOT/fail-systemctl"); case "$*" in $pat) echo "injected systemctl failure" >&2; exit 1 ;; esac; fi
 state="$FAKE_ROOT/systemd"
 mkdir -p "$state"
 printf '%s\n' "systemctl $*" >> "$FAKE_ROOT/systemctl.log"
@@ -224,16 +244,31 @@ printf '%s\n' "journalctl $*" >> "$FAKE_ROOT/journalctl.log"
 echo "journal line for $*"
 `
 
+// fakeDocker records its arguments and keeps an image list: docker-images
+// holds one "ref label" line per image (label "-" when unlabelled).
 const fakeDocker = `#!/bin/sh
 printf '%s\n' "$*" >> "$FAKE_ROOT/docker.log"
+images="$FAKE_ROOT/docker-images"
+touch "$images"
 case "$1" in
-  images) if test -f "$FAKE_ROOT/docker-images"; then cat "$FAKE_ROOT/docker-images"; fi ;;
+  images)
+    shift; label=""
+    while test $# -gt 0; do case "$1" in --filter) case "$2" in label=*) label=${2#label=} ;; esac; shift ;; --format) shift ;; esac; shift; done
+    while read -r ref lab; do
+      if test -z "$label" || test "$lab" = "$label"; then printf '%s\n' "$ref"; fi
+    done < "$images" ;;
   build)
-    shift
-    while test $# -gt 0; do case "$1" in -t) printf '%s\n' "$2" >> "$FAKE_ROOT/docker-images"; shift ;; esac; shift; done ;;
+    shift; tag=""; lab="-"
+    while test $# -gt 0; do case "$1" in -t) tag=$2; shift ;; --label) lab=$2; shift ;; esac; shift; done
+    printf '%s %s\n' "$tag" "$lab" >> "$images" ;;
+  pull) ;;
+  tag) printf '%s -\n' "$3" >> "$images" ;;
+  image)
+    if test "$2" = inspect && test -f "$FAKE_ROOT/image-digests"; then cat "$FAKE_ROOT/image-digests"; fi ;;
   rmi)
-    grep -vxF "$2" "$FAKE_ROOT/docker-images" > "$FAKE_ROOT/docker-images.next" || true
-    mv "$FAKE_ROOT/docker-images.next" "$FAKE_ROOT/docker-images" ;;
+    if ! grep -q "^$2 " "$images"; then echo "No such image: $2" >&2; exit 1; fi
+    grep -v "^$2 " "$images" > "$images.next" || true
+    mv "$images.next" "$images" ;;
 esac
 exit 0
 `
@@ -242,7 +277,7 @@ exit 0
 // replaces a symlink atomically without following it.
 const mvShim = `#!/bin/sh
 case "$1" in
-  -Tf|-fT) shift; exec perl -e 'rename($ARGV[0], $ARGV[1]) or die "mv: $!\n"' "$1" "$2" ;;
+  -T|-Tf|-fT) shift; exec perl -e 'rename($ARGV[0], $ARGV[1]) or die "mv: $!\n"' "$1" "$2" ;;
 esac
 exec /bin/mv "$@"
 `
@@ -258,7 +293,7 @@ type fakeHost struct {
 	Root  string
 	Home  string
 	Exec  *spyExec
-	Out   *bytes.Buffer
+	Out   *syncBuffer
 	ssh   string
 	rsync string
 }
@@ -272,7 +307,7 @@ func newFakeHost(t *testing.T) *fakeHost {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &fakeHost{t: t, Root: root, Home: filepath.Join(root, "home"), Out: &bytes.Buffer{}}
+	h := &fakeHost{t: t, Root: root, Home: filepath.Join(root, "home"), Out: &syncBuffer{}}
 	for _, dir := range []string{"home", "remote-bin", "run", "tmp", "bin"} {
 		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
 			t.Fatal(err)
@@ -480,4 +515,29 @@ func loadConfig(t *testing.T, repo string) *config.Config {
 		t.Fatal(err)
 	}
 	return cfg
+}
+
+// syncBuffer is a bytes.Buffer safe for the concurrent stdout and stderr
+// copies of one command (and the lock refresher).
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
 }
