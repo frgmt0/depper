@@ -1,0 +1,11 @@
+[service]
+name = "sample-http"
+command = "python3 server.py"
+restart = "on-failure"
+
+[deploy]
+host = "desktop"
+exclude = [".git/", "__pycache__/"]
+
+[env]
+PORT = "8080"

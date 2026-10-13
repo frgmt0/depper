@@ -1,0 +1,12 @@
+[service]
+name = "deployer-check"
+command = "python3 server.py"
+restart = "on-failure"
+[deploy]
+host = "desktop"
+healthcheck = "curl --fail --silent http://127.0.0.1:18769 >/dev/null"
+[env]
+DEPLOYER_SMOKE_VALUE = "deployer-cloudflare-ok"
+[tunnel]
+hostname = "deployer-check.frgmt.xyz"
+service = "http://127.0.0.1:18769"
