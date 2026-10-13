@@ -156,9 +156,16 @@ jobs:
           done
           sudo sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication|allowtcpforwarding|port) '
           ls -l /etc/ssh/sshd_config.d/ || true
-          # The runner image exports its own user's XDG directories to every login
-          # through /etc/environment (pam_env); depper must cope (names only).
+          # The runner image puts its own user's XDG_RUNTIME_DIR and XDG_CONFIG_HOME
+          # (/run/user/1001, /home/runner/.config) into /etc/environment, which pam_env
+          # applies to every login and environment.d to every systemd user manager.
+          # Any other user's manager then breaks (its generators cannot open
+          # /home/runner/.config; rootless podman refuses /run/user/1001), so remove
+          # them to make the runner look like a fresh VPS. depper's own scripts
+          # ignore such foreign directories (shell.SessionEnv, unit-tested), but the
+          # units run in the user manager's environment, which depper does not own.
           echo "/etc/environment sets: $(grep -o "^[A-Za-z_][A-Za-z0-9_]*=" /etc/environment | tr -d = | tr "\n" " ")"
+          sudo sed -i -E "/^XDG_[A-Z_]+=/d" /etc/environment
 
       - name: Create the admin and deploy keys
         run: |
@@ -190,6 +197,7 @@ jobs:
           check host-init '[.plan[] | select(.id == "subids" or .id == "docker-group")] | length == 0'
           expect_eq "deploy shell" "$(getent passwd deploy | cut -d: -f7)" /bin/bash
           expect_eq "deploy linger" "$(loginctl show-user deploy -p Linger --value)" yes
+          as_deploy systemctl --user show-environment | grep -qx "XDG_RUNTIME_DIR=/run/user/$(id -u deploy)"
           sudo test -f /etc/depper/host.json
           sudo jq -e '.deploy_user == "deploy" and .container == "none"' /etc/depper/host.json
           if id -nG deploy | grep -Eqw 'sudo|admin|docker'; then echo "::error::deploy is privileged: $(id -nG deploy)"; exit 1; fi
