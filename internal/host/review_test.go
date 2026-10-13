@@ -32,7 +32,9 @@ func (h *fakeHost) addUser(name, password, shell string, akLines ...string) {
 	}
 }
 
-func (h *fakeHost) clientKey() string { return "ssh-ed25519 " + strings.TrimSpace(h.read("client-key-blob")) }
+func (h *fakeHost) clientKey() string {
+	return "ssh-ed25519 " + strings.TrimSpace(h.read("client-key-blob"))
+}
 
 func shadowField(h *fakeHost, user string) string {
 	for _, line := range strings.Split(h.read("fs/etc/shadow"), "\n") {
@@ -278,7 +280,7 @@ func TestPlanConfigWritesAFullyResolvedConnection(t *testing.T) {
 	})
 }
 
-// Item 5: the reviewer's repro. ''' inside basic strings is not a
+// Item 5: the reviewer's repro. ”' inside basic strings is not a
 // multi-line delimiter, so the target table is found and nothing else
 // changes.
 func TestEditConfigIgnoresDelimitersInsideStrings(t *testing.T) {
