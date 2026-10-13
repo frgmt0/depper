@@ -319,7 +319,9 @@ func (e *Engine) runSetup(ctx context.Context, l *Layout, release, rid string, v
 		lines = append(lines, shell.Exports(values)...)
 		lines = append(lines, "cd "+shell.Quote(release))
 		compose := engine + " compose -p " + shell.Quote(ComposeProject(cfg)) + " -f " + shell.Quote(c.Compose) + " --env-file /dev/null"
-		lines = append(lines, compose+" config --quiet", compose+" build")
+		// config >/dev/null rather than config --quiet: podman-compose (the
+		// provider of `podman compose` on Ubuntu 24.04) has no --quiet.
+		lines = append(lines, compose+" config >/dev/null", compose+" build")
 	}
 	if err := e.Remote.Run(ctx, shell.Script(lines...)); err != nil {
 		return fmt.Errorf("container setup failed: %w", err)

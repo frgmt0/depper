@@ -189,7 +189,9 @@ func TestComposeUnit(t *testing.T) {
 	toml := "[service]\nname = \"Shop.App\"\n[deploy]\nhost = \"fakehost\"\n[container]\nengine = \"podman\"\ncompose = \"compose.yaml\"\n"
 	repo := writeRepo(t, toml, map[string]string{"compose.yaml": "services: {}\n", ".env": "STRAY=from-dotenv-file\n"})
 	cfg := loadConfig(t, repo)
-	h.writeExec("remote-bin/podman", strings.Replace(fakeDocker, "docker.log", "podman.log", 1))
+	// Like podman-compose 1.0.6 (Ubuntu 24.04), reject `config --quiet`.
+	noQuiet := "#!/bin/sh\ncase \" $* \" in *\" config --quiet \"*) echo \"podman-compose: error: unrecognized arguments: --quiet\" >&2; exit 2 ;; esac\n"
+	h.writeExec("remote-bin/podman", noQuiet+strings.TrimPrefix(strings.Replace(fakeDocker, "docker.log", "podman.log", 1), "#!/bin/sh\n"))
 	e := h.Engine(cfg)
 	deploy(t, e, DeployOptions{Env: EnvSource{Stdin: strings.NewReader("TOKEN=" + sentinel + "\n")}})
 	podman := h.Root + "/remote-bin/podman"
@@ -203,7 +205,7 @@ func TestComposeUnit(t *testing.T) {
 			t.Errorf("unit missing %s\n%s", want, unitFile)
 		}
 	}
-	if !strings.Contains(h.log("podman.log"), "compose -p depper-shop_app -f compose.yaml --env-file /dev/null config --quiet") {
+	if !strings.Contains(h.log("podman.log"), "compose -p depper-shop_app -f compose.yaml --env-file /dev/null config\n") {
 		t.Errorf("podman log = %s", h.log("podman.log"))
 	}
 	if h.exists(".local/share/depper/Shop.App/.depper/container.env") || strings.Contains(h.read(".local/share/depper/Shop.App/.depper/environment"), ContainerEnvArgsVar) {
@@ -212,7 +214,7 @@ func TestComposeUnit(t *testing.T) {
 	// The compose setup gets the values as process environment (on stdin).
 	found := false
 	for _, s := range h.Exec.Scripts() {
-		if strings.Contains(s, "config --quiet") {
+		if strings.Contains(s, " config >/dev/null") {
 			found = strings.Contains(s, "export TOKEN="+sentinel)
 		}
 	}
