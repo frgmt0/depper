@@ -334,14 +334,14 @@ jobs:
         run: |
           . "$RUNNER_TEMP/e2e/lib.sh"
           cd "$W/basic"
-          sudo useradd --create-home --shell /bin/bash admin
-          sudo usermod -p '*' admin
-          echo 'admin ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/90-e2e-admin >/dev/null
+          sudo useradd --create-home --shell /bin/bash e2eadmin
+          sudo usermod -p '*' e2eadmin
+          echo 'e2eadmin ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/90-e2e-admin >/dev/null
           sudo chmod 440 /etc/sudoers.d/90-e2e-admin
-          sudo install -d -m 700 -o admin -g admin /home/admin/.ssh
-          sudo install -m 600 -o admin -g admin "$KEYS/admin.pub" /home/admin/.ssh/authorized_keys
-          host_init_as admin host-init-sudo 0
-          check host-init-sudo '.error == null and .admin == "admin" and .facts.privilege == "sudo" and .facts.admin_user == "admin"'
+          sudo install -d -m 700 -o e2eadmin -g e2eadmin /home/e2eadmin/.ssh
+          sudo install -m 600 -o e2eadmin -g e2eadmin "$KEYS/admin.pub" /home/e2eadmin/.ssh/authorized_keys
+          host_init_as e2eadmin host-init-sudo 0
+          check host-init-sudo '.error == null and .admin == "e2eadmin" and .facts.privilege == "sudo" and .facts.admin_user == "e2eadmin"'
           check host-init-sudo '.applied == [] and [.plan[] | select(.change)] == [] and .config_written == false'
           check host-init-sudo '([.doctor.checks[] | select(.status == "fail")] | length) == 0'
           git diff --exit-code depper.toml
