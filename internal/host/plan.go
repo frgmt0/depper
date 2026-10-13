@@ -2,6 +2,7 @@ package host
 
 import (
 	"fmt"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -40,6 +41,10 @@ type Step struct {
 
 	lines    []string
 	packages []string
+	// revert undoes a guarded step (firewall, harden-ssh); it runs from
+	// a transient systemd timer armed before the step and disarmed once new
+	// logins succeed.
+	revert []string
 }
 
 // Plan is what host init will do.
@@ -48,6 +53,11 @@ type Plan struct {
 	Warnings []string `json:"warnings"`
 	// Packages are the packages depper installs (for the record).
 	Packages []string `json:"packages"`
+
+	// rootBefore is the effective PermitRootLogin before hardening and
+	// hardenRoot whether the drop-in sets PermitRootLogin.
+	rootBefore string
+	hardenRoot bool
 }
 
 // Changes reports whether any step changes something.
@@ -89,10 +99,15 @@ var codenameRe = regexp.MustCompile(`^[a-z][a-z0-9]{1,31}$`)
 // group.
 const DockerGroupWarning = "membership in the docker group is equivalent to root on this host: anyone who can log in as the deploy user (or run code through a deployed service) can take over the machine. Prefer rootless podman (engine = \"podman\" in [container]) unless you need docker."
 
-// sshPorts returns the TCP ports to allow in the firewall: the requested
-// ones plus the SSH port in use.
-func firewallPorts(o *Options) []int {
-	return unionInts(o.Firewall, []int{o.Port})
+// firewallPorts returns the TCP ports to allow in the firewall: the
+// requested ones, the port host init connects to, and every port sshd
+// listens on (they differ behind a port forward or NAT).
+func firewallPorts(o *Options, f *Facts) []int {
+	ports := unionInts(o.Firewall, []int{o.Port})
+	if f != nil {
+		ports = unionInts(ports, f.SSHDPorts)
+	}
+	return ports
 }
 
 func (r *Runner) aptLines() []string {
@@ -134,40 +149,53 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 	fedoraProper := f.OSID == "fedora"
 
 	// Packages from the distribution.
-	reqs := []pkgReq{{"rsync", "rsync"}, {"curl", "curl"}, {"ca-certificates", ""}, {"coreutils", "sha256sum"}}
+	reqs := []pkgReq{{Pkg: "rsync", Cmd: "rsync"}, {Pkg: "curl", Cmd: "curl"}, {Pkg: "ca-certificates"}, {Pkg: "coreutils", Cmd: "sha256sum"}}
+	amazon := f.OSID == "amzn"
 	switch o.Container {
 	case ContainerPodman:
-		reqs = append(reqs, pkgReq{"podman", "podman"})
+		if amazon {
+			return nil, &ErrUnsupported{Reason: fmt.Sprintf("Amazon Linux (%s) has no supported rootless podman packages; use docker (--container docker, or engine = \"docker\" in [container])", f.VersionID)}
+		}
+		reqs = append(reqs, pkgReq{Pkg: "podman", Cmd: "podman"})
 		if f.Family == FamilyDebian {
-			reqs = append(reqs, pkgReq{"uidmap", "newuidmap"}, pkgReq{"slirp4netns", ""})
+			reqs = append(reqs, pkgReq{Pkg: "uidmap", Cmd: "newuidmap"}, pkgReq{Pkg: "slirp4netns", Cmd: ""})
 		} else if fedoraProper {
-			reqs = append(reqs, pkgReq{"shadow-utils", "newuidmap"}, pkgReq{"passt", ""})
+			reqs = append(reqs, pkgReq{Pkg: "shadow-utils", Cmd: "newuidmap"}, pkgReq{Pkg: "passt", Cmd: ""})
 		} else {
-			reqs = append(reqs, pkgReq{"shadow-utils", "newuidmap"}, pkgReq{"slirp4netns", ""})
+			reqs = append(reqs, pkgReq{Pkg: "shadow-utils", Cmd: "newuidmap"}, pkgReq{Pkg: "slirp4netns", Cmd: ""})
 		}
 	case ContainerDocker:
 		switch {
 		case f.Family == FamilyDebian:
-			reqs = append(reqs, pkgReq{"docker.io", "docker"})
+			reqs = append(reqs, pkgReq{Pkg: "docker.io", Cmd: "docker"})
 		case fedoraProper:
-			reqs = append(reqs, pkgReq{"moby-engine", "docker"})
+			reqs = append(reqs, pkgReq{Pkg: "moby-engine", Cmd: "docker"})
+		case amazon:
+			reqs = append(reqs, pkgReq{Pkg: "docker", Cmd: "docker"})
 		default:
 			return nil, &ErrUnsupported{Reason: fmt.Sprintf("%s has no distribution docker package; install docker-ce from Docker's official repository (https://docs.docker.com/engine/install/) yourself, or use podman (engine = \"podman\" in [container])", f.OSID)}
 		}
 	}
 	if o.Firewall != nil {
 		if f.Family == FamilyDebian {
-			reqs = append(reqs, pkgReq{"ufw", "ufw"})
+			reqs = append(reqs, pkgReq{Pkg: "ufw", Cmd: "ufw"})
 		} else {
-			reqs = append(reqs, pkgReq{"firewalld", "firewall-cmd"})
+			reqs = append(reqs, pkgReq{Pkg: "firewalld", Cmd: "firewall-cmd"})
 		}
 	}
 	if o.AutoUpdates {
 		if f.Family == FamilyDebian {
-			reqs = append(reqs, pkgReq{"unattended-upgrades", ""})
+			reqs = append(reqs, pkgReq{Pkg: "unattended-upgrades", Cmd: ""})
 		} else {
-			reqs = append(reqs, pkgReq{"dnf-automatic", ""})
+			reqs = append(reqs, pkgReq{Pkg: "dnf-automatic", Cmd: ""})
 		}
+	}
+	if o.Compose && o.Container != ContainerNone {
+		req, err := composeProvider(o.Container, f)
+		if err != nil {
+			return nil, err
+		}
+		reqs = append(reqs, req)
 	}
 	var missing, present []string
 	for _, req := range reqs {
@@ -190,7 +218,7 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 	// cloudflared from Cloudflare's signed package repository.
 	if o.Cloudflared {
 		s := p.add(&Step{ID: StepCloudflared, Title: "Install cloudflared from pkg.cloudflare.com"})
-		if f.has(pkgReq{"cloudflared", "cloudflared"}) {
+		if f.has(pkgReq{Pkg: "cloudflared", Cmd: "cloudflared"}) {
 			s.Detail = "already installed"
 		} else {
 			s.Change, s.packages = true, []string{"cloudflared"}
@@ -222,7 +250,7 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 	// Tailscale from its official package repository.
 	if o.TailscaleKey.Set() {
 		s := p.add(&Step{ID: StepTailscalePkg, Title: "Install Tailscale from pkgs.tailscale.com"})
-		if f.has(pkgReq{"tailscale", "tailscale"}) {
+		if f.has(pkgReq{Pkg: "tailscale", Cmd: "tailscale"}) {
 			s.Detail = "already installed"
 		} else {
 			lines, detail, err := r.tailscaleInstall(f)
@@ -240,6 +268,26 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 			return nil, fmt.Errorf("the account %q exists with uid 0; choose another --user", o.User)
 		}
 		s.Detail = fmt.Sprintf("exists (uid %d, home %s)", f.UserUID, f.UserHome)
+		var repairs []string
+		// A locked password ("!" or "!!", what useradd leaves) makes sshd
+		// refuse even key logins when UsePAM is off; "*" only disables
+		// password login.
+		if f.UserPassword == "locked" && f.SSHD["usepam"] == "no" {
+			repairs = append(repairs, "unlock key login (usermod -p '*': the password field is locked and sshd has UsePAM no)")
+			s.lines = append(s.lines, "usermod -p '*' "+u)
+		}
+		if sh := path.Base(f.UserShell); f.UserShell == "" || sh == "nologin" || sh == "false" {
+			if f.Record != nil && f.Record.DeployUser == o.User && contains(f.Record.Steps, StepUser) {
+				repairs = append(repairs, "set the login shell to /bin/sh (it is "+shellName(f.UserShell)+")")
+				s.lines = append(s.lines, "usermod -s /bin/sh "+u)
+			} else {
+				p.warn("the existing account %s has the login shell %s, so depper cannot run commands as it over SSH; depper did not create it and leaves it alone: give it a shell (for example `sudo usermod -s /bin/sh %s`)", o.User, shellName(f.UserShell), o.User)
+			}
+		}
+		if len(repairs) > 0 {
+			s.Change = true
+			s.Detail = "exists; " + strings.Join(repairs, "; ")
+		}
 		for _, g := range f.UserGroups {
 			switch g {
 			case "sudo", "wheel", "admin", "root":
@@ -267,12 +315,21 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 
 	// Its authorized key, appended and deduplicated, written as the user.
 	s = p.add(&Step{ID: StepAuthorizedKey, Title: "Authorize the public key for " + o.User})
-	if f.UserExists && f.KeyPresent {
+	restricted := f.UserExists && !f.KeyPresent && f.KeyRestricted
+	switch {
+	case f.UserExists && f.KeyPresent:
 		s.Detail = key.Type + " " + key.Fingerprint() + " already authorized"
-	} else {
+	case restricted && !o.KeyExplicit:
+		s.Detail = key.Type + " " + key.Fingerprint() + " is authorized only with options (command=, from=, restrict, ...); left as is"
+		p.warn("~%s/.ssh/authorized_keys has the key %s only on a line with options (command=, from=, restrict, no-pty, ...), which may stop depper from running commands or forwarding the health check port; depper leaves it alone. Pass --key %s explicitly to add an unrestricted line as well", o.User, key.Fingerprint(), displayPath(o.KeyFile, ""))
+	default:
 		s.Change = true
 		s.Detail = "append " + key.Type + " " + key.Fingerprint() + " to ~" + o.User + "/.ssh/authorized_keys (700/600, owned by " + o.User + ")"
-		const install = `set -eu
+		if restricted {
+			s.Detail = "append an unrestricted line for " + key.Type + " " + key.Fingerprint() + " (it is authorized only with options) to ~" + o.User + "/.ssh/authorized_keys"
+			p.warn("~%s/.ssh/authorized_keys has the key %s only on a line with options; --key was given, so depper appends an unrestricted line for it (the restricted line stays)", o.User, key.Fingerprint())
+		}
+		install := `set -eu
 umask 077
 home=$1; line=$2; match=$3
 d="$home/.ssh"; ak="$d/authorized_keys"
@@ -281,7 +338,7 @@ mkdir -p "$d"
 chmod 700 "$d"
 touch "$ak"
 chmod 600 "$ak"
-if ! awk -v k="$match" '{ for (i = 1; i < NF; i++) if ($i " " $(i+1) == k) f = 1 } END { exit !f }' "$ak"; then
+if test "$(awk -v k="$match" '` + authorizedKeyAwk + `' "$ak")" != plain; then
   if test -s "$ak" && test -n "$(tail -c 1 "$ak")"; then echo >> "$ak"; fi
   printf '%s\n' "$line" >> "$ak"
 fi`
@@ -357,10 +414,18 @@ fi`
 		}
 	}
 
-	// Firewall (opt-in).
+	// Firewall (opt-in). It runs in its own guarded phase (see
+	// Runner.guarded): a timed revert is armed first and disarmed only after
+	// new admin and deploy logins succeed.
 	if o.Firewall != nil {
-		want := firewallPorts(o)
+		if f.Commands["systemd-run"] == "" {
+			return nil, fmt.Errorf("--firewall: systemd-run was not found on the host; depper needs it to arm the automatic revert")
+		}
+		want := firewallPorts(o, f)
 		portList := intsString(want)
+		if len(f.SSHDPorts) > 0 && !containsInt(f.SSHDPorts, o.Port) {
+			p.warn("host init connects to port %d, but sshd listens on %s: assuming a port forward or NAT in between, so the firewall allows %s", o.Port, intsString(f.SSHDPorts), portList)
+		}
 		if f.Family == FamilyDebian {
 			s = p.add(&Step{ID: StepFirewall, Title: "Firewall (ufw): allow TCP " + portList})
 			var add []int
@@ -382,12 +447,34 @@ fi`
 				}
 				if !f.UFWActive {
 					s.lines = append(s.lines, "ufw --force enable")
+					s.revert = []string{"ufw --force disable"}
 					parts = append(parts, "enable ufw")
+				} else {
+					for _, port := range add {
+						s.revert = append(s.revert, "ufw delete allow "+strconv.Itoa(port)+"/tcp")
+					}
 				}
-				s.Detail = strings.Join(parts, ", then ")
+				s.Detail = strings.Join(parts, ", then ") + "; reverted automatically unless new admin and " + o.User + " logins succeed"
 			}
 		} else {
-			s = p.add(&Step{ID: StepFirewall, Title: "Firewall (firewalld): allow TCP " + portList})
+			if f.FirewalldPresent && f.FirewalldZone == "" {
+				return nil, fmt.Errorf("--firewall: cannot determine the firewalld zone to open the ports in (firewall-cmd --get-zone-of-interface / --get-default-zone gave no usable zone name)")
+			}
+			zoneDesc := "the zone of " + f.SSHInterface
+			if f.SSHInterface == "" {
+				zoneDesc = "the default zone"
+			}
+			if f.FirewalldZone != "" {
+				zoneDesc += " (" + f.FirewalldZone + ")"
+			}
+			if f.FirewalldPresent && f.FirewalldZoneDefault {
+				iface := f.SSHInterface
+				if iface == "" {
+					iface = "(unknown: SSH_CONNECTION or `ip -o addr` gave no interface)"
+				}
+				p.warn("the interface of the admin connection, %s, has no firewalld zone, so the ports are opened in the default zone %s", iface, f.FirewalldZone)
+			}
+			s = p.add(&Step{ID: StepFirewall, Title: "Firewall (firewalld): allow TCP " + portList + " in " + zoneDesc})
 			var add []int
 			for _, port := range want {
 				if containsInt(f.FirewalldPorts, port) || (port == 22 && f.FirewalldSSHSvc) {
@@ -399,22 +486,40 @@ fi`
 				s.Detail = "firewalld is active and allows " + portList
 			} else {
 				s.Change = true
+				fc := "firewall-offline-cmd"
 				if f.FirewalldActive {
+					fc = "firewall-cmd"
+				}
+				zone := firewalldZoneLines(fc, f.SSHInterface)
+				s.lines = append(s.lines, zone...)
+				if f.FirewalldActive {
+					// Runtime and permanent, so nothing depends on a reload.
 					for _, port := range add {
-						s.lines = append(s.lines, "firewall-cmd --permanent --add-port="+strconv.Itoa(port)+"/tcp")
+						pt := strconv.Itoa(port) + "/tcp"
+						s.lines = append(s.lines,
+							`firewall-cmd --zone="$depper_zone" --add-port=`+pt,
+							`firewall-cmd --permanent --zone="$depper_zone" --add-port=`+pt)
 					}
-					s.lines = append(s.lines, "firewall-cmd --reload")
-					s.Detail = "allow " + intsString(add) + " and reload firewalld"
+					s.revert = append(s.revert, zone...)
+					for _, port := range add {
+						pt := strconv.Itoa(port) + "/tcp"
+						s.revert = append(s.revert,
+							`firewall-cmd --zone="$depper_zone" --remove-port=`+pt+` || true`,
+							`firewall-cmd --permanent --zone="$depper_zone" --remove-port=`+pt+` || true`)
+					}
+					s.Detail = "allow " + intsString(add) + " (runtime and permanent)"
 				} else {
 					for _, port := range add {
-						s.lines = append(s.lines, "firewall-offline-cmd --add-port="+strconv.Itoa(port)+"/tcp")
+						s.lines = append(s.lines, `firewall-offline-cmd --zone="$depper_zone" --add-port=`+strconv.Itoa(port)+"/tcp")
 					}
 					s.lines = append(s.lines, "systemctl enable --now firewalld.service")
+					s.revert = []string{"systemctl disable --now firewalld.service"}
 					s.Detail = "allow " + intsString(add) + ", then enable firewalld"
 					if len(add) == 0 {
 						s.Detail = "enable firewalld"
 					}
 				}
+				s.Detail += "; reverted automatically unless new admin and " + o.User + " logins succeed"
 			}
 		}
 	}
@@ -423,7 +528,7 @@ fi`
 	if o.AutoUpdates {
 		s = p.add(&Step{ID: StepAutoUpdates, Title: "Automatic security updates"})
 		if f.Family == FamilyDebian {
-			if f.has(pkgReq{"unattended-upgrades", ""}) && f.AutoUpdatesConf {
+			if f.has(pkgReq{Pkg: "unattended-upgrades", Cmd: ""}) && f.AutoUpdatesConf {
 				s.Detail = "unattended-upgrades is enabled"
 			} else {
 				conf := r.raw("/etc/apt/apt.conf.d/20auto-upgrades")
@@ -436,7 +541,7 @@ fi`
 				}
 			}
 		} else {
-			ok := f.has(pkgReq{"dnf-automatic", ""}) && f.AutoUpdatesConf &&
+			ok := f.has(pkgReq{Pkg: "dnf-automatic", Cmd: ""}) && f.AutoUpdatesConf &&
 				(f.AutoUpdatesTimer == "dnf-automatic-install.timer" || (f.AutoUpdatesTimer == "dnf5-automatic.timer" && f.AutoUpdatesApply))
 			if ok {
 				s.Detail = "dnf-automatic applies security updates (" + f.AutoUpdatesTimer + ")"
@@ -468,18 +573,20 @@ fi`
 	}
 
 	// Tailscale login (opt-in). The key reaches the host inside the script
-	// on stdin and is handed to tailscale as a 600 file, never in argv.
+	// on stdin and is handed to tailscale as a 600 file, never in argv; a
+	// trap removes the file however the script ends.
 	if o.TailscaleKey.Set() {
 		s = p.add(&Step{ID: StepTailscaleUp, Title: "Join the tailnet"})
 		if f.TailscaleUp {
 			s.Detail = "tailscale is already up"
 		} else {
-			s.Change, s.Detail = true, "tailscale up with the auth key from the environment (never in argv or output)"
+			s.Change, s.Detail = true, "tailscale up with the auth key from the environment (never in argv or output; 120 s timeout)"
 			s.lines = []string{
 				"systemctl enable --now tailscaled.service",
 				"depper_kf=$(umask 077 && mktemp)",
+				`trap 'rm -f "$depper_kf"' EXIT HUP INT TERM`,
 				"printf '%s' " + shell.Quote(o.TailscaleKey.value) + " > \"$depper_kf\"",
-				`if tailscale up --authkey="file:$depper_kf" >/dev/null; then rm -f "$depper_kf"; else rm -f "$depper_kf"; echo "tailscale up failed" >&2; exit 1; fi`,
+				`if timeout 120 tailscale up --authkey="file:$depper_kf" >/dev/null; then rm -f "$depper_kf"; else rm -f "$depper_kf"; echo "tailscale up failed or timed out after 120 s" >&2; exit 1; fi`,
 			}
 		}
 	}
@@ -490,6 +597,8 @@ fi`
 		switch {
 		case f.Commands["sshd"] == "":
 			return nil, fmt.Errorf("--harden-ssh: sshd was not found on the host")
+		case f.Commands["systemd-run"] == "":
+			return nil, fmt.Errorf("--harden-ssh: systemd-run was not found on the host; depper needs it to arm the automatic revert")
 		case !f.SSHDInclude:
 			return nil, fmt.Errorf("--harden-ssh: %s does not Include sshd_config.d/*.conf, so a drop-in would be ignored. depper does not edit the main sshd_config; add `Include /etc/ssh/sshd_config.d/*.conf` at its top yourself, or drop --harden-ssh", sshdMain)
 		case len(f.SSHDConflicts) > 0:
@@ -497,52 +606,96 @@ fi`
 		case !f.SSHDTest:
 			return nil, fmt.Errorf("--harden-ssh: the current sshd configuration does not validate (sshd -T: %s); fix it first", f.SSHDTestOutput)
 		}
-		if f.SSHDDropInSet && f.SSHDDropIn == dropInContent && sshdHardened(f.SSHD, o.Admin) {
+		// PermitRootLogin is only ever tightened: written when it is yes
+		// now, or kept when depper's drop-in already carries it.
+		p.rootBefore = f.SSHD["permitrootlogin"]
+		p.hardenRoot = p.rootBefore == "yes" || (f.SSHDDropInSet && strings.Contains(f.SSHDDropIn, "\n"+rootLoginLine+"\n"))
+		want := dropInContent(p.hardenRoot)
+		if f.SSHDDropInSet && f.SSHDDropIn == want && sshdHardened(f.SSHD) {
 			s.Detail = "drop-in present and in effect"
 		} else {
 			s.Change = true
-			s.Detail = "PasswordAuthentication no, KbdInteractiveAuthentication no, PermitRootLogin prohibit-password; verified with sshd -t and a new " + o.User + " login before and after reload"
+			root := "PermitRootLogin unchanged (" + shellName(p.rootBefore) + ")"
+			if p.hardenRoot {
+				root = "PermitRootLogin prohibit-password"
+			}
+			s.Detail = "PasswordAuthentication no, KbdInteractiveAuthentication no, " + root + "; verified with sshd -t and new " + o.User + " and " + o.Admin + " logins; reverted automatically after " + RevertDelay.String() + " unless they succeed"
+		}
+		if len(f.SSHDMatch) > 0 {
+			p.warn("sshd has Match blocks that set password, keyboard-interactive or root login (%s); --harden-ssh does not cover the connections they match", strings.Join(f.SSHDMatch, ", "))
 		}
 	}
 
-	// The host record.
-	steps := []string{}
 	for _, st := range p.Steps {
-		if st.Change {
-			steps = append(steps, st.ID)
-		}
 		p.Packages = append(p.Packages, st.packages...)
-	}
-	rec := mergeRecord(f.Record, o, steps, p.Packages)
-	s = p.add(&Step{ID: StepRecord, Title: "Record the setup in " + RecordPath})
-	if f.Record != nil && sameContent(f.Record, &rec) {
-		s.Detail = "up to date"
-	} else {
-		s.Change, s.Detail = true, "root-owned, mode 644, no secrets"
 	}
 	sort.Strings(p.Packages)
 	return p, nil
 }
 
-// dropInContent is the sshd drop-in --harden-ssh writes. Root key login
-// stays allowed because the admin may be root.
-const dropInContent = "# Managed by depper (depper host init --harden-ssh).\n# Remove this file and reload sshd to undo.\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin prohibit-password\n"
+// addRecord appends the host record step. extra are steps that change
+// something but are not (or no longer) marked Change in the plan, such as a
+// host key pinned after its own confirmation.
+func (p *Plan) addRecord(f *Facts, o *Options, extra []string) {
+	steps := append([]string{}, extra...)
+	for _, st := range p.Steps {
+		if st.Change {
+			steps = append(steps, st.ID)
+		}
+	}
+	s := &Step{ID: StepRecord, Title: "Record the setup in " + RecordPath}
+	p.add(s)
+	if len(steps) > 0 {
+		steps = append(steps, StepRecord)
+	}
+	rec := mergeRecord(f.Record, o, firewallPorts(o, f), steps, p.Packages)
+	if f.Record != nil && sameContent(f.Record, &rec) {
+		s.Detail = "up to date"
+	} else {
+		s.Change, s.Detail = true, "root-owned, mode 644, no secrets"
+	}
+}
 
-// sshdHardened reports whether `sshd -T` shows the hardened settings.
-func sshdHardened(eff map[string]string, admin string) bool {
+// rootLoginLine is the PermitRootLogin directive --harden-ssh writes when
+// root password login is allowed (PermitRootLogin yes).
+const rootLoginLine = "PermitRootLogin prohibit-password"
+
+// dropInContent is the sshd drop-in --harden-ssh writes. PermitRootLogin is
+// included only to tighten "yes"; a stricter setting is never weakened.
+func dropInContent(rootLogin bool) string {
+	s := "# Managed by depper (depper host init --harden-ssh).\n# Remove this file and reload sshd to undo.\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+	if rootLogin {
+		s += rootLoginLine + "\n"
+	}
+	return s
+}
+
+// rootLoginRank orders PermitRootLogin values from the loosest (yes) to the
+// strictest (no); unknown values rank -1.
+func rootLoginRank(v string) int {
+	switch v {
+	case "yes":
+		return 0
+	case "prohibit-password", "without-password":
+		return 1
+	case "forced-commands-only":
+		return 2
+	case "no":
+		return 3
+	}
+	return -1
+}
+
+// sshdHardened reports whether `sshd -T` shows the hardened settings:
+// no password or keyboard-interactive login, and root password login off.
+func sshdHardened(eff map[string]string) bool {
 	if eff["passwordauthentication"] != "no" {
 		return false
 	}
 	if v, ok := eff["kbdinteractiveauthentication"]; ok && v != "no" {
 		return false
 	}
-	switch eff["permitrootlogin"] {
-	case "prohibit-password", "without-password":
-		return true
-	case "no":
-		return admin != "root"
-	}
-	return false
+	return rootLoginRank(eff["permitrootlogin"]) >= 1
 }
 
 // tailscaleInstall returns the official repository setup for the host
@@ -579,6 +732,8 @@ func (r *Runner) tailscaleInstall(f *Facts) ([]string, string, error) {
 	switch {
 	case f.OSID == "fedora":
 		url = "https://pkgs.tailscale.com/stable/fedora/tailscale.repo"
+	case f.OSID == "amzn" && regexp.MustCompile(`^[0-9]{1,4}$`).MatchString(major):
+		url = "https://pkgs.tailscale.com/stable/amazon-linux/" + major + "/tailscale.repo"
 	case regexp.MustCompile(`^[0-9]{1,3}$`).MatchString(major):
 		dist := "rhel"
 		if f.OSID == "centos" {
@@ -622,4 +777,67 @@ func intsString(ns []int) string {
 		parts[i] = strconv.Itoa(n)
 	}
 	return strings.Join(parts, ",")
+}
+
+// composeProvider picks the package that provides `<engine> compose`:
+// podman-compose for podman; for docker the first of docker-compose-plugin,
+// docker-compose-v2 and docker-compose (version 2 or later: the 1.x Python
+// tool is not a docker CLI plugin) that is installed or available.
+func composeProvider(engine string, f *Facts) (pkgReq, error) {
+	candidates := []string{"podman-compose"}
+	if engine == ContainerDocker {
+		candidates = []string{"docker-compose-plugin", "docker-compose-v2", "docker-compose"}
+	}
+	usable := func(pkg, version string) bool {
+		if version == "" {
+			return false
+		}
+		return pkg != "docker-compose" || versionMajor(version) >= 2
+	}
+	for _, pkg := range candidates {
+		if usable(pkg, f.Compose[pkg].Installed) {
+			return pkgReq{Pkg: pkg, Installed: true}, nil
+		}
+	}
+	for _, pkg := range candidates {
+		if usable(pkg, f.Compose[pkg].Candidate) {
+			return pkgReq{Pkg: pkg}, nil
+		}
+	}
+	reason := fmt.Sprintf("depper.toml uses [container].compose, but no compose provider for %s is available from the package repositories of %s (looked for %s", engine, f.OSID, strings.Join(candidates, ", "))
+	if engine == ContainerDocker {
+		reason += "; docker-compose must be version 2 or later"
+	}
+	reason += ")"
+	switch {
+	case f.AptListsEmpty:
+		reason += ". The apt package lists are empty: run `sudo apt-get update` on the host, then host init again"
+	case engine == ContainerPodman && f.Family == FamilyFedora && f.OSID != "fedora":
+		reason += ". On RHEL-compatible systems podman-compose is in EPEL: enable it (`dnf install epel-release`), then run host init again"
+	case engine == ContainerDocker:
+		reason += ". Install docker-ce and docker-compose-plugin from Docker's repository (https://docs.docker.com/engine/install/), or use podman"
+	}
+	return pkgReq{}, &ErrUnsupported{Reason: reason}
+}
+
+// shellName renders a login shell for messages.
+func shellName(s string) string {
+	if s == "" {
+		return "(empty)"
+	}
+	return s
+}
+
+// firewalldZoneLines set $depper_zone to the zone of iface (the interface
+// the admin connection arrives on), falling back to the default zone with a
+// warning. fc is firewall-cmd or firewall-offline-cmd. iface was validated
+// by the facts script ([A-Za-z0-9_.:-]).
+func firewalldZoneLines(fc, iface string) []string {
+	q := shell.Quote(iface)
+	return []string{
+		`depper_zone=""`,
+		`if test -n ` + q + `; then depper_zone=$(` + fc + ` --get-zone-of-interface=` + q + ` 2>/dev/null || true); fi`,
+		`if test -z "$depper_zone"; then depper_zone=$(` + fc + ` --get-default-zone 2>/dev/null || true); echo "firewalld: the interface of the admin connection (` + iface + `) has no zone; using the default zone $depper_zone" >&2; fi`,
+		`case "$depper_zone" in ""|*[!A-Za-z0-9_-]*) echo "cannot determine the firewalld zone" >&2; exit 1 ;; esac`,
+	}
 }

@@ -44,9 +44,9 @@ func TestContainerBuildDeployAndImagePruning(t *testing.T) {
 	unitFile := h.read(".config/systemd/user/depper-web.service")
 	for _, want := range []string{
 		"EnvironmentFile=" + h.path(".local/share/depper/web") + "/.depper/environment",
-		`ExecStartPre=-"` + docker + `" "rm" "-f" "depper-web"`,
-		`ExecStart="` + docker + `" "run" "--rm" "--name" "depper-web" $DEPPER_CONTAINER_ENV_ARGS "-p" "127.0.0.1:8080:8080" "-v" "/srv/data:/data:ro" "--memory" "256m" "depper/web:` + r1.Release + `" "serve" "--label" "a b"`,
-		`ExecStop="` + docker + `" "stop" "depper-web"`,
+		`ExecStartPre=-` + engineWrap + `"` + docker + `" "rm" "-f" "depper-web"`,
+		`ExecStart=` + engineWrap + `"` + docker + `" "run" "--rm" "--name" "depper-web" $DEPPER_CONTAINER_ENV_ARGS "-p" "127.0.0.1:8080:8080" "-v" "/srv/data:/data:ro" "--memory" "256m" "depper/web:` + r1.Release + `" "serve" "--label" "a b"`,
+		`ExecStop=` + engineWrap + `"` + docker + `" "stop" "depper-web"`,
 	} {
 		if !strings.Contains(unitFile, want) {
 			t.Errorf("unit missing %s\n%s", want, unitFile)
@@ -198,8 +198,8 @@ func TestComposeUnit(t *testing.T) {
 	unitFile := h.read(".config/systemd/user/depper-Shop.App.service")
 	for _, want := range []string{
 		"EnvironmentFile=" + h.path(".local/share/depper/Shop.App") + "/.depper/environment",
-		`ExecStart="` + podman + `" "compose" "-p" "depper-shop_app" "-f" "compose.yaml" "--env-file" "/dev/null" "up" "--build" "--remove-orphans"`,
-		`ExecStop="` + podman + `" "compose" "-p" "depper-shop_app" "-f" "compose.yaml" "--env-file" "/dev/null" "down"`,
+		`ExecStart=` + engineWrap + `"` + podman + `" "compose" "-p" "depper-shop_app" "-f" "compose.yaml" "--env-file" "/dev/null" "up" "--build" "--remove-orphans"`,
+		`ExecStop=` + engineWrap + `"` + podman + `" "compose" "-p" "depper-shop_app" "-f" "compose.yaml" "--env-file" "/dev/null" "down"`,
 	} {
 		if !strings.Contains(unitFile, want) {
 			t.Errorf("unit missing %s\n%s", want, unitFile)

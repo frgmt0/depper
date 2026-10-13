@@ -58,6 +58,8 @@ type hostInitFlags struct {
 	autoUpdates   bool
 	tailscaleEnv  string
 	knownHosts    string
+	fingerprints  []string
+	tofu          bool
 	writeConfig   bool
 	noWriteConfig bool
 	dryRun        bool
@@ -118,11 +120,13 @@ again changes nothing.`,
 	fl.StringVar(&f.key, "key", "", "public key to authorize for the deploy user (default: first of ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub)")
 	fl.StringVar(&f.container, "container", "", "container engine to install: podman, docker, or none (default: the engine depper.toml resolves [container].engine to, docker when unset; none without [container])")
 	fl.BoolVar(&f.cloudflared, "cloudflared", false, "install cloudflared from Cloudflare's package repository")
-	fl.BoolVar(&f.hardenSSH, "harden-ssh", false, "disable password and keyboard-interactive SSH login (root key login stays allowed)")
-	fl.StringVar(&f.firewall, "firewall", "", "enable ufw/firewalld allowing these TCP ports, e.g. 22,80,443 (the SSH port is always included)")
+	fl.BoolVar(&f.hardenSSH, "harden-ssh", false, "disable password and keyboard-interactive SSH login and root password login (a stricter PermitRootLogin is kept); reverted automatically unless new logins succeed")
+	fl.StringVar(&f.firewall, "firewall", "", "enable ufw/firewalld allowing these TCP ports, e.g. 80,443 (the SSH port and every port sshd listens on are always included); reverted automatically unless new logins succeed")
 	fl.BoolVar(&f.autoUpdates, "auto-updates", false, "enable automatic security updates (unattended-upgrades or dnf-automatic)")
 	fl.StringVar(&f.tailscaleEnv, "tailscale-authkey-env", "", "install Tailscale and join the tailnet with the auth key in this environment variable")
 	fl.StringVar(&f.knownHosts, "known-hosts", "", "known_hosts file to pin the host key in (default REPO/.depper/known_hosts)")
+	fl.StringArrayVar(&f.fingerprints, "host-key-fingerprint", nil, "expected host key fingerprint (SHA256:..., as ssh-keygen -lf prints; repeatable): only matching keys are pinned, and none matching is refused")
+	fl.BoolVar(&f.tofu, "trust-on-first-use", false, "with --yes, pin the host keys the host presents without verifying them (otherwise --yes needs --host-key-fingerprint or an already pinned key)")
 	fl.BoolVar(&f.writeConfig, "write-config", true, "write the connection into depper.toml")
 	fl.BoolVar(&f.noWriteConfig, "no-write-config", false, "do not modify depper.toml")
 	fl.BoolVar(&f.dryRun, "dry-run", false, "show the host keys and the plan, change nothing")
@@ -168,7 +172,8 @@ func hostInitOptions(app *App, cmd *cobra.Command, f *hostInitFlags, args []stri
 		return nil, fmt.Errorf("repository directory %s does not exist", repo)
 	}
 	o := &host.Options{Repo: repo, Admin: admin, Host: addr, Port: f.port, User: f.user, Target: app.Target(),
-		Cloudflared: f.cloudflared, HardenSSH: f.hardenSSH, AutoUpdates: f.autoUpdates, DryRun: f.dryRun, Yes: f.yes, WriteConfig: true}
+		Cloudflared: f.cloudflared, HardenSSH: f.hardenSSH, AutoUpdates: f.autoUpdates, DryRun: f.dryRun, Yes: f.yes, WriteConfig: true,
+		HostKeyFingerprints: f.fingerprints, TrustOnFirstUse: f.tofu}
 
 	if cmd.Flags().Changed("no-write-config") && cmd.Flags().Changed("write-config") && f.writeConfig == f.noWriteConfig {
 		return nil, fmt.Errorf("--write-config and --no-write-config contradict each other")

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,16 +44,23 @@ type Facts struct {
 	Systemd        bool   `json:"systemd"`
 	Arch           string `json:"arch"`
 
-	UserExists  bool     `json:"user_exists"`
-	UserUID     int      `json:"user_uid,omitempty"`
-	UserHome    string   `json:"user_home,omitempty"`
-	UserShell   string   `json:"user_shell,omitempty"`
-	UserGroups  []string `json:"user_groups,omitempty"`
-	KeyPresent  bool     `json:"key_authorized"`
-	Linger      bool     `json:"linger"`
-	UserManager bool     `json:"user_manager"`
-	SubUID      bool     `json:"subuid"`
-	SubGID      bool     `json:"subgid"`
+	UserExists bool     `json:"user_exists"`
+	UserUID    int      `json:"user_uid,omitempty"`
+	UserHome   string   `json:"user_home,omitempty"`
+	UserShell  string   `json:"user_shell,omitempty"`
+	UserGroups []string `json:"user_groups,omitempty"`
+	// UserPassword classifies the shadow password field without revealing
+	// it: "locked" (exactly "!" or "!!"), "star" ("*"), "empty", or "set".
+	UserPassword string `json:"user_password,omitempty"`
+	// KeyPresent is true when an uncommented authorized_keys line holds the
+	// key without options; KeyRestricted when the only matches carry
+	// options (command=, from=, restrict, ...).
+	KeyPresent    bool `json:"key_authorized"`
+	KeyRestricted bool `json:"key_restricted"`
+	Linger        bool `json:"linger"`
+	UserManager   bool `json:"user_manager"`
+	SubUID        bool `json:"subuid"`
+	SubGID        bool `json:"subgid"`
 
 	Packages map[string]bool   `json:"packages"`
 	Commands map[string]string `json:"commands"`
@@ -69,17 +77,39 @@ type Facts struct {
 	SSHDDropInSet  bool              `json:"sshd_dropin_present"`
 	SSHDConflicts  []string          `json:"sshd_conflicts,omitempty"`
 	SSHDUnit       string            `json:"sshd_unit,omitempty"`
+	// SSHDMatch lists "file:line keyword" for every password,
+	// keyboard-interactive, challenge-response or root-login setting inside
+	// a Match block; hardening does not cover the connections they match.
+	SSHDMatch []string `json:"sshd_match,omitempty"`
 
-	UFWActive        bool   `json:"ufw_active"`
-	UFWPorts         []int  `json:"ufw_ports,omitempty"`
-	FirewalldPresent bool   `json:"firewalld_present"`
-	FirewalldActive  bool   `json:"firewalld_active"`
-	FirewalldPorts   []int  `json:"firewalld_ports,omitempty"`
-	FirewalldSSHSvc  bool   `json:"firewalld_ssh_service"`
-	AutoUpdatesConf  bool   `json:"auto_updates_configured"`
-	AutoUpdatesApply bool   `json:"-"`
-	AutoUpdatesTimer string `json:"auto_updates_timer,omitempty"`
-	TailscaleUp      bool   `json:"tailscale_up"`
+	// SSHLocalAddr is the server address of the admin connection
+	// (SSH_CONNECTION) and SSHInterface the interface that holds it.
+	SSHLocalAddr string `json:"ssh_local_addr,omitempty"`
+	SSHInterface string `json:"ssh_interface,omitempty"`
+
+	UFWActive        bool  `json:"ufw_active"`
+	UFWPorts         []int `json:"ufw_ports,omitempty"`
+	FirewalldPresent bool  `json:"firewalld_present"`
+	FirewalldActive  bool  `json:"firewalld_active"`
+	// FirewalldZone is the zone of SSHInterface, or the default zone when
+	// FirewalldZoneDefault is set.
+	FirewalldZone        string `json:"firewalld_zone,omitempty"`
+	FirewalldZoneDefault bool   `json:"firewalld_zone_is_default"`
+	// FirewalldPorts are the TCP ports open in both the runtime and the
+	// permanent configuration of FirewalldZone (only the permanent one
+	// while firewalld is stopped).
+	FirewalldPorts  []int `json:"firewalld_ports,omitempty"`
+	FirewalldSSHSvc bool  `json:"firewalld_ssh_service"`
+
+	// Compose maps each compose provider package to its installed and
+	// candidate versions ("" when absent); AptListsEmpty reports that apt
+	// has no package lists to look them up in.
+	Compose          map[string]PkgVersions `json:"compose_packages,omitempty"`
+	AptListsEmpty    bool                   `json:"apt_lists_empty,omitempty"`
+	AutoUpdatesConf  bool                   `json:"auto_updates_configured"`
+	AutoUpdatesApply bool                   `json:"-"`
+	AutoUpdatesTimer string                 `json:"auto_updates_timer,omitempty"`
+	TailscaleUp      bool                   `json:"tailscale_up"`
 
 	Record *Record `json:"record,omitempty"`
 }
@@ -90,26 +120,42 @@ type Facts struct {
 type pkgReq struct {
 	Pkg string
 	Cmd string
+	// Installed marks a requirement already known to be satisfied.
+	Installed bool
 }
 
 func (f *Facts) has(r pkgReq) bool {
+	if r.Installed {
+		return true
+	}
 	if r.Cmd != "" && f.Commands[r.Cmd] != "" {
 		return true
 	}
 	return f.Packages[r.Pkg]
 }
 
+// PkgVersions are the installed and candidate (available) versions of a
+// package; each is "" when there is none.
+type PkgVersions struct {
+	Installed string `json:"installed,omitempty"`
+	Candidate string `json:"candidate,omitempty"`
+}
+
+// composePackages are the compose provider packages host init looks up when
+// the configuration uses [container].compose.
+var composePackages = []string{"podman-compose", "docker-compose-plugin", "docker-compose-v2", "docker-compose"}
+
 // queriedPackages and queriedCommands are probed on every host.
 var queriedPackages = []string{
 	"rsync", "curl", "ca-certificates", "coreutils",
 	"podman", "uidmap", "slirp4netns", "passt", "shadow-utils",
-	"docker.io", "moby-engine", "cloudflared", "tailscale",
+	"docker.io", "moby-engine", "docker", "cloudflared", "tailscale",
 	"ufw", "firewalld", "unattended-upgrades", "dnf-automatic",
 }
 
 var queriedCommands = []string{
 	"rsync", "curl", "sha256sum", "podman", "docker", "cloudflared", "tailscale",
-	"ufw", "firewall-cmd", "firewall-offline-cmd", "sshd", "runuser", "newuidmap",
+	"ufw", "firewall-cmd", "firewall-offline-cmd", "sshd", "runuser", "newuidmap", "systemd-run",
 }
 
 // classify maps os-release ID / ID_LIKE to a supported family.
@@ -148,6 +194,14 @@ const rootHeredoc = "DEPPER_AS_ROOT_EOF"
 // prompt). The body travels inside a quoted here-document, so it is part of
 // the script on stdin and never part of any argv.
 func (r *Runner) asRoot(body []string) ([]string, error) {
+	return r.asRootArgs(body)
+}
+
+// asRootArgs is asRoot with positional parameters for the root script. Each
+// arg is a shell word of the admin script (for example `"$depper_iface"`),
+// so values computed by the unprivileged part reach the root part as $1...
+// even through sudo, which resets the environment.
+func (r *Runner) asRootArgs(body []string, args ...string) ([]string, error) {
 	inner := []string{"cd /"}
 	if sp := r.systemPath(); sp != "" {
 		inner = append(inner, "PATH="+shell.Quote(sp)+`:"$PATH"`, "export PATH")
@@ -159,13 +213,28 @@ func (r *Runner) asRoot(body []string) ([]string, error) {
 			return nil, fmt.Errorf("internal error: root script contains its here-document delimiter")
 		}
 	}
+	call := "depper_asroot"
+	for _, a := range args {
+		call += " " + a
+	}
 	lines := []string{
-		`depper_asroot() { if test "$(id -u)" = 0; then sh -s; else sudo -n sh -s; fi; }`,
-		"depper_asroot <<'" + rootHeredoc + "'",
+		`depper_asroot() { if test "$(id -u)" = 0; then sh -s -- "$@"; else sudo -n sh -s -- "$@"; fi; }`,
+		call + " <<'" + rootHeredoc + "'",
 	}
 	lines = append(lines, strings.Split(strings.TrimSuffix(script, "\n"), "\n")...)
 	return append(lines, rootHeredoc), nil
 }
+
+// authorizedKeyAwk classifies an authorized_keys file for the key "TYPE
+// BLOB" in k: it prints "plain" when an uncommented line holds the key
+// without options, "restricted" when the only matches carry options
+// (command=, from=, restrict, no-pty, ...), and "none" otherwise.
+const authorizedKeyAwk = `/^[[:space:]]*#/ { next } { for (i = 1; i < NF; i++) if ($i " " $(i+1) == k) { if (i == 1) p = 1; else r = 1 } } END { if (p) print "plain"; else if (r) print "restricted"; else print "none" }`
+
+// matchAwk prints "FILE:LINE keyword" for every hardening-relevant setting
+// inside a Match block (a block runs to the next Match or the end of the
+// file).
+const matchAwk = `FNR == 1 { m = 0 } { k = tolower($1) } k == "match" { m = 1; next } m && (k == "passwordauthentication" || k == "kbdinteractiveauthentication" || k == "challengeresponseauthentication" || k == "permitrootlogin") { printf "%s:%d %s;", FILENAME, FNR, $1 }`
 
 // factsScript gathers every fact in one admin round trip. It only reads.
 func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
@@ -185,10 +254,23 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`if test -r "$osr"; then grep -E '^(ID|ID_LIKE|VERSION_ID|VERSION_CODENAME|UBUNTU_CODENAME|PRETTY_NAME)=' "$osr" | sed 's/^/os_/'; fi`,
 		`if test -d ` + r.p("/run/systemd/system") + `; then echo systemd=1; else echo systemd=0; fi`,
 		`printf 'arch=%s\n' "$(uname -m 2>/dev/null || true)"`,
+		// The interface the admin connection arrives on (sudo drops
+		// SSH_CONNECTION, so it is read here and passed to the root part).
+		`depper_iface=""`,
+		`if test -n "${SSH_CONNECTION:-}"; then`,
+		`  set -- $SSH_CONNECTION`,
+		`  depper_laddr=${3:-}`,
+		`  case "$depper_laddr" in *[!0-9A-Fa-f.:]*) depper_laddr="" ;; esac`,
+		`  printf 'ssh_laddr=%s\n' "$depper_laddr"`,
+		`  if test -n "$depper_laddr"; then depper_iface=$(PATH="$PATH:/usr/sbin:/sbin" ip -o addr show 2>/dev/null | awk -v a="$depper_laddr" '{ split($4, x, "/"); if (x[1] == a) { sub(/@.*/, "", $2); print $2; exit } }'); fi`,
+		`  case "$depper_iface" in *[!A-Za-z0-9_.:-]*) depper_iface="" ;; esac`,
+		`  printf 'ssh_iface=%s\n' "$depper_iface"`,
+		`fi`,
 	}
 	akMatch := shell.Quote(key.Type + " " + key.Blob)
 	root := []string{
 		"set -u",
+		`depper_iface=${1:-}`,
 		"u=" + u,
 		`pw=$(getent passwd "$u" 2>/dev/null || true)`,
 		`if test -n "$pw"; then`,
@@ -199,8 +281,10 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`  printf 'user_home=%s\n' "$home"`,
 		`  printf 'user_shell=%s\n' "$(printf '%s\n' "$pw" | cut -d: -f7)"`,
 		`  printf 'user_groups=%s\n' "$(id -nG "$u" 2>/dev/null || true)"`,
+		// Only the class of the password field is printed, never the field.
+		`  case "$(getent shadow "$u" 2>/dev/null | cut -d: -f2)" in '!'|'!!') echo user_pw=locked ;; '*') echo user_pw=star ;; '') echo user_pw=empty ;; *) echo user_pw=set ;; esac`,
 		`  ak="$home/.ssh/authorized_keys"`,
-		`  if test -f "$ak" && awk -v k=` + akMatch + ` '{ for (i = 1; i < NF; i++) if ($i " " $(i+1) == k) f = 1 } END { exit !f }' "$ak"; then echo ak_key=1; else echo ak_key=0; fi`,
+		`  if test -f "$ak"; then printf 'ak_key=%s\n' "$(awk -v k=` + akMatch + ` ` + shell.Quote(authorizedKeyAwk) + ` "$ak")"; else echo ak_key=none; fi`,
 		`  if test -e ` + r.p("/var/lib/systemd/linger") + `/"$u"; then echo linger=1; else echo linger=0; fi`,
 		`  rt=` + r.p("/run/user") + `/"$uid"`,
 		`  if runuser -u "$u" -- env XDG_RUNTIME_DIR="$rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" systemctl --user show-environment >/dev/null 2>&1; then echo usermgr=1; else echo usermgr=0; fi`,
@@ -220,7 +304,7 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`if command -v sshd >/dev/null 2>&1; then`,
 		`  if t=$(sshd -T 2>&1); then`,
 		`    echo sshd_t=1`,
-		`    printf '%s\n' "$t" | awk '$1 == "passwordauthentication" || $1 == "kbdinteractiveauthentication" || $1 == "permitrootlogin" || $1 == "pubkeyauthentication" { print "sshd_" $1 "=" $2 }'`,
+		`    printf '%s\n' "$t" | awk '$1 == "passwordauthentication" || $1 == "kbdinteractiveauthentication" || $1 == "permitrootlogin" || $1 == "pubkeyauthentication" || $1 == "usepam" { print "sshd_" $1 "=" $2 }'`,
 		`    printf 'sshd_ports=%s\n' "$(printf '%s\n' "$t" | awk '$1 == "port" { printf "%s ", $2 }')"`,
 		`  else echo sshd_t=0; printf 'sshd_t_msg=%s\n' "$(printf '%s' "$t" | tr '\n' ' ' | head -c 300)"; fi`,
 		`fi`,
@@ -231,16 +315,22 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		// before depper's drop-in can override it.
 		`conflicts=""`,
 		`yes_re='^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitRootLogin)[[:space:]]+"?yes"?([[:space:]]|$)'`,
-		`if test -f ` + r.p(sshdMain) + ` && awk 'tolower($1) == "include" { exit } { print }' ` + r.p(sshdMain) + ` | grep -Eiq "$yes_re"; then conflicts="sshd_config"; fi`,
+		`if test -f ` + r.p(sshdMain) + ` && awk 'tolower($1) == "include" || tolower($1) == "match" { exit } { print }' ` + r.p(sshdMain) + ` | grep -Eiq "$yes_re"; then conflicts="sshd_config"; fi`,
 		`for f in ` + r.p(sshdDropInD) + `/*.conf; do`,
 		`  test -f "$f" || continue`,
 		`  b=${f##*/}`,
 		`  test "$b" = ` + sshDropInName + ` && continue`,
 		`  first=$(printf '%s\n%s\n' "$b" ` + sshDropInName + ` | LC_ALL=C sort | head -n 1)`,
 		`  test "$first" = "$b" || continue`,
-		`  if grep -Eiq "$yes_re" "$f"; then conflicts="$conflicts sshd_config.d/$b"; fi`,
+		`  if awk 'tolower($1) == "match" { exit } { print }' "$f" | grep -Eiq "$yes_re"; then conflicts="$conflicts sshd_config.d/$b"; fi`,
 		`done`,
 		`printf 'sshd_conflicts=%s\n' "$conflicts"`,
+		`depper_match=""`,
+		`for f in ` + r.p(sshdMain) + ` ` + r.p(sshdDropInD) + `/*.conf; do`,
+		`  test -f "$f" || continue`,
+		`  depper_match="$depper_match$(awk ` + shell.Quote(matchAwk) + ` "$f" 2>/dev/null)"`,
+		`done`,
+		`printf 'sshd_match=%s\n' "$depper_match"`,
 		`if systemctl is-active --quiet ssh.service 2>/dev/null; then echo sshd_unit=ssh; elif systemctl is-active --quiet sshd.service 2>/dev/null; then echo sshd_unit=sshd; fi`,
 		`if command -v ufw >/dev/null 2>&1; then`,
 		`  s=$(ufw status 2>/dev/null || true)`,
@@ -249,9 +339,22 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`fi`,
 		`if command -v firewall-cmd >/dev/null 2>&1 || command -v firewall-offline-cmd >/dev/null 2>&1; then`,
 		`  echo firewalld_present=1`,
-		`  if systemctl is-active --quiet firewalld.service 2>/dev/null; then echo firewalld_active=1; fc="firewall-cmd --permanent"; else fc=firewall-offline-cmd; fi`,
-		`  printf 'firewalld_ports=%s\n' "$($fc --list-ports 2>/dev/null | tr '\n' ' ')"`,
-		`  printf 'firewalld_services=%s\n' "$($fc --list-services 2>/dev/null | tr '\n' ' ')"`,
+		`  if systemctl is-active --quiet firewalld.service 2>/dev/null; then echo firewalld_active=1; fc=firewall-cmd; else fc=firewall-offline-cmd; fi`,
+		`  zone=""`,
+		`  if test -n "$depper_iface"; then zone=$($fc --get-zone-of-interface="$depper_iface" 2>/dev/null || true); fi`,
+		`  if test -z "$zone"; then zone=$($fc --get-default-zone 2>/dev/null || true); echo firewalld_zone_default=1; fi`,
+		`  case "$zone" in ""|*[!A-Za-z0-9_-]*) printf 'firewalld_zone_bad=%s\n' "$(printf '%s' "$zone" | tr -c 'A-Za-z0-9_-' '?' | head -c 64)" ;; *)`,
+		`    printf 'firewalld_zone=%s\n' "$zone"`,
+		`    if test "$fc" = firewall-cmd; then`,
+		`      printf 'firewalld_ports=%s\n' "$(firewall-cmd --zone="$zone" --list-ports 2>/dev/null | tr '\n' ' ')"`,
+		`      printf 'firewalld_pports=%s\n' "$(firewall-cmd --permanent --zone="$zone" --list-ports 2>/dev/null | tr '\n' ' ')"`,
+		`      printf 'firewalld_services=%s\n' "$(firewall-cmd --zone="$zone" --list-services 2>/dev/null | tr '\n' ' ')"`,
+		`      printf 'firewalld_pservices=%s\n' "$(firewall-cmd --permanent --zone="$zone" --list-services 2>/dev/null | tr '\n' ' ')"`,
+		`    else`,
+		`      printf 'firewalld_pports=%s\n' "$(firewall-offline-cmd --zone="$zone" --list-ports 2>/dev/null | tr '\n' ' ')"`,
+		`      printf 'firewalld_pservices=%s\n' "$(firewall-offline-cmd --zone="$zone" --list-services 2>/dev/null | tr '\n' ' ')"`,
+		`    fi ;;`,
+		`  esac`,
 		`fi`,
 		`f=` + r.p("/etc/apt/apt.conf.d/20auto-upgrades"),
 		`if test -f "$f" && grep -q 'APT::Periodic::Unattended-Upgrade "1"' "$f"; then echo autoupd_apt=1; fi`,
@@ -261,9 +364,25 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`for t in dnf-automatic-install.timer dnf5-automatic.timer; do if systemctl is-enabled --quiet "$t" 2>/dev/null; then printf 'autoupd_timer=%s\n' "$t"; break; fi; done`,
 		`if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then echo tailscale_up=1; fi`,
 		`if test -f ` + r.p(RecordPath) + `; then printf 'record=%s\n' "$(base64 < ` + r.p(RecordPath) + ` | tr -d '\n')"; fi`,
-		`echo root_facts=1`,
 	}
-	rootLines, err := r.asRoot(root)
+	if o.Compose {
+		// Installed and candidate versions of each compose provider.
+		root = append(root,
+			`for p in `+shell.Join(composePackages...)+`; do`,
+			`  if command -v apt-cache >/dev/null 2>&1; then`,
+			`    v=$(apt-cache policy "$p" 2>/dev/null | awk '$1 == "Installed:" { i = $2 } $1 == "Candidate:" { c = $2 } END { print i "|" c }')`,
+			`  elif command -v dnf >/dev/null 2>&1; then`,
+			`    i=$(rpm -q --qf '%{VERSION}\n' "$p" 2>/dev/null | head -n 1) || i=""`,
+			`    c=$(dnf -q info --available "$p" 2>/dev/null | awk -F': *' '$1 ~ /^Version/ { print $2; exit }')`,
+			`    v="$i|$c"`,
+			`  else v="|"; fi`,
+			`  printf 'compose_%s=%s\n' "$p" "$v"`,
+			`done`,
+			`if command -v apt-cache >/dev/null 2>&1 && ! ls `+r.p("/var/lib/apt/lists")+`/*_Packages* >/dev/null 2>&1; then echo apt_lists_empty=1; fi`,
+		)
+	}
+	root = append(root, `echo root_facts=1`)
+	rootLines, err := r.asRootArgs(root, `"$depper_iface"`)
 	if err != nil {
 		return "", err
 	}
@@ -276,7 +395,7 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 // sshdMetaKeys are sshd_* facts that are not `sshd -T` settings.
 var sshdMetaKeys = map[string]bool{
 	"sshd_t": true, "sshd_t_msg": true, "sshd_ports": true, "sshd_include": true,
-	"sshd_dropin": true, "sshd_conflicts": true, "sshd_unit": true,
+	"sshd_dropin": true, "sshd_conflicts": true, "sshd_unit": true, "sshd_match": true,
 }
 
 // parseFacts turns the facts output into Facts.
@@ -292,53 +411,82 @@ func parseFacts(out string) (*Facts, map[string]string, error) {
 		}
 	}
 	f := &Facts{
-		AdminUser:        clean(m["admin_user"]),
-		Privilege:        m["priv"],
-		SudoMessage:      clean(m["sudo_msg"]),
-		OSID:             osValue(m["os_ID"]),
-		OSLike:           osValue(m["os_ID_LIKE"]),
-		VersionID:        osValue(m["os_VERSION_ID"]),
-		Codename:         osValue(m["os_VERSION_CODENAME"]),
-		UbuntuCodename:   osValue(m["os_UBUNTU_CODENAME"]),
-		PrettyName:       osValue(m["os_PRETTY_NAME"]),
-		Systemd:          m["systemd"] == "1",
-		Arch:             clean(m["arch"]),
-		UserExists:       m["user_exists"] == "1",
-		UserHome:         clean(m["user_home"]),
-		UserShell:        clean(m["user_shell"]),
-		UserGroups:       strings.Fields(clean(m["user_groups"])),
-		KeyPresent:       m["ak_key"] == "1",
-		Linger:           m["linger"] == "1",
-		UserManager:      m["usermgr"] == "1",
-		SubUID:           m["subuid"] == "1",
-		SubGID:           m["subgid"] == "1",
-		Packages:         map[string]bool{},
-		Commands:         map[string]string{},
-		DockerActive:     m["docker_active"] == "1",
-		DockerEnabled:    m["docker_enabled"] == "1",
-		SSHDTest:         m["sshd_t"] == "1",
-		SSHDTestOutput:   clean(m["sshd_t_msg"]),
-		SSHD:             map[string]string{},
-		SSHDInclude:      m["sshd_include"] == "1",
-		SSHDConflicts:    strings.Fields(clean(m["sshd_conflicts"])),
-		SSHDUnit:         m["sshd_unit"],
-		UFWActive:        m["ufw_active"] == "1",
-		UFWPorts:         ports(m["ufw_ports"]),
-		FirewalldPresent: m["firewalld_present"] == "1",
-		FirewalldActive:  m["firewalld_active"] == "1",
-		FirewalldPorts:   ports(m["firewalld_ports"]),
-		AutoUpdatesConf:  m["autoupd_apt"] == "1" || m["autoupd_security"] == "1",
-		AutoUpdatesApply: m["autoupd_apply"] == "1",
-		AutoUpdatesTimer: clean(m["autoupd_timer"]),
-		TailscaleUp:      m["tailscale_up"] == "1",
+		AdminUser:            clean(m["admin_user"]),
+		Privilege:            m["priv"],
+		SudoMessage:          clean(m["sudo_msg"]),
+		OSID:                 osValue(m["os_ID"]),
+		OSLike:               osValue(m["os_ID_LIKE"]),
+		VersionID:            osValue(m["os_VERSION_ID"]),
+		Codename:             osValue(m["os_VERSION_CODENAME"]),
+		UbuntuCodename:       osValue(m["os_UBUNTU_CODENAME"]),
+		PrettyName:           osValue(m["os_PRETTY_NAME"]),
+		Systemd:              m["systemd"] == "1",
+		Arch:                 clean(m["arch"]),
+		UserExists:           m["user_exists"] == "1",
+		UserHome:             clean(m["user_home"]),
+		UserShell:            clean(m["user_shell"]),
+		UserGroups:           strings.Fields(clean(m["user_groups"])),
+		UserPassword:         clean(m["user_pw"]),
+		KeyPresent:           m["ak_key"] == "plain",
+		KeyRestricted:        m["ak_key"] == "restricted",
+		SSHLocalAddr:         clean(m["ssh_laddr"]),
+		SSHInterface:         clean(m["ssh_iface"]),
+		Linger:               m["linger"] == "1",
+		UserManager:          m["usermgr"] == "1",
+		SubUID:               m["subuid"] == "1",
+		SubGID:               m["subgid"] == "1",
+		Packages:             map[string]bool{},
+		Commands:             map[string]string{},
+		DockerActive:         m["docker_active"] == "1",
+		DockerEnabled:        m["docker_enabled"] == "1",
+		SSHDTest:             m["sshd_t"] == "1",
+		SSHDTestOutput:       clean(m["sshd_t_msg"]),
+		SSHD:                 map[string]string{},
+		SSHDInclude:          m["sshd_include"] == "1",
+		SSHDConflicts:        strings.Fields(clean(m["sshd_conflicts"])),
+		SSHDUnit:             m["sshd_unit"],
+		UFWActive:            m["ufw_active"] == "1",
+		UFWPorts:             ports(m["ufw_ports"]),
+		FirewalldPresent:     m["firewalld_present"] == "1",
+		FirewalldActive:      m["firewalld_active"] == "1",
+		FirewalldZone:        clean(m["firewalld_zone"]),
+		FirewalldZoneDefault: m["firewalld_zone_default"] == "1",
+		AutoUpdatesConf:      m["autoupd_apt"] == "1" || m["autoupd_security"] == "1",
+		AutoUpdatesApply:     m["autoupd_apply"] == "1",
+		AutoUpdatesTimer:     clean(m["autoupd_timer"]),
+		TailscaleUp:          m["tailscale_up"] == "1",
 	}
 	f.Family = classify(f.OSID, f.OSLike)
 	if uid, err := strconv.Atoi(m["user_uid"]); err == nil {
 		f.UserUID = uid
 	}
-	for _, s := range strings.Fields(m["firewalld_services"]) {
-		if s == "ssh" {
-			f.FirewalldSSHSvc = true
+	// A firewalld port or the ssh service counts when it is open both now
+	// and after a reload (runtime and permanent); a stopped firewalld only
+	// has the permanent configuration.
+	permPorts, permSvcs := ports(m["firewalld_pports"]), strings.Fields(m["firewalld_pservices"])
+	if f.FirewalldActive {
+		for _, p := range ports(m["firewalld_ports"]) {
+			if containsInt(permPorts, p) {
+				f.FirewalldPorts = append(f.FirewalldPorts, p)
+			}
+		}
+		f.FirewalldSSHSvc = contains(strings.Fields(m["firewalld_services"]), "ssh") && contains(permSvcs, "ssh")
+	} else {
+		f.FirewalldPorts, f.FirewalldSSHSvc = permPorts, contains(permSvcs, "ssh")
+	}
+	for _, mm := range strings.Split(m["sshd_match"], ";") {
+		if mm = clean(mm); mm != "" {
+			f.SSHDMatch = append(f.SSHDMatch, mm)
+		}
+	}
+	f.AptListsEmpty = m["apt_lists_empty"] == "1"
+	for _, p := range composePackages {
+		if v, ok := m["compose_"+p]; ok {
+			if f.Compose == nil {
+				f.Compose = map[string]PkgVersions{}
+			}
+			i, c, _ := strings.Cut(v, "|")
+			f.Compose[p] = PkgVersions{Installed: pkgVersion(i), Candidate: pkgVersion(c)}
 		}
 	}
 	for k, v := range m {
@@ -416,6 +564,11 @@ func (r *Runner) gatherFacts(ctx context.Context, admin *transport.Remote, o *Op
 	if err != nil {
 		return nil, err
 	}
+	if r.fsRoot != "" {
+		for i, mm := range f.SSHDMatch {
+			f.SSHDMatch[i] = strings.TrimPrefix(mm, r.fsRoot)
+		}
+	}
 	switch f.Privilege {
 	case PrivRoot, PrivSudo:
 		if m["root_facts"] != "1" {
@@ -431,4 +584,33 @@ func (r *Runner) gatherFacts(ctx context.Context, admin *transport.Remote, o *Op
 		return nil, fmt.Errorf("%s is not root and sudo is not installed; connect as root or as a user with passwordless sudo", o.Admin)
 	}
 	return f, nil
+}
+
+// pkgVersion cleans a version reported by apt-cache or rpm/dnf; "(none)"
+// and anything that is not a version become "".
+func pkgVersion(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" || v == "(none)" || !pkgVersionRe.MatchString(v) {
+		return ""
+	}
+	return v
+}
+
+var pkgVersionRe = regexp.MustCompile(`^[0-9][A-Za-z0-9.+~:_-]{0,80}$`)
+
+// versionMajor returns the major version of a Debian or RPM version string
+// (an epoch "N:" is skipped), or -1.
+func versionMajor(v string) int {
+	if _, rest, ok := strings.Cut(v, ":"); ok {
+		v = rest
+	}
+	end := 0
+	for end < len(v) && v[end] >= '0' && v[end] <= '9' {
+		end++
+	}
+	n, err := strconv.Atoi(v[:end])
+	if err != nil {
+		return -1
+	}
+	return n
 }

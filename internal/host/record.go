@@ -32,11 +32,11 @@ type Hardening struct {
 
 // mergeRecord combines the previous record with this run's settings.
 // Timestamps and version are left for the caller.
-func mergeRecord(prev *Record, o *Options, steps, packages []string) Record {
+func mergeRecord(prev *Record, o *Options, firewall []int, steps, packages []string) Record {
 	rec := Record{DeployUser: o.User, Container: o.Container, Cloudflared: o.Cloudflared}
 	rec.Hardening = Hardening{SSH: o.HardenSSH, AutoUpdates: o.AutoUpdates, Tailscale: o.TailscaleKey.Set()}
 	if o.Firewall != nil {
-		rec.Hardening.Firewall = firewallPorts(o)
+		rec.Hardening.Firewall = firewall
 	}
 	if prev != nil {
 		rec.CreatedAt = prev.CreatedAt

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/frgmt0/depper/internal/config"
 	"github.com/frgmt0/depper/internal/doctor"
 	"github.com/frgmt0/depper/internal/shell"
 	"github.com/frgmt0/depper/internal/transport"
@@ -102,14 +103,10 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 		return err
 	}
 	deployIdentity := PrivateKeyFor(o.KeyFile)
-	configIdentity := ""
-	if o.KeyExplicit {
-		configIdentity = deployIdentity
-	}
 
 	// The configuration must exist and accept the edit before the host is
 	// touched.
-	edit, cfg, err := planConfig(o.Repo, o.Target, o, configIdentity, r.LookupEnv)
+	edit, cfg, err := planConfig(o.Repo, o.Target, o, deployIdentity, r.LookupEnv)
 	if err != nil {
 		return err
 	}
@@ -123,12 +120,31 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 			return err
 		}
 	}
+	o.Compose = cfg.Container != nil && cfg.Container.Mode() == config.ModeCompose && o.Container != ContainerNone
 
 	// 1. Host key.
 	name := KnownHostsName(o.Host, o.Port)
 	scanned, err := r.keyscan(ctx, o.Host, o.Port)
 	if err != nil {
 		return err
+	}
+	verified := false
+	if len(o.HostKeyFingerprints) > 0 {
+		var match []HostKey
+		for _, k := range scanned {
+			if contains(o.HostKeyFingerprints, k.Fingerprint()) {
+				match = append(match, k)
+			}
+		}
+		if len(match) == 0 {
+			r.printf("The host %s presents these SSH host keys:\n", name)
+			r.printKeys(scanned)
+			return fmt.Errorf("none of the host keys %s presents matches --host-key-fingerprint %s; refusing to connect (if the host was reinstalled, get the new fingerprint from the provider console)", name, strings.Join(o.HostKeyFingerprints, ", "))
+		}
+		if len(match) < len(scanned) {
+			r.printf("Pinning only the host keys that match --host-key-fingerprint (%d of %d).\n", len(match), len(scanned))
+		}
+		scanned, verified = match, true
 	}
 	for _, k := range scanned {
 		res.HostKeys = append(res.HostKeys, KeyInfo{Type: k.Type, Fingerprint: k.Fingerprint()})
@@ -153,7 +169,11 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 	} else {
 		r.printf("The host %s presents these SSH host keys:\n", name)
 		r.printKeys(scanned)
-		r.printf("Compare them with the fingerprints from your provider's console (or `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the host).\n")
+		if verified {
+			r.printf("They match --host-key-fingerprint.\n")
+		} else {
+			r.printf("Compare them with the fingerprints from your provider's console (or `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the host).\n")
+		}
 		if o.DryRun {
 			res.HostKeyStatus = HostKeyUnconfirmed
 			r.printf("Dry run: the keys are not confirmed or written; facts are read over a connection that trusts them for this run only.\n")
@@ -167,8 +187,16 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 				return err
 			}
 		} else {
-			if err := r.confirm(o, "Trust these host keys and write them to "+o.KnownHosts+"?"); err != nil {
-				return err
+			switch {
+			case verified:
+			case o.Yes && !o.TrustOnFirstUse:
+				return fmt.Errorf("--yes cannot confirm an unverified host key: pass --host-key-fingerprint SHA256:... (from the provider console or `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the host), or --trust-on-first-use to pin whatever key the host presents now")
+			case o.Yes:
+				r.printf("--trust-on-first-use: pinning the keys without verification.\n")
+			default:
+				if err := r.confirm(o, "Trust these host keys and write them to "+o.KnownHosts+"?"); err != nil {
+					return err
+				}
 			}
 			if err := writeKnownHosts(o.KnownHosts, existing, name, scanned); err != nil {
 				return err
@@ -180,7 +208,7 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 	}
 
 	// 2. Facts, as the admin.
-	adminTarget := transport.Target{Host: o.Admin + "@" + o.Host, Port: o.Port, IdentityFile: o.Identity, KnownHosts: knownHosts}
+	adminTarget := transport.Target{Host: o.Admin + "@" + o.Host, Port: o.Port, IdentityFile: o.Identity, KnownHosts: knownHosts, Options: sessionOptions}
 	admin := r.remote(adminTarget)
 	facts, err := r.gatherFacts(ctx, admin, o, key)
 	if err != nil {
@@ -194,11 +222,16 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 		return err
 	}
 	khStep := &Step{ID: StepKnownHosts, Title: "Pin the host key in " + displayPath(o.KnownHosts, cfg.Repo)}
+	var recordExtra []string
 	switch res.HostKeyStatus {
 	case HostKeyPinned:
 		khStep.Detail = "already pinned"
 	case HostKeyAdded:
 		khStep.Detail = "written after confirmation"
+		if verified {
+			khStep.Detail = "written after matching --host-key-fingerprint"
+		}
+		recordExtra = append(recordExtra, StepKnownHosts)
 	default:
 		khStep.Change, khStep.Detail = true, "write "+fmt.Sprint(len(scanned))+" key(s) for "+name+" (mode 600)"
 	}
@@ -207,17 +240,12 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 		cfgStep.Detail = "skipped (--no-write-config)"
 	} else if edit.Changed() {
 		cfgStep.Change = true
-		var parts []string
-		for _, c := range edit.Changes {
-			if c.Changed {
-				parts = append(parts, c.String())
-			}
-		}
-		cfgStep.Detail = strings.Join(parts, "; ")
+		cfgStep.Detail = edit.describe() + " (after depper doctor passes)"
 	} else {
 		cfgStep.Detail = "already up to date"
 	}
 	plan.Steps = append(append([]*Step{khStep}, plan.Steps...), cfgStep)
+	plan.addRecord(facts, o, recordExtra)
 	if cfg.Container != nil && o.Container == ContainerNone {
 		plan.warn("depper.toml has [container] (engine %s) but --container none installs no container engine; drop --container to install %s", cfg.Container.Engine, cfg.Container.Engine)
 	}
@@ -242,11 +270,12 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 		}
 	}
 
-	// 4. Apply.
+	// 4. Apply. The firewall and sshd hardening run last, each guarded by
+	// an automatic revert.
 	var main []*Step
 	for _, s := range plan.Steps {
 		switch s.ID {
-		case StepKnownHosts, StepConfig, StepHardenSSH, StepRecord:
+		case StepKnownHosts, StepConfig, StepFirewall, StepHardenSSH, StepRecord:
 			continue
 		}
 		if s.Change {
@@ -267,18 +296,33 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 			applyErr = fmt.Errorf("applying the plan failed after %d of %d step(s): %w", len(done), len(main), err)
 		}
 	}
-	deployTarget := transport.Target{Host: o.User + "@" + o.Host, Port: o.Port, IdentityFile: deployIdentity, KnownHosts: o.KnownHosts}
+	deployTarget := transport.Target{Host: o.User + "@" + o.Host, Port: o.Port, IdentityFile: deployIdentity, KnownHosts: o.KnownHosts, Options: sessionOptions}
+	if s := plan.step(StepFirewall); applyErr == nil && s != nil && s.Change {
+		if err := r.applyFirewall(ctx, admin, adminTarget, deployTarget, s); err != nil {
+			applyErr = err
+		} else {
+			res.Applied = append(res.Applied, StepFirewall)
+		}
+	}
 	if s := plan.step(StepHardenSSH); applyErr == nil && s != nil && s.Change {
-		if err := r.hardenSSH(ctx, admin, adminTarget, deployTarget, o); err != nil {
+		if err := r.hardenSSH(ctx, admin, adminTarget, deployTarget, o, plan, facts.SSHDUnit); err != nil {
 			applyErr = err
 		} else {
 			res.Applied = append(res.Applied, StepHardenSSH)
 		}
 	}
-	// Record what was applied, also after a failure part-way, so the
-	// packages depper installed are not forgotten.
-	if s := plan.step(StepRecord); s != nil && s.Change && (applyErr == nil || len(remoteSteps(res.Applied)) > 0) {
-		rec := mergeRecord(facts.Record, recordedOptions(o, plan, res.Applied), remoteSteps(res.Applied), appliedPkgs)
+	recordStep := plan.step(StepRecord)
+	writeRecord := func() error {
+		if !recordStep.Change && len(res.Applied) == 0 {
+			return nil
+		}
+		steps := append(append([]string{}, res.Applied...), StepRecord)
+		ro := recordedOptions(o, plan, res.Applied)
+		fw := []int(nil)
+		if ro.Firewall != nil {
+			fw = firewallPorts(ro, facts)
+		}
+		rec := mergeRecord(facts.Record, ro, fw, steps, appliedPkgs)
 		now := r.now().UTC().Format(time.RFC3339)
 		rec.UpdatedAt, rec.DepperVersion = now, r.Version
 		if rec.CreatedAt == "" {
@@ -288,34 +332,64 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 		if err != nil {
 			return err
 		}
-		done, err := r.applySteps(ctx, admin, []*Step{{ID: StepRecord, lines: body}})
+		done, err := r.applySteps(ctx, admin, []*Step{{ID: StepRecord, Title: recordStep.Title, lines: body}})
 		res.Applied = append(res.Applied, done...)
-		if err != nil && applyErr == nil {
-			applyErr = fmt.Errorf("writing %s failed: %w", RecordPath, err)
+		if err != nil {
+			return fmt.Errorf("writing %s failed: %w", RecordPath, err)
 		}
+		return nil
 	}
 	if applyErr != nil {
+		// Record what was applied, also after a failure part-way, so the
+		// packages depper installed are not forgotten.
+		if len(remoteSteps(res.Applied)) > 0 {
+			if err := writeRecord(); err != nil {
+				r.printf("WARNING: %v\n", err)
+			}
+		}
 		return applyErr
 	}
 
-	// 5. Verify as the deploy user with the pinned key, then write the
-	// configuration.
+	// 5. Verify as the deploy user with the pinned key; write the
+	// configuration only when that passes, then the record.
 	r.printf("Checking the host as %s@%s with depper doctor...\n", o.User, o.Host)
-	d := &doctor.Doctor{Config: cfg, Remote: r.remote(cfg.SSHTarget())}
+	dt := cfg.SSHTarget()
+	dt.Options = sessionOptions
+	d := &doctor.Doctor{Config: cfg, Remote: r.remote(dt)}
 	report := d.Run(ctx)
 	res.Doctor = report
 	report.WriteHuman(r.out())
+	res.Next = "depper deploy"
+	if o.Target != "" {
+		res.Next += " --target " + o.Target
+	}
+	if report.Failed() {
+		if o.WriteConfig && edit.Changed() {
+			r.printf("depper doctor reports failures, so %s was not changed. The edit host init would have made to [%s]:\n", edit.File, edit.Table)
+			for _, c := range edit.Changes {
+				if c.Changed {
+					r.printf("  %s\n", c.String())
+				}
+			}
+		}
+		if err := writeRecord(); err != nil {
+			return err
+		}
+		return &DoctorFailedError{}
+	}
 	if o.WriteConfig && edit.Changed() {
 		if err := edit.apply(cfg.Repo, o.Target, r.LookupEnv); err != nil {
+			if rerr := writeRecord(); rerr != nil {
+				r.printf("WARNING: %v\n", rerr)
+			}
 			return err
 		}
 		res.ConfigWritten = true
 		res.Applied = append(res.Applied, StepConfig)
 		r.printf("Updated %s [%s].\n", edit.File, edit.Table)
 	}
-	res.Next = "depper deploy"
-	if o.Target != "" {
-		res.Next += " --target " + o.Target
+	if err := writeRecord(); err != nil {
+		return err
 	}
 	if len(res.Applied) == 0 && res.HostKeyStatus == HostKeyPinned {
 		r.printf("Nothing to change: %s is already prepared.\n", o.Host)
@@ -326,9 +400,6 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 		r.printf("Commit %s (host keys are not secret), or copy its contents into the DEPPER_KNOWN_HOSTS CI secret.\n", rel)
 	} else {
 		r.printf("Copy %s into the repository or into the DEPPER_KNOWN_HOSTS CI secret so CI trusts the same key.\n", rel)
-	}
-	if report.Failed() {
-		return &DoctorFailedError{}
 	}
 	r.printf("Next: %s\n", res.Next)
 	return nil
@@ -474,7 +545,7 @@ func (r *Runner) verifyLogin(ctx context.Context, t transport.Target) error {
 		program = "ssh"
 	}
 	args := append([]string{program}, t.SSHOptions()...)
-	args = append(args, "-o", "ControlPath=none", "-T", "--", t.Host, transport.RemoteShell)
+	args = append(args, "-o", "ControlPath=none", "-o", "ConnectTimeout=10", "-T", "--", t.Host, transport.RemoteShell)
 	res, err := r.Exec.Run(ctx, transport.Cmd{Args: args, Stdin: strings.NewReader(shell.Wrap("echo " + loginMarker)), Capture: true})
 	if err != nil {
 		return err
@@ -506,59 +577,6 @@ func (r *Runner) verifyLoginRetry(ctx context.Context, t transport.Target) error
 		}
 	}
 	return err
-}
-
-// hardenSSH writes the sshd drop-in, validates it, proves the deploy key
-// works over a new connection, reloads sshd, and proves new connections
-// still work. Any failure removes the drop-in (and reloads when it was
-// already loaded).
-func (r *Runner) hardenSSH(ctx context.Context, admin *transport.Remote, adminT, deployT transport.Target, o *Options) error {
-	r.printf("==> Harden sshd\n")
-	dir, file := r.raw(sshdDropInD), r.raw(SSHDropIn)
-	write := []string{
-		"set -eu",
-		"umask 022",
-		"mkdir -p " + shell.Quote(dir),
-		"printf '%s' " + shell.Quote(dropInContent) + " > " + shell.Quote(file+".depper-tmp"),
-		"chmod 644 " + shell.Quote(file+".depper-tmp"),
-		"mv -f " + shell.Quote(file+".depper-tmp") + " " + shell.Quote(file),
-		`if ! depper_out=$(sshd -t 2>&1); then rm -f ` + shell.Quote(file) + `; printf 'sshd -t rejected the configuration (drop-in removed): %s\n' "$depper_out" >&2; exit 1; fi`,
-		`depper_bad=$(sshd -T 2>/dev/null | awk -v admin=` + shell.Quote(o.Admin) + ` '($1 == "passwordauthentication" && $2 != "no") || ($1 == "kbdinteractiveauthentication" && $2 != "no") || ($1 == "permitrootlogin" && $2 != "prohibit-password" && $2 != "without-password" && !($2 == "no" && admin != "root")) { printf "%s %s; ", $1, $2 }')`,
-		`if test -n "$depper_bad"; then rm -f ` + shell.Quote(file) + `; printf 'the drop-in does not take effect (sshd -T: %s): an earlier configuration line sets these first; drop-in removed\n' "$depper_bad" >&2; exit 1; fi`,
-	}
-	remove := []string{"rm -f " + shell.Quote(file)}
-	reload := []string{
-		`if systemctl is-active --quiet ssh.service; then depper_unit=ssh.service; elif systemctl is-active --quiet sshd.service; then depper_unit=sshd.service; else echo "cannot find the running sshd service (ssh.service or sshd.service)" >&2; exit 1; fi`,
-		`systemctl reload "$depper_unit"`,
-	}
-	if err := r.runRoot(ctx, admin, write); err != nil {
-		return fmt.Errorf("--harden-ssh: %w", err)
-	}
-	r.printf("  checking that %s can log in with its key before reloading sshd...\n", o.User)
-	if err := r.verifyLogin(ctx, deployT); err != nil {
-		if rerr := r.runRoot(ctx, admin, remove); rerr != nil {
-			return fmt.Errorf("--harden-ssh: %s cannot log in with its key (%v), and removing %s failed: %v; remove it by hand before reloading sshd", o.User, err, SSHDropIn, rerr)
-		}
-		return fmt.Errorf("--harden-ssh: %s cannot log in with its key over a new connection (%v); removed %s and did not reload sshd", o.User, err, SSHDropIn)
-	}
-	if err := r.runRoot(ctx, admin, reload); err != nil {
-		_ = r.runRoot(ctx, admin, remove)
-		return fmt.Errorf("--harden-ssh: reloading sshd failed: %w; removed %s", err, SSHDropIn)
-	}
-	r.printf("  sshd reloaded; checking new connections...\n")
-	verr := r.verifyLoginRetry(ctx, deployT)
-	who := o.User
-	if verr == nil {
-		verr = r.verifyLoginRetry(ctx, adminT)
-		who = o.Admin
-	}
-	if verr != nil {
-		if rerr := r.runRoot(ctx, admin, append(remove, reload...)); rerr != nil {
-			return fmt.Errorf("--harden-ssh: a new login as %s failed after reload (%v), and rolling back failed: %v; remove %s and reload sshd from the provider console", who, verr, rerr, SSHDropIn)
-		}
-		return fmt.Errorf("--harden-ssh: a new login as %s failed after reload (%v); removed %s and reloaded sshd again", who, verr, SSHDropIn)
-	}
-	return nil
 }
 
 // remoteSteps drops the local steps from a list of step IDs.

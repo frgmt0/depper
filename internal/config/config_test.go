@@ -104,7 +104,7 @@ FEATURE_FLAG = "yes"
 			count++
 		}
 	}
-	for _, want := range []string{".env", "build/", FileName, LegacyFileName} {
+	for _, want := range []string{".env", "build/", FileName, LegacyFileName, ".depper/"} {
 		if !contains(cfg.Deploy.Exclude, want) {
 			t.Errorf("exclude lacks %q", want)
 		}

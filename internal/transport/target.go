@@ -22,6 +22,9 @@ type Target struct {
 	IdentityFile string
 	// KnownHosts sets UserKnownHostsFile and StrictHostKeyChecking=yes.
 	KnownHosts string
+	// Options are extra "-o" values (for example "ForwardAgent=no"), added
+	// after the options above and before BatchMode=yes.
+	Options []string
 }
 
 // SSHOptions returns the ssh options shared by every ssh and rsync
@@ -39,6 +42,9 @@ func (t Target) SSHOptions() []string {
 	}
 	if t.KnownHosts != "" {
 		opts = append(opts, "-o", "UserKnownHostsFile="+t.KnownHosts, "-o", "StrictHostKeyChecking=yes")
+	}
+	for _, o := range t.Options {
+		opts = append(opts, "-o", o)
 	}
 	return append(opts, "-o", "BatchMode=yes")
 }

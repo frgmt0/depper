@@ -342,3 +342,121 @@ func TestFactsAfterMarkerOnly(t *testing.T) {
 		t.Error("script prints no facts marker")
 	}
 }
+
+func composeConfig(engineName string) *config.Config {
+	cfg := baseConfig()
+	cfg.Service.Command = ""
+	cfg.Container = &config.Container{Engine: engineName, Compose: "compose.yaml"}
+	return cfg
+}
+
+const composeHint = "(install a compose provider: podman-compose for podman, the docker compose plugin for docker; `depper host init` installs one)"
+
+func TestComposeCheck(t *testing.T) {
+	engineFacts := with(healthyFacts, "engine", "/usr/bin/podman")
+
+	report, _ := runWith(t, composeConfig("podman"), with(with(engineFacts, "compose_rc", "0"), "compose_out", "podman-compose version 1.0.6"), nil)
+	if c := byName(report, "compose"); c.Status != Pass || c.Detail != "podman-compose version 1.0.6" {
+		t.Errorf("compose = %+v", c)
+	}
+	if report.Failed() {
+		t.Errorf("checks = %+v", report.Checks)
+	}
+
+	report, _ = runWith(t, composeConfig("podman"), with(with(engineFacts, "compose_rc", "125"), "compose_out", "Error: looking up compose provider failed"), nil)
+	want := "`podman compose version` failed: Error: looking up compose provider failed " + composeHint
+	if c := byName(report, "compose"); c.Status != Fail || c.Detail != want {
+		t.Errorf("compose = %+v, want detail %q", c, want)
+	}
+	if !report.Failed() {
+		t.Error("Failed() = false with a failing compose check")
+	}
+
+	// No output: the exit status is the message.
+	report, _ = runWith(t, composeConfig("docker"), with(with(with(healthyFacts, "engine", "/usr/bin/docker"), "compose_rc", "1"), "compose_out", ""), nil)
+	if c := byName(report, "compose"); c.Status != Fail || c.Detail != "`docker compose version` failed: exit status 1 "+composeHint {
+		t.Errorf("compose = %+v", c)
+	}
+
+	// Remote text is cleaned and bounded.
+	long := "v1\x1b[2J" + strings.Repeat("x", 500)
+	report, _ = runWith(t, composeConfig("podman"), with(with(engineFacts, "compose_rc", "0"), "compose_out", long), nil)
+	if c := byName(report, "compose"); c.Status != Pass || strings.ContainsRune(c.Detail, 0x1b) || len([]rune(c.Detail)) != maxComposeLine {
+		t.Errorf("compose = %+v", c)
+	}
+
+	// Missing engine: only the container engine check fails; compose is
+	// skipped rather than reported twice.
+	report, _ = runWith(t, composeConfig("podman"), healthyFacts, nil)
+	if c := byName(report, "container engine"); c.Status != Fail {
+		t.Errorf("container engine = %+v", c)
+	}
+	if c := byName(report, "compose"); c.Detail != "missing" {
+		t.Errorf("compose checked without an engine: %+v", c)
+	}
+
+	// Build/image modes do not use compose.
+	cfg := baseConfig()
+	cfg.Service.Command = ""
+	cfg.Container = &config.Container{Engine: "podman", Image: "nginx"}
+	report, _ = runWith(t, cfg, with(with(engineFacts, "compose_rc", "1"), "compose_out", "nope"), nil)
+	if c := byName(report, "compose"); c.Detail != "missing" {
+		t.Errorf("compose checked in image mode: %+v", c)
+	}
+	if strings.Contains(Script(cfg), "compose") {
+		t.Error("image-mode script probes compose")
+	}
+	if script := Script(composeConfig("docker")); !strings.Contains(script, "docker compose version 2>&1 </dev/null") {
+		t.Errorf("compose-mode script lacks the probe:\n%s", script)
+	}
+}
+
+// The compose probe runs under a POSIX shell against fake engines: a working
+// provider (after podman's provider banner), a failing one, and none.
+func TestComposeProbeRunsUnderPOSIXShell(t *testing.T) {
+	for _, tt := range []struct {
+		name, engine, fake string
+		status             Status
+		detail             string
+	}{
+		{"working", "podman", "#!/bin/sh\ntest \"$1 $2\" = 'compose version' || exit 9\necho '>>>> Executing external compose provider \"/usr/bin/podman-compose\". Please refer to the documentation for details. <<<<' >&2\necho >&2\necho 'podman-compose version 1.0.6'\necho 'podman version 4.9.3'\n", Pass, "podman-compose version 1.0.6"},
+		{"failing", "docker", "#!/bin/sh\necho \"docker: '$1' is not a docker command.\" >&2\necho \"See 'docker --help'\" >&2\nexit 1\n", Fail, "`docker compose version` failed: docker: 'compose' is not a docker command. " + composeHint},
+		{"no engine", "podman", "", "", ""},
+	} {
+		home := t.TempDir()
+		env := scriptEnv(t, home)
+		if tt.fake != "" {
+			bin := t.TempDir()
+			if err := os.WriteFile(filepath.Join(bin, tt.engine), []byte(tt.fake), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			env[1] = "PATH=" + bin + string(os.PathListSeparator) + strings.TrimPrefix(env[1], "PATH=")
+		}
+		cmd := exec.Command("/bin/sh", "-s")
+		cmd.Env = env
+		cmd.Stdin = strings.NewReader(Script(composeConfig(tt.engine)))
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%s: script failed: %v\n%s", tt.name, err, out)
+		}
+		facts := ParseFacts(string(out))
+		if facts["doctor"] != "1" {
+			t.Fatalf("%s: script did not finish: %q", tt.name, out)
+		}
+		c := Check{Detail: "missing"}
+		for _, check := range (&Doctor{Config: composeConfig(tt.engine)}).evaluate(facts) {
+			if check.Name == "compose" {
+				c = check
+			}
+		}
+		if tt.fake == "" {
+			if c.Detail != "missing" {
+				t.Errorf("%s: compose = %+v", tt.name, c)
+			}
+			continue
+		}
+		if c.Status != tt.status || c.Detail != tt.detail {
+			t.Errorf("%s: compose = %+v, want %s %q (facts %v)", tt.name, c, tt.status, tt.detail, facts)
+		}
+	}
+}

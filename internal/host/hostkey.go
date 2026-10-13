@@ -265,8 +265,13 @@ func writeKnownHosts(path, existing, name string, keys []HostKey) error {
 }
 
 // atomicWrite replaces path with data through a temporary file in the same
-// directory and a rename.
+// directory and a rename. A symbolic link is followed, so its target is
+// replaced and the link kept.
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
+	path, err := resolveLinks(path)
+	if err != nil {
+		return fmt.Errorf("cannot write %s: %w", path, err)
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".depper-*")
 	if err != nil {
 		return fmt.Errorf("cannot write %s: %w", path, err)
@@ -295,4 +300,30 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 		return fmt.Errorf("cannot write %s: %w", path, err)
 	}
 	return nil
+}
+
+// resolveLinks follows symbolic links in the final component of path (also
+// a dangling one, whose target is then created), up to 40 levels.
+func resolveLinks(path string) (string, error) {
+	for i := 0; i < 40; i++ {
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return path, nil
+		}
+		if err != nil {
+			return path, err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return path, nil
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return path, err
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(path), target)
+		}
+		path = target
+	}
+	return path, fmt.Errorf("too many levels of symbolic links")
 }

@@ -155,13 +155,22 @@ rest:
 		fmt.Fprintln(os.Stderr, "Host key verification failed.")
 		return 255
 	}
+	laddr := readTrim(filepath.Join(root, "ssh-laddr"))
+	if laddr == "" {
+		laddr = "10.0.0.5"
+	}
 	env := []string{
 		"PATH=" + fakeRemotePATH(root),
+		"SSH_CONNECTION=192.0.2.7 50022 " + laddr + " " + strconv.Itoa(port),
 		"FAKE_ROOT=" + root,
 		"TMPDIR=" + filepath.Join(root, "tmp"),
 	}
+	if exists(filepath.Join(root, "firewall-blocks-ssh")) && (exists(filepath.Join(root, "ufw-active")) || exists(filepath.Join(root, "units", "firewalld.service.active"))) {
+		fmt.Fprintln(os.Stderr, "ssh: connect to host "+addr+" port "+strconv.Itoa(port)+": Connection timed out")
+		return 255
+	}
 	if user == readTrim(filepath.Join(root, "admin-user")) {
-		if exists(filepath.Join(root, "deny-admin-after-reload")) && exists(filepath.Join(root, "sshd-reloads")) {
+		if exists(filepath.Join(root, "deny-admin-after-reload")) && exists(filepath.Join(root, "sshd-reloads")) && exists(filepath.Join(fs, "etc/ssh/sshd_config.d/10-depper.conf")) {
 			fmt.Fprintln(os.Stderr, "Permission denied (publickey).")
 			return 255
 		}
@@ -221,14 +230,14 @@ var remoteToolAllowlist = []string{
 	"cat", "mkdir", "rmdir", "mv", "ln", "rm", "cp", "chmod", "readlink", "ls",
 	"date", "stat", "touch", "find", "tee", "sleep",
 	"grep", "sed", "awk", "head", "tail", "tr", "cut", "sort", "uniq", "wc",
-	"basename", "dirname", "base64", "mktemp", "od", "uname", "hostname", "kill", "perl", "df",
+	"basename", "dirname", "base64", "mktemp", "od", "uname", "hostname", "kill", "perl", "df", "nohup",
 }
 
 // guardedTools must only ever resolve to a fake.
 var guardedTools = []string{
 	"apt-get", "dpkg-query", "dnf", "rpm", "useradd", "usermod", "loginctl", "systemctl", "runuser",
 	"sudo", "sshd", "ufw", "firewall-cmd", "firewall-offline-cmd", "tailscale", "curl", "podman", "docker",
-	"cloudflared", "rsync", "getent", "id", "chown",
+	"cloudflared", "rsync", "getent", "id", "chown", "systemd-run", "ip", "ssh-keygen", "apt-cache", "timeout",
 }
 
 const fakeID = `#!/bin/sh
@@ -282,6 +291,7 @@ uid=$(awk -F: 'BEGIN { m = 999 } $3 > m && $3 < 60000 { m = $3 } END { print m +
 if test "$usergroup" = yes; then printf '%s:x:%s:\n' "$name" "$uid" >> "$FS/etc/group"; gid=$uid
 else gid=$(awk -F: -v g="$group" '$1 == g { print $3 }' "$FS/etc/group"); fi
 printf '%s:x:%s:%s::%s:%s\n' "$name" "$uid" "$gid" "$home" "$shell" >> "$FS/etc/passwd"
+printf '%s:!:19000:0:99999:7:::\n' "$name" >> "$FS/etc/shadow"
 mkdir -p "$home"
 `
 
@@ -291,7 +301,8 @@ FS="$FAKE_ROOT/fs"
 for u; do :; done
 while test $# -gt 1; do
   case "$1" in
-    -p) printf '%s %s\n' "$u" "$2" >> "$FAKE_ROOT/passwords"; shift ;;
+    -p) printf '%s %s\n' "$u" "$2" >> "$FAKE_ROOT/passwords"; awk -F: -v OFS=: -v u="$u" -v p="$2" '$1 == u { $2 = p } { print }' "$FS/etc/shadow" > "$FS/etc/shadow.new" && mv "$FS/etc/shadow.new" "$FS/etc/shadow"; shift ;;
+    -s) awk -F: -v OFS=: -v u="$u" -v s="$2" '$1 == u { $7 = s } { print }' "$FS/etc/passwd" > "$FS/etc/passwd.new" && mv "$FS/etc/passwd.new" "$FS/etc/passwd"; shift ;;
     -aG) awk -F: -v OFS=: -v g="$2" -v u="$u" '$1 == g { if ($4 == "") $4 = u; else $4 = $4 "," u } { print }' "$FS/etc/group" > "$FS/etc/group.new" && mv "$FS/etc/group.new" "$FS/etc/group"; shift ;;
     --add-subuids|--add-subgids)
       f=subuid; test "$1" = --add-subgids && f=subgid
@@ -325,6 +336,11 @@ if test "$1" = --user; then
   esac
   exit 0
 fi
+if test "$1" = show; then
+  for u; do :; done
+  if test -e "$S/$u.active"; then echo waiting; else echo dead; fi
+  exit 0
+fi
 cmd=""; units=""; now=no
 for a; do
   case "$a" in
@@ -334,15 +350,20 @@ for a; do
   esac
 done
 case "$cmd" in
-  start|enable|reload) printf '%s\n' "systemctl $*" >> "$FAKE_ROOT/changes.log" ;;
+  start|enable|reload|stop|disable) printf '%s\n' "systemctl $*" >> "$FAKE_ROOT/changes.log" ;;
 esac
+# Starting firewalld loads its permanent configuration.
+fwstart() { if test "$1" = firewalld.service; then for z in "$FAKE_ROOT"/fwd/*.perm; do test -f "$z" && cp "$z" "${z%.perm}.runtime"; done; fi; }
 case "$cmd" in
   start)
     for u in $units; do
       case "$u" in user@*.service) id=${u#user@}; id=${id%.service}; mkdir -p "$FS/run/user/$id"; : > "$FS/run/user/$id/manager" ;; esac
-      : > "$S/$u.active"
+      : > "$S/$u.active"; fwstart "$u"
     done ;;
-  enable) for u in $units; do : > "$S/$u.enabled"; if test "$now" = yes; then : > "$S/$u.active"; fi; done ;;
+  enable) for u in $units; do : > "$S/$u.enabled"; if test "$now" = yes; then : > "$S/$u.active"; fwstart "$u"; fi; done ;;
+  disable) for u in $units; do rm -f "$S/$u.enabled"; if test "$now" = yes; then rm -f "$S/$u.active"; fi; done ;;
+  stop) for u in $units; do rm -f "$S/$u.active"; done ;;
+  reset-failed) ;;
   is-active) for u in $units; do test -e "$S/$u.active" || exit 3; done ;;
   is-enabled) for u in $units; do test -e "$S/$u.enabled" || exit 1; done ;;
   reload)
@@ -353,6 +374,57 @@ case "$cmd" in
   daemon-reload|restart) ;;
   *) echo "fake systemctl: unsupported $cmd" >&2; exit 1 ;;
 esac
+`
+
+// fakeSystemdRun arms a transient timer: after --on-active it runs the
+// command unless the timer was stopped (disarmed) first.
+const fakeSystemdRun = `#!/bin/sh
+printf '%s\n' "systemd-run $*" >> "$FAKE_ROOT/systemd-run.log"
+unit=""; delay=1
+while test $# -gt 0; do
+  case "$1" in
+    --unit=*) unit=${1#--unit=} ;;
+    --on-active=*) delay=${1#--on-active=}; delay=${delay%s} ;;
+    --*) ;;
+    *) break ;;
+  esac
+  shift
+done
+S="$FAKE_ROOT/units"
+mkdir -p "$S"
+: > "$S/$unit.timer.active"
+echo "armed $unit" >> "$FAKE_ROOT/timer-events"
+# An external sh (not a subshell), so no descriptor of this script stays
+# open in the sleeping process.
+sh -c 'd=$1; S=$2; unit=$3; R=$4; shift 4; sleep "$d"; if test -e "$S/$unit.timer.active"; then rm -f "$S/$unit.timer.active"; echo "fired $unit" >> "$R/timer-events"; "$@"; echo "done $unit" >> "$R/timer-events"; fi' fake-timer "$delay" "$S" "$unit" "$FAKE_ROOT" "$@" </dev/null >/dev/null 2>&1 &
+`
+
+const fakeIP = `#!/bin/sh
+echo '1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever'
+echo '2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0\       valid_lft forever preferred_lft forever'
+`
+
+const fakeSSHKeygen = `#!/bin/sh
+out=""
+while test $# -gt 0; do case "$1" in -f) out=$2; shift ;; esac; shift; done
+test -n "$out" && echo key > "$out" && echo pub > "$out.pub"
+`
+
+const fakeTimeout = `#!/bin/sh
+printf '%s\n' "timeout $*" >> "$FAKE_ROOT/timeout.log"
+shift
+exec "$@"
+`
+
+// fakeAptCache answers "policy PKG" from the packages file (installed) and
+// the available file ("PKG VERSION" lines).
+const fakeAptCache = `#!/bin/sh
+p=$2
+v=$(awk -v p="$p" '$1 == p { print $2 }' "$FAKE_ROOT/available" 2>/dev/null)
+i="(none)"; if grep -qx "$p" "$FAKE_ROOT/packages"; then i=${v:-1.0}; fi
+echo "$p:"
+echo "  Installed: $i"
+echo "  Candidate: ${v:-(none)}"
 `
 
 const fakeRunuser = `#!/bin/sh
@@ -385,10 +457,10 @@ case "$1" in
     # Like sshd: the main file up to its Include, then the drop-ins in
     # lexical order, then the rest of the main file; the first value wins.
     {
-      awk 'tolower($1) == "include" { exit } { print }' "$main"
+      awk 'tolower($1) == "include" || tolower($1) == "match" { exit } { print }' "$main"
       if grep -qi '^Include' "$main"; then
-        for f in "$FS"/etc/ssh/sshd_config.d/*.conf; do test -f "$f" && cat "$f"; done
-        awk 'f { print } tolower($1) == "include" { f = 1 }' "$main"
+        for f in "$FS"/etc/ssh/sshd_config.d/*.conf; do test -f "$f" && awk 'tolower($1) == "match" { exit } { print }' "$f"; done
+        awk 'tolower($1) == "match" { exit } f { print } tolower($1) == "include" { f = 1 }' "$main"
       fi
     } | awk '
       { k = tolower($1) }
@@ -400,6 +472,7 @@ case "$1" in
         if (!("kbdinteractiveauthentication" in v)) v["kbdinteractiveauthentication"] = "yes"
         if (!("permitrootlogin" in v)) v["permitrootlogin"] = "prohibit-password"
         if (!("pubkeyauthentication" in v)) v["pubkeyauthentication"] = "yes"
+        if (!("usepam" in v)) v["usepam"] = "yes"
         for (k in v) print k, v[k]
       }' ;;
 esac
@@ -413,7 +486,8 @@ echo "dpkg-query: no packages found matching $p" >&2; exit 1
 
 const fakeRpm = `#!/bin/sh
 for p; do :; done
-if grep -qx "$p" "$FAKE_ROOT/packages"; then echo "$p-1.0"; exit 0; fi
+v=$(awk -v p="$p" '$1 == p { print $2 }' "$FAKE_ROOT/available" 2>/dev/null)
+if grep -qx "$p" "$FAKE_ROOT/packages"; then case " $* " in *" --qf "*) echo "${v:-1.0}" ;; *) echo "$p-${v:-1.0}" ;; esac; exit 0; fi
 echo "package $p is not installed"; exit 1
 `
 
@@ -434,7 +508,7 @@ for p; do
   case "$p" in
     rsync|curl|podman|cloudflared|ufw) inst "$p" ;;
     tailscale) inst tailscale; : > "$FAKE_ROOT/units/tailscaled.service.file" ;;
-    docker.io|moby-engine) inst docker; grep -q '^docker:' "$FS/etc/group" || echo 'docker:x:998:' >> "$FS/etc/group"; : > "$FAKE_ROOT/units/docker.service.file" ;;
+    docker.io|moby-engine|docker) inst docker; grep -q '^docker:' "$FS/etc/group" || echo 'docker:x:998:' >> "$FS/etc/group"; : > "$FAKE_ROOT/units/docker.service.file" ;;
     firewalld) inst firewall-cmd; inst firewall-offline-cmd ;;
     uidmap|shadow-utils) inst newuidmap ;;
     dnf-automatic) : > "$FAKE_ROOT/units/dnf-automatic-install.timer.file" ;;
@@ -462,7 +536,6 @@ esac
 `
 
 const fakeDnf = `#!/bin/sh
-printf '%s\n' "dnf $*" >> "$FAKE_ROOT/changes.log"
 cmd=""; pkgs=""
 for a; do
   case "$a" in
@@ -470,6 +543,11 @@ for a; do
     *) if test -z "$cmd"; then cmd=$a; else pkgs="$pkgs $a"; fi ;;
   esac
 done
+if test "$cmd" = info; then
+  for p in $pkgs; do v=$(awk -v p="$p" '$1 == p { print $2 }' "$FAKE_ROOT/available" 2>/dev/null); test -n "$v" || exit 1; echo "Name         : $p"; echo "Version      : $v"; done
+  exit 0
+fi
+printf '%s\n' "dnf $*" >> "$FAKE_ROOT/changes.log"
 case "$cmd" in
   install) exec pkg-install $pkgs ;;
   *) echo "fake dnf: unsupported $cmd" >&2; exit 1 ;;
@@ -501,20 +579,35 @@ case "$1" in
       while read -r p; do printf '%-27s%-12s%s\n' "$p" ALLOW Anywhere; done < "$R"
     else echo "Status: inactive"; fi ;;
   allow) grep -qx "$2" "$R" || echo "$2" >> "$R" ;;
-  --force) if test "$2" = enable; then : > "$FAKE_ROOT/ufw-active"; mkdir -p "$FAKE_ROOT/fs/etc/ufw"; echo ENABLED=yes > "$FAKE_ROOT/fs/etc/ufw/ufw.conf"; fi ;;
+  --force)
+    if test "$2" = enable; then : > "$FAKE_ROOT/ufw-active"; mkdir -p "$FAKE_ROOT/fs/etc/ufw"; echo ENABLED=yes > "$FAKE_ROOT/fs/etc/ufw/ufw.conf"; fi
+    if test "$2" = disable; then rm -f "$FAKE_ROOT/ufw-active"; mkdir -p "$FAKE_ROOT/fs/etc/ufw"; echo ENABLED=no > "$FAKE_ROOT/fs/etc/ufw/ufw.conf"; fi ;;
+  delete) test "$2" = allow && { grep -vx "$3" "$R" > "$R.new" || true; mv "$R.new" "$R"; } ;;
   *) echo "fake ufw: unsupported $1" >&2; exit 1 ;;
 esac
 `
 
+// fakeFirewallCmd keeps runtime and permanent ports per zone in fwd/
+// (firewall-offline-cmd edits the permanent configuration only). Interface
+// zones come from firewalld-iface-zones ("IFACE ZONE" lines).
 const fakeFirewallCmd = `#!/bin/sh
 printf '%s\n' "${0##*/} $*" >> "$FAKE_ROOT/firewalld.log"
-P="$FAKE_ROOT/firewalld-ports"
-touch "$P"
+D="$FAKE_ROOT/fwd"
+mkdir -p "$D"
+def=$(cat "$FAKE_ROOT/firewalld-default-zone" 2>/dev/null || echo public)
+perm=no; zone=$def
+test "${0##*/}" = firewall-offline-cmd && perm=yes
+for a; do case "$a" in --permanent) perm=yes ;; --zone=*) zone=${a#--zone=} ;; esac; done
+f="$D/$zone.runtime"; test "$perm" = yes && f="$D/$zone.perm"
+touch "$f"
 for a; do
   case "$a" in
-    --list-ports) tr '\n' ' ' < "$P"; echo ;;
+    --get-default-zone) echo "$def" ;;
+    --get-zone-of-interface=*) i=${a#*=}; z=$(awk -v i="$i" '$1 == i { print $2 }' "$FAKE_ROOT/firewalld-iface-zones" 2>/dev/null); if test -n "$z"; then echo "$z"; else echo "no zone" >&2; exit 2; fi ;;
+    --list-ports) tr '\n' ' ' < "$f"; echo ;;
     --list-services) echo "ssh dhcpv6-client" ;;
-    --add-port=*) p=${a#--add-port=}; grep -qx "$p" "$P" || echo "$p" >> "$P" ;;
+    --add-port=*) p=${a#--add-port=}; grep -qx "$p" "$f" || echo "$p" >> "$f" ;;
+    --remove-port=*) p=${a#--remove-port=}; grep -vx "$p" "$f" > "$f.new" || true; mv "$f.new" "$f" ;;
   esac
 done
 `
@@ -629,12 +722,14 @@ func newFakeHost(t *testing.T, d distro) *fakeHost {
 		"id": fakeID, "getent": fakeGetent, "sudo": fakeSudo, "useradd": fakeUseradd, "usermod": fakeUsermod,
 		"loginctl": fakeLoginctl, "systemctl": fakeSystemctl, "runuser": fakeRunuser, "chown": fakeChown,
 		"sshd": fakeSSHD, "pkg-install": fakePkgInstall, "sha256sum": sha256Stub,
+		"systemd-run": fakeSystemdRun, "ip": fakeIP, "ssh-keygen": fakeSSHKeygen, "timeout": fakeTimeout,
 	} {
 		h.write("remote-bin/"+name, body, 0o755)
 	}
 	if d.debian {
 		h.write("remote-bin/dpkg-query", fakeDpkgQuery, 0o755)
 		h.write("remote-bin/apt-get", fakeAptGet, 0o755)
+		h.write("remote-bin/apt-cache", fakeAptCache, 0o755)
 	} else {
 		h.write("remote-bin/rpm", fakeRpm, 0o755)
 		h.write("remote-bin/dnf", fakeDnf, 0o755)
@@ -656,6 +751,7 @@ func newFakeHost(t *testing.T, d distro) *fakeHost {
 	h.write("packages", strings.Join(d.installed, "\n")+"\n", 0o644)
 	h.write("fs/etc/os-release", d.osRelease, 0o644)
 	h.write("fs/etc/passwd", "root:x:0:0:root:"+filepath.Join(h.FS, "root")+":/bin/bash\n", 0o644)
+	h.write("fs/etc/shadow", "root:*:19000:0:99999:7:::\n", 0o600)
 	h.write("fs/etc/group", "root:x:0:\nsudo:x:27:\nwheel:x:10:\n", 0o644)
 	h.write("fs/etc/ssh/sshd_config", "Include /etc/ssh/sshd_config.d/*.conf\nPermitRootLogin yes\nPasswordAuthentication yes\n", 0o644)
 	h.write("fs/bin/bash", stubTool, 0o755)
@@ -738,6 +834,7 @@ func (h *fakeHost) runner() *Runner {
 		Now:       func() time.Time { return time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC) },
 		Version:   "v0.2.0-test",
 		fsRoot:    h.FS, pathSet: true, sysPath: "", managerWait: 2, retryDelay: 10 * time.Millisecond,
+		revertDelay: 20 * time.Second, revertGrace: 2 * time.Second,
 	}
 }
 
@@ -746,7 +843,7 @@ func (h *fakeHost) options() *Options {
 	return &Options{
 		Repo: h.Repo, Admin: "root", Host: "127.0.0.1", Port: 22, User: "deploy",
 		KeyFile: h.KeyFile, Container: ContainerNone, KnownHosts: filepath.Join(h.Repo, ".depper", "known_hosts"),
-		WriteConfig: true, Yes: true,
+		WriteConfig: true, Yes: true, TrustOnFirstUse: true,
 	}
 }
 

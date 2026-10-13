@@ -62,7 +62,10 @@ func (s *StatusResult) WriteHuman(w io.Writer) {
 const statusMarker = "@@depper-host-status"
 
 // statusScript reads the host record and live state as the deploy user; it
-// needs no administrator rights and changes nothing.
+// needs no administrator rights and changes nothing. The effective sshd
+// settings come from `sshd -T` with a throwaway host key (sshd -T refuses
+// to run without one, and the real keys are readable only by root) and the
+// connection spec of this very session, so Match blocks are applied.
 func (r *Runner) statusScript() string {
 	lines := append([]string{"set -u"}, shell.SessionEnv()...)
 	return shell.Script(append(lines,
@@ -75,6 +78,25 @@ func (r *Runner) statusScript() string {
 		`if systemctl --user show-environment >/dev/null 2>&1; then echo usermgr=1; else echo usermgr=0; fi`,
 		`for c in podman docker cloudflared tailscale rsync; do printf 'cmd_%s=%s\n' "$c" "$(command -v "$c" 2>/dev/null || true)"; done`,
 		`if test -f `+r.p(SSHDropIn)+`; then echo dropin=1; fi`,
+		`PATH="$PATH:/usr/sbin:/sbin"`,
+		`set -- ${SSH_CONNECTION:-127.0.0.1 0 127.0.0.1 22}`,
+		`spec="user=$u,host=$1,addr=$1,laddr=$3,lport=$4"`,
+		`case "$spec" in *[!A-Za-z0-9_.:=,-]*) spec="user=$u,host=127.0.0.1,addr=127.0.0.1,laddr=127.0.0.1,lport=22" ;; esac`,
+		`if ! command -v sshd >/dev/null 2>&1; then echo sshd_t_msg=sshd is not installed`,
+		`elif ! command -v ssh-keygen >/dev/null 2>&1; then echo sshd_t_msg=ssh-keygen is not installed`,
+		`elif ! kd=$(mktemp -d 2>/dev/null); then echo sshd_t_msg=mktemp failed`,
+		`else`,
+		`  if ssh-keygen -q -t ed25519 -N '' -C depper-status -f "$kd/k" >/dev/null 2>&1 && t=$(sshd -T -h "$kd/k" -C "$spec" 2>&1); then`,
+		`    echo sshd_t=1`,
+		`    printf '%s\n' "$t" | awk '$1 == "passwordauthentication" || $1 == "kbdinteractiveauthentication" || $1 == "permitrootlogin" { print "sshd_" $1 "=" $2 }'`,
+		`  else printf 'sshd_t_msg=%s\n' "$(printf '%s' "${t:-ssh-keygen failed}" | tr '\n' ' ' | head -c 300)"; fi`,
+		`  rm -rf "$kd"`,
+		`fi`,
+		`depper_match=""`,
+		`for f in `+r.p(sshdMain)+` `+r.p(sshdDropInD)+`/*.conf; do`,
+		`  if test -f "$f" && test -r "$f"; then depper_match="$depper_match$(awk `+shell.Quote(matchAwk)+` "$f" 2>/dev/null)"; elif test -f "$f"; then depper_match="$depper_match${f##*/}: not readable by $u;"; fi`,
+		`done`,
+		`printf 'sshd_match=%s\n' "$depper_match"`,
 		`if test -r `+r.p("/etc/ufw/ufw.conf")+` && grep -q '^ENABLED=yes' `+r.p("/etc/ufw/ufw.conf")+`; then echo ufw=1; fi`,
 		`if systemctl is-active --quiet firewalld.service 2>/dev/null; then echo firewalld=1; fi`,
 		`if test -f `+r.p("/etc/apt/apt.conf.d/20auto-upgrades")+` && grep -q 'APT::Periodic::Unattended-Upgrade "1"' `+r.p("/etc/apt/apt.conf.d/20auto-upgrades")+`; then echo autoupd=1; fi`,
@@ -162,12 +184,16 @@ func (r *Runner) Status(ctx context.Context, cfg *config.Config) (*StatusResult,
 			add("cloudflared", StatusFail, "cloudflared is not installed")
 		}
 	}
+	// Opt-in features: pass when in effect; recorded in host.json but not
+	// in effect now is a warning (something changed since depper set it
+	// up), never a failure.
+	notInEffect := "recorded as applied by depper but not in effect now: "
 	feature := func(name string, recorded, live bool, on, off string) {
 		switch {
 		case live:
 			add(name, StatusPass, on)
 		case recorded:
-			add(name, StatusFail, off)
+			add(name, StatusWarn, notInEffect+off)
 		default:
 			add(name, StatusInfo, "not enabled (opt-in)")
 		}
@@ -176,14 +202,43 @@ func (r *Runner) Status(ctx context.Context, cfg *config.Config) (*StatusResult,
 	if rec != nil {
 		h = rec.Hardening
 	}
-	feature("ssh hardening", h.SSH, m["dropin"] == "1", SSHDropIn+" is present", SSHDropIn+" is missing although depper applied it")
+	dropin := "absent"
+	if m["dropin"] == "1" {
+		dropin = "present"
+	}
+	if m["sshd_t"] == "1" {
+		eff := map[string]string{}
+		for _, k := range []string{"passwordauthentication", "kbdinteractiveauthentication", "permitrootlogin"} {
+			eff[k] = clean(m["sshd_"+k])
+		}
+		values := fmt.Sprintf("PasswordAuthentication %s, KbdInteractiveAuthentication %s, PermitRootLogin %s for %s (sshd -T; %s %s)", shellName(eff["passwordauthentication"]), shellName(eff["kbdinteractiveauthentication"]), shellName(eff["permitrootlogin"]), res.User, SSHDropIn, dropin)
+		feature("ssh hardening", h.SSH, sshdHardened(eff), values, values)
+	} else {
+		msg := clean(m["sshd_t_msg"])
+		if h.SSH {
+			add("ssh hardening", StatusWarn, "cannot read the effective sshd settings as "+res.User+" (sshd -T: "+msg+"); "+SSHDropIn+" is "+dropin)
+		} else {
+			add("ssh hardening", StatusInfo, "not enabled (opt-in)")
+		}
+	}
+	if h.SSH || m["dropin"] == "1" {
+		var match []string
+		for _, mm := range strings.Split(m["sshd_match"], ";") {
+			if mm = clean(strings.TrimPrefix(clean(mm), r.fsRoot)); mm != "" {
+				match = append(match, mm)
+			}
+		}
+		if len(match) > 0 {
+			add("ssh match blocks", StatusWarn, "hardening does not cover connections these Match blocks apply to: "+strings.Join(match, ", "))
+		}
+	}
 	fw := m["ufw"] == "1" || m["firewalld"] == "1"
 	fwName := "ufw"
 	if m["firewalld"] == "1" {
 		fwName = "firewalld"
 	}
-	feature("firewall", len(h.Firewall) > 0, fw, fwName+" is active", "no firewall is active although depper enabled one (ports "+intsString(h.Firewall)+")")
-	feature("auto updates", h.AutoUpdates, m["autoupd"] == "1", "automatic security updates are enabled", "automatic updates are not enabled although depper configured them")
-	feature("tailscale", h.Tailscale, m["tailscale_up"] == "1", "tailscale is up", "tailscale is not up although depper joined the tailnet")
+	feature("firewall", len(h.Firewall) > 0, fw, fwName+" is active", "no firewall is active (depper enabled one for ports "+intsString(h.Firewall)+")")
+	feature("auto updates", h.AutoUpdates, m["autoupd"] == "1", "automatic security updates are enabled", "automatic security updates are not enabled")
+	feature("tailscale", h.Tailscale, m["tailscale_up"] == "1", "tailscale is up", "tailscale is not up")
 	return res, nil
 }

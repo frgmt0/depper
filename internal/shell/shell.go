@@ -58,22 +58,25 @@ func Prelude() []string {
 
 // SessionEnv returns lines that export XDG_RUNTIME_DIR and
 // DBUS_SESSION_BUS_ADDRESS for systemctl --user and rootless podman. A
-// non-interactive SSH session may lack them, and the login may carry
-// another user's XDG directories: pam_env applies /etc/environment, which
-// on some images (the GitHub runner's, for one) names the image user's
-// /run/user/UID and ~/.config. podman refuses a runtime directory it does
-// not own and cannot read another user's configuration. Unless the
-// inherited runtime directory exists and is owned by the current user, both
-// variables are set to /run/user/$(id -u). XDG_CONFIG_HOME, XDG_DATA_HOME,
-// XDG_CACHE_HOME and XDG_STATE_HOME are kept only when they name a
-// directory the current user owns, or a missing one in a directory it owns;
-// otherwise they are unset, so the defaults under $HOME apply.
+// non-interactive SSH session may lack them, and the login (or the systemd
+// user manager, whose environment every unit inherits) may carry another
+// user's XDG directories: pam_env applies /etc/environment, which on some
+// images (the GitHub runner's, for one) names the image user's /run/user/UID
+// and ~/.config. podman refuses a runtime directory it does not own, so
+// unless the inherited XDG_RUNTIME_DIR exists and is owned by the current
+// user (test -O), both variables are set to /run/user/$(id -u).
+// XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_CACHE_HOME and XDG_STATE_HOME only
+// need to be usable, not owned: each is kept when it names a directory the
+// current user can write to, or a missing one whose parent the user can
+// write to; otherwise it is unset, so the defaults under $HOME apply. The
+// lines work with and without set -u and leave no helper variables behind.
 func SessionEnv() []string {
 	return []string{
 		`if test -z "${XDG_RUNTIME_DIR:-}" || ! test -d "$XDG_RUNTIME_DIR" || ! test -O "$XDG_RUNTIME_DIR"; then XDG_RUNTIME_DIR="/run/user/$(id -u)"; DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; fi`,
 		`export XDG_RUNTIME_DIR`,
 		`export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"`,
-		`for depper_xdg in XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME; do eval "depper_dir=\${$depper_xdg:-}"; if test -n "$depper_dir" && ! test -O "$depper_dir" && ! { ! test -e "$depper_dir" && test -O "$(dirname -- "$depper_dir")"; }; then unset "$depper_xdg"; fi; done`,
+		`for depper_xdg in XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME; do eval "depper_dir=\${$depper_xdg:-}"; if test -n "$depper_dir" && ! { test -d "$depper_dir" && test -w "$depper_dir"; } && ! { ! test -e "$depper_dir" && test -w "$(dirname -- "$depper_dir")"; }; then unset "$depper_xdg"; fi; done`,
+		`unset depper_xdg depper_dir`,
 	}
 }
 

@@ -3,8 +3,10 @@ package shell
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -198,26 +200,100 @@ func TestSessionEnvReplacesForeignRuntimeDir(t *testing.T) {
 	}
 }
 
-// XDG base directories that belong to someone else, or cannot be created by
-// the user, are dropped; the user's own, and missing ones in a directory
-// the user owns, are kept.
-func TestSessionEnvDropsForeignBaseDirs(t *testing.T) {
-	sh, err := exec.LookPath("sh")
-	if err != nil {
-		t.Skip("sh not available")
+// posixShells returns /bin/sh and, when installed, dash: SessionEnv must run
+// under both (dash is /bin/sh on Debian and Ubuntu hosts).
+func posixShells(t *testing.T) []string {
+	t.Helper()
+	var shells []string
+	if _, err := os.Stat("/bin/sh"); err == nil {
+		shells = append(shells, "/bin/sh")
 	}
+	if dash, err := exec.LookPath("dash"); err == nil {
+		shells = append(shells, dash)
+	}
+	if len(shells) == 0 {
+		t.Skip("no POSIX shell available")
+	}
+	return shells
+}
+
+// writableForeignDir returns a directory the test user can write to but does
+// not own (the sticky, world-writable /tmp), or skips.
+func writableForeignDir(t *testing.T) string {
+	t.Helper()
+	for _, dir := range []string{"/tmp", "/var/tmp", "/dev/shm"} {
+		real, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(real)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || int(st.Uid) == os.Geteuid() {
+			continue
+		}
+		if syscall.Access(real, 2) != nil { // W_OK
+			continue
+		}
+		return real
+	}
+	t.Skip("no writable directory owned by another user")
+	return ""
+}
+
+// XDG base directories only need to be usable: a writable directory is kept
+// even when another user owns it, as is a missing one whose parent is
+// writable. Unwritable directories, missing ones in an unwritable or missing
+// parent, and paths that are not directories are dropped, so the defaults
+// under $HOME apply. No helper variables are left behind.
+func TestSessionEnvDropsForeignBaseDirs(t *testing.T) {
 	if os.Geteuid() == 0 {
-		t.Skip("root owns every directory used here")
+		t.Skip("root can write to every directory used here")
 	}
 	own := t.TempDir()
-	cmd := exec.Command(sh, "-s")
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "XDG_CONFIG_HOME=/", "XDG_DATA_HOME=" + own, "XDG_CACHE_HOME=" + own + "/new", "XDG_STATE_HOME=/nonexistent-depper-test/state"}
-	cmd.Stdin = strings.NewReader(Script(append(Prelude(), `sh -c 'printf "%s|%s|%s|%s\n" "${XDG_CONFIG_HOME-unset}" "${XDG_DATA_HOME-unset}" "${XDG_CACHE_HOME-unset}" "${XDG_STATE_HOME-unset}"'`)...))
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("%v %s", err, out)
+	file := filepath.Join(own, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if want := "unset|" + own + "|" + own + "/new|unset\n"; string(out) != want {
-		t.Errorf("got %q, want %q", out, want)
+	foreign := writableForeignDir(t)
+	missingInForeign := filepath.Join(foreign, "depper-test-missing-"+strconv.Itoa(os.Getpid()))
+	for _, sh := range posixShells(t) {
+		for _, tt := range []struct {
+			name, value string
+			keep        bool
+		}{
+			{"unwritable", "/", false},
+			{"own", own, true},
+			{"missing in own", own + "/new", true},
+			{"missing in unwritable", "/depper-test-missing", false},
+			{"missing parent", "/nonexistent-depper-test/state", false},
+			{"writable, not owned", foreign, true},
+			{"missing in writable, not owned", missingInForeign, true},
+			{"regular file", file, false},
+		} {
+			for _, strict := range []string{"set -eu", "set -e"} {
+				lines := append([]string{strict}, SessionEnv()...)
+				lines = append(lines, `printf '%s|%s|%s|%s|%s|%s\n' "${XDG_CONFIG_HOME-unset}" "${XDG_DATA_HOME-unset}" "${XDG_CACHE_HOME-unset}" "${XDG_STATE_HOME-unset}" "${depper_xdg-gone}" "${depper_dir-gone}"`)
+				cmd := exec.Command(sh, "-s")
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+				for _, key := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"} {
+					cmd.Env = append(cmd.Env, key+"="+tt.value)
+				}
+				cmd.Stdin = strings.NewReader(Script(lines...))
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("%s %s (%s): %v %s", sh, tt.name, strict, err, out)
+				}
+				want := "unset"
+				if tt.keep {
+					want = tt.value
+				}
+				if w := strings.Repeat(want+"|", 4) + "gone|gone\n"; string(out) != w {
+					t.Errorf("%s %s (%s): got %q, want %q", sh, tt.name, strict, out, w)
+				}
+			}
+		}
 	}
 }

@@ -108,7 +108,21 @@ func Script(cfg *config.Config) string {
 		`printf 'disk_kb=%s\n' "$(df -Pk "$d" 2>/dev/null | awk 'NR==2 { print $4 }')"`,
 	)
 	if c := cfg.Container; c != nil {
-		lines = append(lines, `printf 'engine=%s\n' "$(command -v `+shell.Quote(c.Engine)+` 2>/dev/null || true)"`)
+		engineName := shell.Quote(c.Engine)
+		lines = append(lines, `printf 'engine=%s\n' "$(command -v `+engineName+` 2>/dev/null || true)"`)
+		if c.Mode() == config.ModeCompose {
+			// Only with the engine present (otherwise the container engine
+			// check already fails). The first meaningful output line: podman
+			// announces its external compose provider on stderr first, and
+			// PODMAN_COMPOSE_WARNING_LOGS=false asks it not to.
+			lines = append(lines,
+				`if command -v `+engineName+` >/dev/null 2>&1; then`,
+				`  if compose_out=$(PODMAN_COMPOSE_WARNING_LOGS=false `+engineName+` compose version 2>&1 </dev/null); then compose_rc=0; else compose_rc=$?; fi`,
+				`  printf 'compose_rc=%s\n' "$compose_rc"`,
+				`  printf 'compose_out=%s\n' "$(printf '%s\n' "$compose_out" | sed -e '/^>>>> /d' -e '/^[[:space:]]*$/d' | head -n 1 | cut -c 1-`+strconv.Itoa(maxComposeLine)+`)"`,
+				`fi`,
+			)
+		}
 	}
 	if cfg.Tunnel != nil {
 		lines = append(lines, `printf 'cloudflared=%s\n' "$(command -v cloudflared 2>/dev/null || true)"`)
@@ -212,6 +226,10 @@ func (d *Doctor) evaluate(f map[string]string) []Check {
 	if c := d.Config.Container; c != nil {
 		if path := clean(f["engine"]); path != "" {
 			add("container engine", Pass, path)
+			if c.Mode() == config.ModeCompose {
+				status, detail := composeCheck(c.Engine, f)
+				add("compose", status, detail)
+			}
 		} else {
 			add("container engine", Fail, c.Engine+" is not installed on the deploy host (required by [container])")
 		}
@@ -240,6 +258,37 @@ func (d *Doctor) evaluate(f map[string]string) []Check {
 		add("layout", Pass, "no deployment yet; the first deploy creates "+clean(f["base"]))
 	}
 	return checks
+}
+
+// maxComposeLine bounds the `compose version` line doctor reports.
+const maxComposeLine = 200
+
+// composeCheck evaluates `<engine> compose version`, which doctor runs for a
+// compose-mode [container] when the engine is installed.
+func composeCheck(engineName string, f map[string]string) (Status, string) {
+	msg := truncate(clean(f["compose_out"]), maxComposeLine)
+	if f["compose_rc"] == "0" {
+		if msg == "" {
+			msg = "`" + engineName + " compose version` succeeded"
+		}
+		return Pass, msg
+	}
+	if msg == "" {
+		if rc := clean(f["compose_rc"]); rc != "" {
+			msg = "exit status " + rc
+		} else {
+			msg = "no result from the deploy host"
+		}
+	}
+	return Fail, "`" + engineName + " compose version` failed: " + msg + " (install a compose provider: podman-compose for podman, the docker compose plugin for docker; `depper host init` installs one)"
+}
+
+// truncate shortens s to at most n runes.
+func truncate(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n])
+	}
+	return s
 }
 
 func (d *Doctor) lockStatus(f map[string]string) Check {

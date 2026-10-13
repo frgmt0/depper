@@ -15,7 +15,7 @@ import (
 )
 
 func TestEditConfigText(t *testing.T) {
-	vals := []configValue{{"host", `"203.0.113.7"`}, {"user", `"deploy"`}, {"known_hosts", `".depper/known_hosts"`}}
+	vals := []configValue{{key: "host", value: `"203.0.113.7"`}, {key: "user", value: `"deploy"`}, {key: "known_hosts", value: `".depper/known_hosts"`}}
 	tests := []struct {
 		name, table, in, want string
 		changed               []bool
@@ -85,7 +85,7 @@ func TestEditConfigText(t *testing.T) {
 }
 
 func TestConfigChangeShowsOldAndNew(t *testing.T) {
-	_, changes, err := editConfigText("[deploy]\nhost = \"deploy@203.0.113.10\"\n", "deploy", []configValue{{"host", `"1.2.3.4"`}, {"user", `"deploy"`}})
+	_, changes, err := editConfigText("[deploy]\nhost = \"deploy@203.0.113.10\"\n", "deploy", []configValue{{key: "host", value: `"1.2.3.4"`}, {key: "user", value: `"deploy"`}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +355,7 @@ func TestScriptsAreQuoted(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkScriptSyntax(t, []string{script})
-	if !strings.Contains(script, "depper_asroot <<'"+rootHeredoc+"'") || !strings.Contains(script, "sudo -n sh -s") {
+	if !strings.Contains(script, "depper_asroot \"$depper_iface\" <<'"+rootHeredoc+"'") || !strings.Contains(script, "sudo -n sh -s -- \"$@\"") {
 		t.Error("root wrapper missing")
 	}
 	if _, err := r.asRoot([]string{"echo hi", rootHeredoc}); err == nil {

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/frgmt0/depper/internal/config"
 )
@@ -169,7 +170,7 @@ func TestInitDebianFullSetup(t *testing.T) {
 	}
 
 	// sshd hardening: validated, then reloaded once; root key login kept.
-	if got := h.read("fs/etc/ssh/sshd_config.d/10-depper.conf"); got != dropInContent || !strings.Contains(got, "PermitRootLogin prohibit-password") {
+	if got := h.read("fs/etc/ssh/sshd_config.d/10-depper.conf"); got != dropInContent(true) || !strings.Contains(got, "PermitRootLogin prohibit-password") {
 		t.Errorf("drop-in = %q", got)
 	}
 	if got := h.read("events"); got != "sshd-t\nreload\n" {
@@ -192,8 +193,11 @@ func TestInitDebianFullSetup(t *testing.T) {
 			t.Errorf("record steps %v lack %s", rec.Steps, step)
 		}
 	}
-	if contains(rec.Steps, StepKnownHosts) || contains(rec.Steps, StepConfig) {
-		t.Errorf("record lists local steps: %v", rec.Steps)
+	// The local steps are recorded too.
+	for _, step := range []string{StepKnownHosts, StepConfig, StepRecord} {
+		if !contains(rec.Steps, step) {
+			t.Errorf("record steps %v lack %s", rec.Steps, step)
+		}
 	}
 	if strings.Join(rec.Packages, " ") != "cloudflared curl podman rsync slirp4netns tailscale ufw uidmap unattended-upgrades" {
 		t.Errorf("record packages = %v", rec.Packages)
@@ -335,7 +339,7 @@ func TestInitFedora(t *testing.T) {
 	}
 	// Ports, including the SSH port, are added offline before firewalld
 	// starts.
-	if got := h.read("firewalld.log"); !strings.Contains(got, "firewall-offline-cmd --add-port=22/tcp\nfirewall-offline-cmd --add-port=8080/tcp") {
+	if got := h.read("firewalld.log"); !strings.Contains(got, "firewall-offline-cmd --zone=public --add-port=22/tcp\nfirewall-offline-cmd --zone=public --add-port=8080/tcp") {
 		t.Errorf("firewalld.log:\n%s", got)
 	}
 	if strings.Index(changes, "firewalld.service") < 0 {
@@ -773,7 +777,7 @@ func TestHardenSSHOverridesCloudInitDropIn(t *testing.T) {
 	if !contains(res.Applied, StepHardenSSH) {
 		t.Fatalf("applied = %v", res.Applied)
 	}
-	if got := h.read("fs/etc/ssh/sshd_config.d/10-depper.conf"); got != dropInContent {
+	if got := h.read("fs/etc/ssh/sshd_config.d/10-depper.conf"); got != dropInContent(true) {
 		t.Errorf("drop-in = %q", got)
 	}
 	if !h.has("fs/etc/ssh/sshd_config.d/50-cloud-init.conf") {
@@ -848,7 +852,7 @@ func TestHardenSSHRollsBackWhenLoginFailsAfterReload(t *testing.T) {
 	o.HardenSSH = true
 	h.write("deny-deploy-after-reload", "", 0o644)
 	_, err := h.runner().Init(context.Background(), o)
-	if err == nil || !strings.Contains(err.Error(), "failed after reload") || !strings.Contains(err.Error(), "reloaded sshd again") {
+	if err == nil || !strings.Contains(err.Error(), "a new login as deploy failed") || !strings.Contains(err.Error(), "after reloading sshd") || !strings.Contains(err.Error(), "rolled back the change and disarmed depper-ssh-revert.timer") {
 		t.Fatalf("err = %v", err)
 	}
 	if h.has("fs/etc/ssh/sshd_config.d/10-depper.conf") {
@@ -857,16 +861,57 @@ func TestHardenSSHRollsBackWhenLoginFailsAfterReload(t *testing.T) {
 	if got := strings.Count(h.read("sshd-reloads"), "reload"); got != 2 {
 		t.Errorf("reloads = %d, want 2 (apply + rollback)", got)
 	}
+	if h.has("units/depper-ssh-revert.timer.active") {
+		t.Error("the revert timer is still armed after the immediate rollback")
+	}
 }
 
-func TestHardenSSHRollsBackWhenAdminLoginFailsAfterReload(t *testing.T) {
+// The admin cannot log in after the reload, so the immediate rollback over
+// a new admin connection fails too: the timer armed on the host before the
+// drop-in was written undoes it on its own, and host init says so.
+func TestHardenSSHRevertTimerFiresWhenAdminLoginFails(t *testing.T) {
 	t.Parallel()
 	h := newFakeHost(t, debian12)
 	o := h.options()
 	o.HardenSSH = true
 	h.write("deny-admin-after-reload", "", 0o644)
-	_, err := h.runner().Init(context.Background(), o)
-	if err == nil || !strings.Contains(err.Error(), "as root failed after reload") {
-		t.Fatalf("err = %v", err)
+	r := h.runner()
+	r.revertDelay, r.revertGrace = time.Second, 2*time.Second
+	_, err := r.Init(context.Background(), o)
+	if err == nil {
+		t.Fatal("hardening succeeded although the admin cannot log in")
+	}
+	for _, want := range []string{
+		"--harden-ssh: a new login as root failed",
+		"after reloading sshd",
+		"the immediate rollback failed",
+		"so depper-ssh-revert.timer on the host undid the change at",
+		"a new root login works again",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error lacks %q: %v", want, err)
+		}
+	}
+	if h.has("fs/etc/ssh/sshd_config.d/10-depper.conf") {
+		t.Error("the revert timer did not remove the drop-in")
+	}
+	if got := h.read("timer-events"); !strings.Contains(got, "armed depper-ssh-revert\n") || !strings.Contains(got, "fired depper-ssh-revert\n") || !strings.Contains(got, "done depper-ssh-revert\n") {
+		t.Errorf("timer events = %q", got)
+	}
+	// The timer reloaded sshd after removing the drop-in.
+	if got := strings.Count(h.read("sshd-reloads"), "reload"); got != 2 {
+		t.Errorf("reloads = %d, want 2 (apply + timer)", got)
+	}
+	if !strings.Contains(h.Out.String(), "waiting for depper-ssh-revert.timer") {
+		t.Errorf("output does not explain the wait:\n%s", h.Out.String())
+	}
+	if rec := readRecord(t, h); rec.Hardening.SSH || contains(rec.Steps, StepHardenSSH) {
+		t.Errorf("record claims hardening: %+v", rec)
+	}
+	// The timer is armed before the drop-in is written, so an interrupted
+	// run is undone as well.
+	logs := h.read("systemd-run.log")
+	if !strings.Contains(logs, "--unit=depper-ssh-revert --on-active=1s /bin/sh -c") || !strings.Contains(logs, "10-depper.conf") {
+		t.Errorf("systemd-run.log = %q", logs)
 	}
 }

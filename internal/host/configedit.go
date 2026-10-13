@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,6 +36,9 @@ func (c ConfigChange) String() string {
 type configValue struct {
 	key   string
 	value string
+	// ifPresent writes the value only when the key is already in the
+	// table (port 22 replaces an existing port, but is not added).
+	ifPresent bool
 }
 
 // configEdit is a planned minimal text edit of the configuration file.
@@ -49,6 +53,17 @@ type configEdit struct {
 
 // Changed reports whether the edit changes the file.
 func (e *configEdit) Changed() bool { return e.Original != e.Edited }
+
+// describe lists the changed keys.
+func (e *configEdit) describe() string {
+	var parts []string
+	for _, c := range e.Changes {
+		if c.Changed {
+			parts = append(parts, c.String())
+		}
+	}
+	return strings.Join(parts, "; ")
+}
 
 var (
 	headerRe   = regexp.MustCompile(`^\s*\[\s*([^\[\]]+?)\s*\]\s*(#.*)?$`)
@@ -74,6 +89,87 @@ func normalizeTable(h string) string {
 		parts[i] = p
 	}
 	return strings.Join(parts, ".")
+}
+
+// tomlScanner follows the lexical state of a TOML document line by line:
+// whether a multi-line string (""" or ”') or a multi-line array or inline
+// table is open. Delimiters inside basic and literal strings and comments
+// do not count.
+type tomlScanner struct {
+	// ml is the open multi-line string delimiter ("" when none).
+	ml string
+	// depth is the number of open [ and { in values.
+	depth int
+}
+
+// topLevel reports whether the next line starts outside any value, where
+// headers and keys are recognised.
+func (s *tomlScanner) topLevel() bool { return s.ml == "" && s.depth == 0 }
+
+// scan advances the state over one line (without its newline). header is
+// true for a table header line, whose brackets are not value brackets.
+func (s *tomlScanner) scan(line string, header bool) {
+	i := 0
+	for i < len(line) {
+		c := line[i]
+		switch {
+		case s.ml == `"""`:
+			switch {
+			case c == '\\':
+				i += 2
+			case strings.HasPrefix(line[i:], `"""`):
+				i += 3
+				// Up to two more quotes belong to the content.
+				for n := 0; n < 2 && i < len(line) && line[i] == '"'; n++ {
+					i++
+				}
+				s.ml = ""
+			default:
+				i++
+			}
+		case s.ml == `'''`:
+			if strings.HasPrefix(line[i:], `'''`) {
+				i += 3
+				for n := 0; n < 2 && i < len(line) && line[i] == '\''; n++ {
+					i++
+				}
+				s.ml = ""
+			} else {
+				i++
+			}
+		case c == '#':
+			return
+		case strings.HasPrefix(line[i:], `"""`):
+			s.ml, i = `"""`, i+3
+		case strings.HasPrefix(line[i:], `'''`):
+			s.ml, i = `'''`, i+3
+		case c == '"':
+			i++
+			for i < len(line) && line[i] != '"' {
+				if line[i] == '\\' {
+					i++
+				}
+				i++
+			}
+			i++
+		case c == '\'':
+			if j := strings.IndexByte(line[i+1:], '\''); j >= 0 {
+				i += j + 2
+			} else {
+				i = len(line)
+			}
+		case (c == '[' || c == '{') && !header:
+			s.depth++
+			i++
+		case (c == ']' || c == '}') && !header:
+			if s.depth > 0 {
+				s.depth--
+			}
+			i++
+		default:
+			i++
+		}
+	}
 }
 
 // splitValue separates a single-line TOML value from a trailing comment.
@@ -142,20 +238,20 @@ func editConfigText(text, table string, values []configValue) (string, []ConfigC
 	current := ""
 	headerAt := -1
 	found := map[string]int{}
-	inMulti := ""
+	var sc tomlScanner
 	for i, raw := range lines {
 		line := strings.TrimRight(raw, "\r\n")
-		if inMulti != "" {
-			if strings.Count(line, inMulti)%2 == 1 {
-				inMulti = ""
-			}
+		if !sc.topLevel() {
+			sc.scan(line, false)
 			continue
 		}
+		trimmed := strings.TrimSpace(line)
 		if arrayHdrRe.MatchString(line) {
 			current = "\x00array"
+			sc.scan(line, true)
 			continue
 		}
-		if m := headerRe.FindStringSubmatch(line); m != nil && !strings.HasPrefix(strings.TrimSpace(line), "#") {
+		if m := headerRe.FindStringSubmatch(line); m != nil && !strings.HasPrefix(trimmed, "#") {
 			current = normalizeTable(m[1])
 			if current == table {
 				if headerAt >= 0 {
@@ -163,19 +259,21 @@ func editConfigText(text, table string, values []configValue) (string, []ConfigC
 				}
 				headerAt = i
 			}
+			sc.scan(line, true)
 			continue
 		}
-		for _, delim := range []string{`"""`, `'''`} {
-			if strings.Count(line, delim)%2 == 1 {
-				inMulti = delim
+		if current == table {
+			if m := keyLineRe.FindStringSubmatch(line); m != nil && m[2] == m[4] {
+				if _, dup := found[m[3]]; dup {
+					return "", nil, fmt.Errorf("[%s].%s appears more than once", table, m[3])
+				}
+				found[m[3]] = i
 			}
 		}
-		if current != table {
-			continue
-		}
-		if m := keyLineRe.FindStringSubmatch(line); m != nil && m[2] == m[4] {
-			found[m[3]] = i
-		}
+		sc.scan(line, false)
+	}
+	if sc.ml != "" {
+		return "", nil, fmt.Errorf("a multi-line string is not closed")
 	}
 	if headerAt < 0 && table == "deploy" {
 		return "", nil, fmt.Errorf("could not find a [deploy] table header to edit; add host, user and known_hosts to [deploy] by hand")
@@ -203,6 +301,9 @@ func editConfigText(text, table string, values []configValue) (string, []ConfigC
 				lines[i] = newLine + eol
 			}
 		} else {
+			if v.ifPresent {
+				continue
+			}
 			ch.Changed = true
 			inserts = append(inserts, v.key+" = "+v.value+"\n")
 		}
@@ -226,16 +327,16 @@ func editConfigText(text, table string, values []configValue) (string, []ConfigC
 	return strings.Join(lines, ""), changes, nil
 }
 
-// connectionValues are the keys host init writes.
-func connectionValues(o *Options, repo, identity string) []configValue {
-	values := []configValue{{"host", tomlString(o.Host)}, {"user", tomlString(o.User)}}
-	if o.Port != 22 {
-		values = append(values, configValue{"port", fmt.Sprint(o.Port)})
-	}
+// connectionValues are the keys host init writes. identity is the private
+// key file to record ("" to leave identity_file alone); forcePort writes the
+// port even when it is 22 and absent.
+func connectionValues(o *Options, repo, identity string, forcePort bool) []configValue {
+	values := []configValue{{key: "host", value: tomlString(o.Host)}, {key: "user", value: tomlString(o.User)}}
+	values = append(values, configValue{key: "port", value: fmt.Sprint(o.Port), ifPresent: o.Port == 22 && !forcePort})
 	if identity != "" {
-		values = append(values, configValue{"identity_file", tomlString(displayPath(identity, ""))})
+		values = append(values, configValue{key: "identity_file", value: tomlString(displayPath(identity, ""))})
 	}
-	values = append(values, configValue{"known_hosts", tomlString(displayPath(o.KnownHosts, repo))})
+	values = append(values, configValue{key: "known_hosts", value: tomlString(displayPath(o.KnownHosts, repo))})
 	return values
 }
 
@@ -255,9 +356,125 @@ func displayPath(path, repo string) string {
 	return path
 }
 
-// planConfig reads the configuration file of repo and prepares the edit.
-// It refuses when there is no configuration file.
-func planConfig(repo, target string, o *Options, identity string, lookup func(string) (string, bool)) (*configEdit, *config.Config, error) {
+// connection is the resolved SSH connection of a configuration.
+type connection struct {
+	Host, User, IdentityFile, KnownHosts string
+	Port                                 int
+}
+
+func connectionOf(cfg *config.Config) connection {
+	port := cfg.Deploy.Port
+	if port == 0 {
+		port = 22
+	}
+	return connection{Host: cfg.Deploy.Host, User: cfg.Deploy.User, Port: port, IdentityFile: cleanPath(cfg.Deploy.IdentityFile), KnownHosts: cleanPath(cfg.Deploy.KnownHosts)}
+}
+
+func cleanPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	return filepath.Clean(p)
+}
+
+// diff lists the fields of c that differ from want.
+func (c connection) diff(want connection) []string {
+	var out []string
+	add := func(field string, got, w any) {
+		if !reflect.DeepEqual(got, w) {
+			out = append(out, fmt.Sprintf("%s = %q (want %q)", field, fmt.Sprint(got), fmt.Sprint(w)))
+		}
+	}
+	add("host", c.Host, want.Host)
+	add("user", c.User, want.User)
+	add("port", c.Port, want.Port)
+	add("identity_file", c.IdentityFile, want.IdentityFile)
+	add("known_hosts", c.KnownHosts, want.KnownHosts)
+	return out
+}
+
+// tableHasKey reports whether the raw TOML document sets key in table
+// ("deploy" or "targets.NAME").
+func tableHasKey(doc map[string]any, table, key string) bool {
+	t := rawTable(doc, table)
+	_, ok := t[key]
+	return ok
+}
+
+func rawTable(doc map[string]any, table string) map[string]any {
+	cur := doc
+	for _, part := range strings.Split(table, ".") {
+		next, ok := cur[part].(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur = next
+	}
+	return cur
+}
+
+// withoutKeys returns a deep copy of doc without keys in table; the table
+// (and an emptied "targets") is dropped when nothing else is left in it.
+func withoutKeys(doc map[string]any, table string, keys []string) map[string]any {
+	out := deepCopy(doc).(map[string]any)
+	parts := strings.Split(table, ".")
+	parents := []map[string]any{out}
+	cur := out
+	for _, part := range parts {
+		next, ok := cur[part].(map[string]any)
+		if !ok {
+			return out
+		}
+		parents = append(parents, next)
+		cur = next
+	}
+	for _, k := range keys {
+		delete(cur, k)
+	}
+	for i := len(parts) - 1; i >= 0; i-- {
+		child := parents[i+1]
+		if len(child) != 0 {
+			break
+		}
+		delete(parents[i], parts[i])
+	}
+	return out
+}
+
+func deepCopy(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		m := make(map[string]any, len(x))
+		for k, e := range x {
+			m[k] = deepCopy(e)
+		}
+		return m
+	case []any:
+		s := make([]any, len(x))
+		for i, e := range x {
+			s[i] = deepCopy(e)
+		}
+		return s
+	case []map[string]any:
+		s := make([]map[string]any, len(x))
+		for i, e := range x {
+			s[i] = deepCopy(e).(map[string]any)
+		}
+		return s
+	}
+	return v
+}
+
+// planConfig reads the configuration file of repo and prepares the edit of
+// table [deploy] (target "") or [targets.NAME]. It refuses when there is no
+// configuration file, and whenever the edited file would not resolve to
+// exactly the intended connection or would change anything else: the other
+// tables, and the connection of every other target.
+//
+// deployIdentity is the private key of the authorized public key ("" when
+// it is not on disk). It is written as identity_file with --key, or when
+// the table (or an inherited [deploy]) already names a different key.
+func planConfig(repo, target string, o *Options, deployIdentity string, lookup func(string) (string, bool)) (*configEdit, *config.Config, error) {
 	file, err := config.FindFile(repo)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%v; run `depper init` first, then `depper host init` again", err)
@@ -271,46 +488,147 @@ func planConfig(repo, target string, o *Options, identity string, lookup func(st
 		return nil, nil, fmt.Errorf("cannot read %s: %w", file, err)
 	}
 	original := string(data)
+	base := filepath.Base(file)
 	before, err := config.Parse(repo, file, original)
 	if err != nil {
-		return nil, nil, fmt.Errorf("fix %s before running host init: %w", filepath.Base(file), err)
+		return nil, nil, fmt.Errorf("fix %s before running host init: %w", base, err)
+	}
+	var rawBefore map[string]any
+	if _, err := toml.Decode(original, &rawBefore); err != nil {
+		return nil, nil, fmt.Errorf("fix %s before running host init: %w", base, err)
 	}
 	table := "deploy"
 	if target != "" {
 		table = "targets." + target
 	}
-	edited, changes, err := editConfigText(original, table, connectionValues(o, repo, identity))
-	if err != nil {
-		return nil, nil, fmt.Errorf("cannot edit %s: %w", filepath.Base(file), err)
+
+	// The intended connection.
+	want := connection{Host: o.Host, User: o.User, Port: o.Port, KnownHosts: cleanPath(o.KnownHosts)}
+	identity := ""
+	if o.KeyExplicit {
+		identity = deployIdentity
 	}
-	after, err := config.Parse(repo, file, edited)
-	if err != nil {
-		return nil, nil, fmt.Errorf("editing %s would make it invalid (%v); set the connection by hand", filepath.Base(file), err)
+	if identity == "" && tableHasKey(rawBefore, table, "identity_file") {
+		if deployIdentity == "" {
+			return nil, nil, fmt.Errorf("[%s] sets identity_file, but the private key of %s (the key host init authorizes) is not on this machine, so the configured key would not match the authorized one; pass --key with the public key of the private key you deploy with", table, displayPath(o.KeyFile, ""))
+		}
+		identity = deployIdentity
 	}
-	cfg, err := after.ResolveWithEnv(target, lookup)
-	if err != nil {
-		return nil, nil, fmt.Errorf("the edited %s does not resolve: %w", filepath.Base(file), err)
-	}
-	// Other targets that resolved before must still resolve.
-	for _, name := range before.TargetNames() {
-		if name == target {
-			continue
+	want.IdentityFile = cleanPath(identity)
+
+	forcePort := false
+	var edited string
+	var changes []ConfigChange
+	var cfg *config.Config
+	for attempt := 0; ; attempt++ {
+		edited, changes, err = editConfigText(original, table, connectionValues(o, repo, identity, forcePort))
+		if err != nil {
+			return nil, nil, fmt.Errorf("cannot edit %s: %w", base, err)
 		}
-		if _, err := before.ResolveWithEnv(name, lookup); err != nil {
-			continue
+		after, err := config.Parse(repo, file, edited)
+		if err != nil {
+			return nil, nil, fmt.Errorf("editing %s would make it invalid (%v); set the connection by hand", base, err)
 		}
-		if _, err := after.ResolveWithEnv(name, lookup); err != nil {
-			return nil, nil, fmt.Errorf("editing %s would break target %q (%v); set the connection by hand", filepath.Base(file), name, err)
+		cfg, err = after.ResolveWithEnv(target, lookup)
+		if err != nil {
+			return nil, nil, fmt.Errorf("the edited %s does not resolve: %w", base, err)
 		}
+		got := connectionOf(cfg)
+		if attempt == 0 {
+			// A value inherited from [deploy] that differs is overridden in
+			// the target table.
+			retry := false
+			if got.Port != want.Port && !forcePort {
+				forcePort, retry = true, true
+			}
+			if got.IdentityFile != want.IdentityFile && identity == "" && deployIdentity != "" {
+				identity, want.IdentityFile, retry = deployIdentity, cleanPath(deployIdentity), true
+			}
+			if retry {
+				continue
+			}
+		}
+		if d := got.diff(want); len(d) > 0 {
+			hint := "an environment override (DEPPER_*) or a value inherited from [deploy]?"
+			if got.IdentityFile != want.IdentityFile && deployIdentity == "" {
+				hint = "pass --key with the public key of the private key you deploy with"
+			}
+			return nil, nil, fmt.Errorf("after the edit, %s would resolve [%s] to %s (%s); %s was not changed: set the connection by hand", base, table, strings.Join(d, ", "), hint, base)
+		}
+		// Nothing outside the edited keys may change.
+		var rawAfter map[string]any
+		if _, err := toml.Decode(edited, &rawAfter); err != nil {
+			return nil, nil, fmt.Errorf("editing %s would make it invalid (%v); set the connection by hand", base, err)
+		}
+		var keys []string
+		for _, c := range changes {
+			keys = append(keys, c.Key)
+		}
+		if !reflect.DeepEqual(withoutKeys(rawBefore, table, keys), withoutKeys(rawAfter, table, keys)) {
+			return nil, nil, fmt.Errorf("editing %s would change more than [%s] %s (an internal editor error); %s was not changed: set the connection by hand", base, table, strings.Join(keys, ", "), base)
+		}
+		// Every other target (and [deploy] when a target is edited)
+		// resolves to the same connection as before.
+		others := before.TargetNames()
+		if target != "" {
+			others = append([]string{""}, others...)
+		}
+		for _, name := range others {
+			if name == target || (target == "" && name != "") {
+				continue
+			}
+			b, err := before.ResolveWithEnv(name, lookup)
+			if err != nil {
+				continue
+			}
+			a, err := after.ResolveWithEnv(name, lookup)
+			if err != nil {
+				return nil, nil, fmt.Errorf("editing %s would break %s (%v); set the connection by hand", base, targetLabel(name), err)
+			}
+			if d := connectionOf(a).diff(connectionOf(b)); len(d) > 0 {
+				return nil, nil, fmt.Errorf("editing %s would change the connection of %s (%s); set the connection by hand", base, targetLabel(name), strings.Join(d, ", "))
+			}
+		}
+		// Targets that inherit from an edited [deploy] change with it; they
+		// must still resolve.
+		if target == "" {
+			for _, name := range before.TargetNames() {
+				if _, err := before.ResolveWithEnv(name, lookup); err != nil {
+					continue
+				}
+				if _, err := after.ResolveWithEnv(name, lookup); err != nil {
+					return nil, nil, fmt.Errorf("editing %s would break %s (%v); set the connection by hand", base, targetLabel(name), err)
+				}
+			}
+		}
+		break
 	}
 	return &configEdit{File: file, Mode: info.Mode().Perm(), Original: original, Edited: edited, Table: table, Changes: changes}, cfg, nil
 }
 
-// apply writes the edit atomically, re-validates the file with config.Load
-// and Resolve, and restores the original when validation fails.
+func targetLabel(name string) string {
+	if name == "" {
+		return "[deploy]"
+	}
+	return "target " + fmt.Sprintf("%q", name)
+}
+
+// ErrConfigChanged reports that depper.toml changed while host init ran.
+var ErrConfigChanged = fmt.Errorf("depper.toml changed while host init was running")
+
+// apply writes the edit atomically, after checking that the file still holds
+// what was read, re-validates it with config.LoadTarget, and restores the
+// original when validation fails.
 func (e *configEdit) apply(repo, target string, lookup func(string) (string, bool)) error {
 	if !e.Changed() {
 		return nil
+	}
+	current, err := os.ReadFile(e.File)
+	if err != nil {
+		return fmt.Errorf("cannot re-read %s before writing it: %w", e.File, err)
+	}
+	if !bytes.Equal(current, []byte(e.Original)) {
+		return fmt.Errorf("%s: %w; it was not written. Run host init again (the host is already prepared, so only the configuration is written)", e.File, ErrConfigChanged)
 	}
 	if err := atomicWrite(e.File, []byte(e.Edited), e.Mode); err != nil {
 		return err

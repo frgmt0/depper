@@ -141,7 +141,7 @@ func preparedHostFacts(t *testing.T) string {
 		"motd noise", "@@depper-host-facts", "admin_user=root", "priv=root",
 		"os_ID=debian", `os_VERSION_ID="12"`, "os_VERSION_CODENAME=bookworm", `os_PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"`,
 		"systemd=1", "arch=x86_64", "user_exists=1", "user_uid=1000", "user_home=/home/deploy", "user_shell=/bin/bash", "user_groups=deploy",
-		"ak_key=1", "linger=1", "usermgr=1", "subuid=1", "subgid=1",
+		"ak_key=plain", "linger=1", "usermgr=1", "subuid=1", "subgid=1",
 		"pkg_ca-certificates=1", "cmd_rsync=/usr/bin/rsync", "cmd_curl=/usr/bin/curl", "cmd_sha256sum=/usr/bin/sha256sum", "cmd_runuser=/usr/sbin/runuser",
 		"record=" + base64.StdEncoding.EncodeToString(rec), "root_facts=1",
 	}
@@ -160,6 +160,10 @@ func hostRecorder(t *testing.T, keyBlob string) *transporttest.Recorder {
 			return transport.Result{Stdout: facts}, nil
 		case strings.Contains(c.Stdin, "@@doctor"):
 			return transport.Result{Stdout: doctorOK}, nil
+		case strings.Contains(c.Stdin, "/etc/depper/host.json.depper-tmp"):
+			// The record write (it lists the pinned host key and the
+			// configuration edit).
+			return transport.Result{Stdout: "@@depper-begin record\n@@depper-done record\n"}, nil
 		}
 		t.Errorf("unexpected command %v", c.Args)
 		return transport.Result{}, nil
@@ -172,7 +176,8 @@ func TestHostInitJSONOnPreparedHost(t *testing.T) {
 	app, stdout, stderr := testApp(nil)
 	rec := hostRecorder(t, blob)
 	app.Exec = rec
-	code := Run(context.Background(), app, []string{"--json", "host", "init", "root@203.0.113.7", repo, "--key", key, "--yes"})
+	fp := host.HostKey{Type: "ssh-ed25519", Blob: blob}.Fingerprint()
+	code := Run(context.Background(), app, []string{"--json", "host", "init", "root@203.0.113.7", repo, "--key", key, "--yes", "--host-key-fingerprint", fp})
 	if code != 0 {
 		t.Fatalf("exit %d\n%s", code, stderr.String())
 	}
@@ -259,8 +264,9 @@ func TestHostStatus(t *testing.T) {
 	app.Exec = &transporttest.Recorder{Handler: func(c transporttest.Call) (transport.Result, error) {
 		return transport.Result{Stdout: out}, nil
 	}}
-	// The recorded ssh hardening is missing on the host: status fails.
-	if code := Run(context.Background(), app, []string{"--json", "host", "status", repo}); code != exitcode.Failure {
+	// The recorded ssh hardening cannot be confirmed (no sshd -T as the
+	// deploy user): a warning, not a failure.
+	if code := Run(context.Background(), app, []string{"--json", "host", "status", repo}); code != 0 {
 		t.Fatalf("exit %d", code)
 	}
 	var doc host.StatusResult
@@ -271,7 +277,7 @@ func TestHostStatus(t *testing.T) {
 	for _, c := range doc.Checks {
 		statuses[c.Name] = c.Status
 	}
-	if statuses["ssh hardening"] != host.StatusFail || statuses["linger"] != host.StatusPass || statuses["firewall"] != host.StatusInfo || doc.Record == nil {
+	if statuses["ssh hardening"] != host.StatusWarn || statuses["linger"] != host.StatusPass || statuses["firewall"] != host.StatusInfo || doc.Record == nil {
 		t.Errorf("status = %+v", doc)
 	}
 	calls := app.Exec.(*transporttest.Recorder).Calls()
@@ -284,7 +290,7 @@ func TestHostInitRepoFirstForm(t *testing.T) {
 	repo, key := hostRepo(t, hostTestConfig)
 	app, _, stderr := testApp(nil)
 	app.Exec = hostRecorder(t, randomBlob(t))
-	if code := Run(context.Background(), app, []string{repo, "host", "init", "root@203.0.113.7", "--key", key, "--yes"}); code != 0 {
+	if code := Run(context.Background(), app, []string{repo, "host", "init", "root@203.0.113.7", "--key", key, "--yes", "--trust-on-first-use"}); code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr.String())
 	}
 	if got, _ := os.ReadFile(filepath.Join(repo, "depper.toml")); !strings.Contains(string(got), `host = "203.0.113.7"`) {

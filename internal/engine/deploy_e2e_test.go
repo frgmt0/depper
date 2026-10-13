@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/frgmt0/depper/internal/shell"
 )
 
 const sentinel = "synthetic-secret-not-for-output"
@@ -87,7 +89,7 @@ func TestDeployLifecycle(t *testing.T) {
 	if h.read(rel1+"/setup.txt") != "setup-ran" || h.read(rel1+"/sub/x.txt") != "nested\n" {
 		t.Error("release content or setup output missing")
 	}
-	if h.read(rel1+"/"+StartScriptName) != "#!/bin/sh\nexec python3 app.py --label 'it works'\n" || h.mode(rel1+"/"+StartScriptName) != 0o700 {
+	if h.read(rel1+"/"+StartScriptName) != "#!/bin/sh\n"+strings.Join(shell.SessionEnv(), "\n")+"\nexec python3 app.py --label 'it works'\n" || h.mode(rel1+"/"+StartScriptName) != 0o700 {
 		t.Errorf("start script wrong (mode %v)", h.mode(rel1+"/"+StartScriptName))
 	}
 	var meta ReleaseMetadata

@@ -36,6 +36,16 @@ const (
 	defaultSPath  = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
+// RevertDelay is how long an armed revert (a transient systemd timer on the
+// host) waits before it undoes --harden-ssh or --firewall. host init disarms
+// it once new admin and deploy logins succeed.
+const RevertDelay = 120 * time.Second
+
+// sessionOptions are added to every ssh connection host init opens (admin
+// and deploy, dry run included): nothing from this machine is forwarded to
+// the host.
+var sessionOptions = []string{"ForwardAgent=no", "ForwardX11=no", "ClearAllForwardings=yes"}
+
 // Container engine choices for --container. ContainerAuto (no flag) installs
 // the engine the resolved configuration uses: [container].engine (docker
 // when unset), or nothing without [container].
@@ -50,10 +60,11 @@ var (
 	// deployUserRe is the rule for the deploy account name.
 	deployUserRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 	// adminUserRe matches the SSH login name of the administrator.
-	adminUserRe  = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}$`)
-	hostNameRe   = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$`)
-	envNameRe    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	targetNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`)
+	adminUserRe   = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}$`)
+	hostNameRe    = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$`)
+	envNameRe     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	targetNameRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$`)
+	fingerprintRe = regexp.MustCompile(`^SHA256:[A-Za-z0-9+/]{43}$`)
 )
 
 // Secret holds a value that must never be printed. Its String and Format
@@ -106,7 +117,16 @@ type Options struct {
 	// Target is the [targets.<name>] table to write ("" for [deploy]).
 	Target string
 	// KnownHosts is the absolute known_hosts path.
-	KnownHosts  string
+	KnownHosts string
+	// HostKeyFingerprints are "SHA256:..." fingerprints the scanned host
+	// keys are checked against (--host-key-fingerprint); only matching
+	// keys are pinned.
+	HostKeyFingerprints []string
+	// TrustOnFirstUse allows --yes to pin unverified host keys.
+	TrustOnFirstUse bool
+	// Compose is set by Init when the configuration uses
+	// [container].compose, so a compose provider is installed.
+	Compose     bool
 	WriteConfig bool
 	DryRun      bool
 	Yes         bool
@@ -140,6 +160,11 @@ type Runner struct {
 	managerWait int
 	// retryDelay separates login attempts after an sshd reload (0: 1s).
 	retryDelay time.Duration
+	// revertDelay is how long an armed revert waits before it undoes a
+	// guarded change (0: RevertDelay); revertGrace is how long host init
+	// waits past it before checking that the revert worked (0: 15s).
+	revertDelay time.Duration
+	revertGrace time.Duration
 }
 
 func (r *Runner) now() time.Time {
@@ -272,6 +297,11 @@ func (o *Options) Validate() error {
 	}
 	if o.KnownHosts == "" {
 		return fmt.Errorf("a known_hosts path is required")
+	}
+	for _, fp := range o.HostKeyFingerprints {
+		if !fingerprintRe.MatchString(fp) {
+			return fmt.Errorf("invalid --host-key-fingerprint %q: use the SHA256:... form `ssh-keygen -lf` prints", clean(fp))
+		}
 	}
 	if o.TailscaleKey.Set() {
 		if err := ValidateTailscaleKey(o.TailscaleKey.value); err != nil {
