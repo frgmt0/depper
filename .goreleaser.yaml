@@ -1,0 +1,29 @@
+# GoReleaser configuration (https://goreleaser.com).
+version: 2
+
+project_name: depper
+
+builds:
+  - id: depper
+    main: ./cmd/depper
+    binary: depper
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X github.com/frgmt0/depper/internal/version.Version={{.Version}}
+
+archives:
+  - id: depper
+    formats: [tar.gz]
+    # Must match ci.ArchiveName, which `depper ci init` downloads.
+    name_template: "depper_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  sort: asc
