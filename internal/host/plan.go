@@ -87,7 +87,7 @@ var codenameRe = regexp.MustCompile(`^[a-z][a-z0-9]{1,31}$`)
 
 // DockerGroupWarning is printed whenever the deploy user joins the docker
 // group.
-const DockerGroupWarning = "membership in the docker group is equivalent to root on this host: anyone who can log in as the deploy user (or run code through a deployed service) can take over the machine. Prefer --container podman (rootless) unless you need docker."
+const DockerGroupWarning = "membership in the docker group is equivalent to root on this host: anyone who can log in as the deploy user (or run code through a deployed service) can take over the machine. Prefer rootless podman (engine = \"podman\" in [container]) unless you need docker."
 
 // sshPorts returns the TCP ports to allow in the firewall: the requested
 // ones plus the SSH port in use.
@@ -152,7 +152,7 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 		case fedoraProper:
 			reqs = append(reqs, pkgReq{"moby-engine", "docker"})
 		default:
-			return nil, &ErrUnsupported{Reason: fmt.Sprintf("%s has no distribution docker package; install docker-ce from Docker's official repository (https://docs.docker.com/engine/install/) yourself, or use --container podman", f.OSID)}
+			return nil, &ErrUnsupported{Reason: fmt.Sprintf("%s has no distribution docker package; install docker-ce from Docker's official repository (https://docs.docker.com/engine/install/) yourself, or use podman (engine = \"podman\" in [container])", f.OSID)}
 		}
 	}
 	if o.Firewall != nil {
@@ -493,7 +493,7 @@ fi`
 		case !f.SSHDInclude:
 			return nil, fmt.Errorf("--harden-ssh: %s does not Include sshd_config.d/*.conf, so a drop-in would be ignored. depper does not edit the main sshd_config; add `Include /etc/ssh/sshd_config.d/*.conf` at its top yourself, or drop --harden-ssh", sshdMain)
 		case len(f.SSHDConflicts) > 0:
-			return nil, fmt.Errorf("--harden-ssh: %s in %s set(s) password, keyboard-interactive or root login to yes and sort(s) before 50-depper.conf, so sshd would ignore depper's settings; change or remove those lines first", strings.Join(f.SSHDConflicts, ", "), sshdDropInD)
+			return nil, fmt.Errorf("--harden-ssh: %s (in /etc/ssh) set(s) password, keyboard-interactive or root login to yes and sshd reads it before %s (it keeps the first value it reads), so sshd would ignore depper's settings; change or remove those lines first", strings.Join(f.SSHDConflicts, ", "), sshDropInName)
 		case !f.SSHDTest:
 			return nil, fmt.Errorf("--harden-ssh: the current sshd configuration does not validate (sshd -T: %s); fix it first", f.SSHDTestOutput)
 		}

@@ -95,17 +95,40 @@ func TestHostInitRequiresConfig(t *testing.T) {
 	}
 }
 
-func TestDefaultContainer(t *testing.T) {
-	for _, tt := range []struct{ extra, want string }{
-		{"", host.ContainerNone},
-		{"\n[container]\nimage = \"nginx\"\n", host.ContainerPodman},
-		{"\n[container]\nengine = \"podman\"\nimage = \"nginx\"\n", host.ContainerPodman},
-		{"\n[container]\nengine = \"docker\"\nimage = \"nginx\"\n", host.ContainerNone},
+// Without --container the choice is left to host.Init, which resolves the
+// configuration (host.ContainerAuto); an explicit value is passed through.
+func TestHostInitContainerFlag(t *testing.T) {
+	repo, key := hostRepo(t, strings.Replace(hostTestConfig, "command = \"./run\"\n", "", 1)+"\n[container]\nengine = \"podman\"\nimage = \"nginx\"\n")
+	for _, tt := range []struct {
+		flags []string
+		want  string
+	}{
+		{nil, host.ContainerAuto},
+		{[]string{"--container", "docker"}, host.ContainerDocker},
+		{[]string{"--container", "none"}, host.ContainerNone},
 	} {
-		repo, _ := hostRepo(t, strings.Replace(hostTestConfig, "command = \"./run\"\n", "", 1)+tt.extra)
-		if got := defaultContainer(repo); got != tt.want {
-			t.Errorf("%q: %s", tt.extra, got)
+		app, _, _ := testApp(nil)
+		cmd := newHostInitCommand(app)
+		if err := cmd.ParseFlags(append([]string{"--key", key}, tt.flags...)); err != nil {
+			t.Fatal(err)
 		}
+		var f hostInitFlags
+		f.key, f.writeConfig = key, true
+		if v, err := cmd.Flags().GetString("container"); err == nil {
+			f.container = v
+		}
+		o, err := hostInitOptions(app, cmd, &f, []string{"root@203.0.113.7", repo})
+		if err != nil {
+			t.Fatalf("%v: %v", tt.flags, err)
+		}
+		if o.Container != tt.want {
+			t.Errorf("%v: container = %q, want %q", tt.flags, o.Container, tt.want)
+		}
+	}
+	app, _, stderr := testApp(nil)
+	setTerminal(t, false)
+	if code := Run(context.Background(), app, []string{"host", "init", "root@203.0.113.7", repo, "--key", key, "--yes", "--container", ""}); code != exitcode.Failure || !strings.Contains(stderr.String(), "--container must be") {
+		t.Errorf("empty --container: exit %d, stderr %q", code, stderr.String())
 	}
 }
 

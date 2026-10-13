@@ -26,15 +26,21 @@ const DefaultUser = "deploy"
 
 // Remote paths depper owns on the host.
 const (
-	RecordPath   = "/etc/depper/host.json"
-	SSHDropIn    = "/etc/ssh/sshd_config.d/50-depper.conf"
-	sshdMain     = "/etc/ssh/sshd_config"
-	sshdDropInD  = "/etc/ssh/sshd_config.d"
-	defaultSPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	RecordPath = "/etc/depper/host.json"
+	// SSHDropIn is read before the drop-ins clouds ship (Ubuntu cloud images
+	// have 50-cloud-init.conf), because sshd keeps the first value it reads.
+	SSHDropIn     = "/etc/ssh/sshd_config.d/" + sshDropInName
+	sshDropInName = "10-depper.conf"
+	sshdMain      = "/etc/ssh/sshd_config"
+	sshdDropInD   = "/etc/ssh/sshd_config.d"
+	defaultSPath  = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
-// Container engine choices for --container.
+// Container engine choices for --container. ContainerAuto (no flag) installs
+// the engine the resolved configuration uses: [container].engine (docker
+// when unset), or nothing without [container].
 const (
+	ContainerAuto   = ""
 	ContainerNone   = "none"
 	ContainerPodman = "podman"
 	ContainerDocker = "docker"
@@ -86,7 +92,8 @@ type Options struct {
 	// identity_file).
 	KeyFile     string
 	KeyExplicit bool
-	// Container is ContainerNone, ContainerPodman or ContainerDocker.
+	// Container is ContainerAuto, ContainerNone, ContainerPodman or
+	// ContainerDocker; Init replaces ContainerAuto with the resolved choice.
 	Container   string
 	Cloudflared bool
 	HardenSSH   bool
@@ -246,7 +253,7 @@ func (o *Options) Validate() error {
 		return fmt.Errorf("the deploy user %q must differ from the admin account", o.User)
 	}
 	switch o.Container {
-	case ContainerNone, ContainerPodman, ContainerDocker:
+	case ContainerAuto, ContainerNone, ContainerPodman, ContainerDocker:
 	default:
 		return fmt.Errorf("--container must be podman, docker, or none")
 	}

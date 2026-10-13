@@ -114,6 +114,15 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 		return err
 	}
 	res.ConfigFile, res.ConfigChanges = edit.File, edit.Changes
+	if o.Container == ContainerAuto {
+		o.Container = ContainerNone
+		if cfg.Container != nil {
+			o.Container = cfg.Container.Engine
+		}
+		if err := o.Validate(); err != nil {
+			return err
+		}
+	}
 
 	// 1. Host key.
 	name := KnownHostsName(o.Host, o.Port)
@@ -210,10 +219,7 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 	}
 	plan.Steps = append(append([]*Step{khStep}, plan.Steps...), cfgStep)
 	if cfg.Container != nil && o.Container == ContainerNone {
-		plan.warn("depper.toml has [container] (engine %s) but no container engine is installed; pass --container %s", cfg.Container.Engine, cfg.Container.Engine)
-	}
-	if cfg.Container != nil && o.Container != ContainerNone && cfg.Container.Engine != o.Container {
-		plan.warn("--container %s installs %s, but depper.toml resolves [container].engine to %s; set engine = %q in [container] so deploys use it", o.Container, o.Container, cfg.Container.Engine, o.Container)
+		plan.warn("depper.toml has [container] (engine %s) but --container none installs no container engine; drop --container to install %s", cfg.Container.Engine, cfg.Container.Engine)
 	}
 	res.Plan, res.Warnings = plan.Steps, plan.Warnings
 	r.printPlan(o, facts, plan)

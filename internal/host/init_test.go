@@ -167,7 +167,7 @@ func TestInitDebianFullSetup(t *testing.T) {
 	}
 
 	// sshd hardening: validated, then reloaded once; root key login kept.
-	if got := h.read("fs/etc/ssh/sshd_config.d/50-depper.conf"); got != dropInContent || !strings.Contains(got, "PermitRootLogin prohibit-password") {
+	if got := h.read("fs/etc/ssh/sshd_config.d/10-depper.conf"); got != dropInContent || !strings.Contains(got, "PermitRootLogin prohibit-password") {
 		t.Errorf("drop-in = %q", got)
 	}
 	if got := h.read("events"); got != "sshd-t\nreload\n" {
@@ -401,6 +401,68 @@ func TestInitDockerOnDebianWarns(t *testing.T) {
 		t.Errorf("group = %s", h.read("fs/etc/group"))
 	}
 	if len(res.Warnings) == 0 || !strings.Contains(res.Warnings[0], "equivalent to root") || !strings.Contains(h.Out.String(), "WARNING: membership in the docker group is equivalent to root") {
+		t.Errorf("warnings = %v", res.Warnings)
+	}
+}
+
+// Without --container, host init installs the engine the resolved
+// configuration uses: [container].engine, docker when unset, nothing
+// without [container].
+func TestInitContainerDefaultsToConfiguredEngine(t *testing.T) {
+	t.Parallel()
+	noCommand := strings.Replace(sampleConfig, "command = \"./run\" # start command\n", "", 1)
+	for _, tt := range []struct {
+		name, config, want, pkg string
+	}{
+		{"no container table", sampleConfig, ContainerNone, ""},
+		{"engine unset", noCommand + "\n[container]\nimage = \"nginx:1.27\"\n", ContainerDocker, "docker.io"},
+		{"engine podman", noCommand + "\n[container]\nengine = \"podman\"\nimage = \"nginx:1.27\"\n", ContainerPodman, "podman"},
+		{"engine docker", noCommand + "\n[container]\nengine = \"docker\"\nimage = \"nginx:1.27\"\n", ContainerDocker, "docker.io"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			h := newFakeHost(t, debian12)
+			h.write("repo/depper.toml", tt.config, 0o644)
+			o := h.options()
+			o.Container = ContainerAuto
+			res := mustInit(t, h, o)
+			if rec := readRecord(t, h); rec.Container != tt.want {
+				t.Errorf("recorded container = %q, want %q", rec.Container, tt.want)
+			}
+			installed := h.read("packages")
+			for _, pkg := range []string{"podman", "docker.io"} {
+				if has := strings.Contains("\n"+installed, "\n"+pkg+"\n"); has != (pkg == tt.pkg) {
+					t.Errorf("package %s installed = %v (packages:\n%s)", pkg, has, installed)
+				}
+			}
+			for _, w := range res.Warnings {
+				if strings.Contains(w, "resolves [container].engine") || strings.Contains(w, "pass --container") {
+					t.Errorf("obsolete warning: %s", w)
+				}
+			}
+		})
+	}
+}
+
+// An explicit --container none on a container project installs nothing and
+// says so.
+func TestInitContainerNoneWarnsForContainerProject(t *testing.T) {
+	t.Parallel()
+	h := newFakeHost(t, debian12)
+	cfg := strings.Replace(sampleConfig, "command = \"./run\" # start command\n", "", 1) + "\n[container]\nengine = \"podman\"\nimage = \"nginx:1.27\"\n"
+	h.write("repo/depper.toml", cfg, 0o644)
+	o := h.options()
+	o.Container = ContainerNone
+	res, err := h.runner().Init(context.Background(), o)
+	// The final doctor run rightly fails: the configured engine is missing.
+	var doctorFailed *DoctorFailedError
+	if !errors.As(err, &doctorFailed) {
+		t.Fatalf("err = %v", err)
+	}
+	if strings.Contains(h.read("packages"), "podman") {
+		t.Error("podman installed with --container none")
+	}
+	if len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], "--container none installs no container engine") {
 		t.Errorf("warnings = %v", res.Warnings)
 	}
 }
@@ -673,7 +735,7 @@ func TestHardenSSHRefusesWithoutInclude(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "does not Include sshd_config.d") {
 		t.Fatalf("err = %v", err)
 	}
-	if h.changes() != "" || h.has("fs/etc/ssh/sshd_config.d/50-depper.conf") {
+	if h.changes() != "" || h.has("fs/etc/ssh/sshd_config.d/10-depper.conf") {
 		t.Error("refused hardening changed the host")
 	}
 	if h.read("fs/etc/ssh/sshd_config") != "PermitRootLogin yes\nPasswordAuthentication yes\n" {
@@ -697,6 +759,50 @@ func TestHardenSSHRefusesEarlierConflictingDropIn(t *testing.T) {
 	}
 }
 
+// Ubuntu cloud images ship 50-cloud-init.conf with PasswordAuthentication
+// yes. depper's 10-depper.conf is read first, so it wins and is no conflict.
+func TestHardenSSHOverridesCloudInitDropIn(t *testing.T) {
+	t.Parallel()
+	h := newFakeHost(t, ubuntu2404)
+	h.write("fs/etc/ssh/sshd_config.d/50-cloud-init.conf", "PasswordAuthentication yes\n", 0o644)
+	o := h.options()
+	o.HardenSSH = true
+	res := mustInit(t, h, o)
+	if !contains(res.Applied, StepHardenSSH) {
+		t.Fatalf("applied = %v", res.Applied)
+	}
+	if got := h.read("fs/etc/ssh/sshd_config.d/10-depper.conf"); got != dropInContent {
+		t.Errorf("drop-in = %q", got)
+	}
+	if !h.has("fs/etc/ssh/sshd_config.d/50-cloud-init.conf") {
+		t.Error("the cloud-init drop-in was removed")
+	}
+	// A second run sees the hardening in effect.
+	o2 := h.options()
+	o2.HardenSSH = true
+	res = mustInit(t, h, o2)
+	if ids := planChanges(res); len(ids) != 0 {
+		t.Errorf("second run changes %v", ids)
+	}
+}
+
+// Lines of the main sshd_config before its Include are read before every
+// drop-in; lines after it are not.
+func TestHardenSSHRefusesMainConfigBeforeInclude(t *testing.T) {
+	t.Parallel()
+	h := newFakeHost(t, ubuntu2404)
+	h.write("fs/etc/ssh/sshd_config", "KbdInteractiveAuthentication yes\nInclude /etc/ssh/sshd_config.d/*.conf\nPasswordAuthentication yes\n", 0o644)
+	o := h.options()
+	o.HardenSSH = true
+	_, err := h.runner().Init(context.Background(), o)
+	if err == nil || !strings.Contains(err.Error(), "sshd_config (in /etc/ssh)") || !strings.Contains(err.Error(), "10-depper.conf") {
+		t.Fatalf("err = %v", err)
+	}
+	if h.changes() != "" || h.has("fs/etc/ssh/sshd_config.d/10-depper.conf") {
+		t.Errorf("refused hardening changed the host:\n%s", h.changes())
+	}
+}
+
 func TestHardenSSHRemovesDropInWhenSSHDTestFails(t *testing.T) {
 	t.Parallel()
 	h := newFakeHost(t, debian12)
@@ -707,7 +813,7 @@ func TestHardenSSHRemovesDropInWhenSSHDTestFails(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "sshd -t rejected") {
 		t.Fatalf("err = %v", err)
 	}
-	if h.has("fs/etc/ssh/sshd_config.d/50-depper.conf") || h.has("sshd-reloads") {
+	if h.has("fs/etc/ssh/sshd_config.d/10-depper.conf") || h.has("sshd-reloads") {
 		t.Error("drop-in left in place or sshd reloaded")
 	}
 }
@@ -723,7 +829,7 @@ func TestHardenSSHVerifiesDeployLoginBeforeReload(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "cannot log in with its key") || !strings.Contains(err.Error(), "did not reload") {
 		t.Fatalf("err = %v", err)
 	}
-	if h.has("fs/etc/ssh/sshd_config.d/50-depper.conf") || h.has("sshd-reloads") {
+	if h.has("fs/etc/ssh/sshd_config.d/10-depper.conf") || h.has("sshd-reloads") {
 		t.Error("drop-in kept or sshd reloaded although the deploy login failed")
 	}
 	// The steps that did complete are recorded, without the hardening.
@@ -743,7 +849,7 @@ func TestHardenSSHRollsBackWhenLoginFailsAfterReload(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "failed after reload") || !strings.Contains(err.Error(), "reloaded sshd again") {
 		t.Fatalf("err = %v", err)
 	}
-	if h.has("fs/etc/ssh/sshd_config.d/50-depper.conf") {
+	if h.has("fs/etc/ssh/sshd_config.d/10-depper.conf") {
 		t.Error("drop-in not removed after the failed verification")
 	}
 	if got := strings.Count(h.read("sshd-reloads"), "reload"); got != 2 {

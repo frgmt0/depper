@@ -226,14 +226,19 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`fi`,
 		`if grep -Eiq '^[[:space:]]*Include[[:space:]]+(/etc/ssh/)?sshd_config\.d/\*\.conf' ` + r.p(sshdMain) + ` 2>/dev/null; then echo sshd_include=1; fi`,
 		`if test -f ` + r.p(SSHDropIn) + `; then printf 'sshd_dropin=%s\n' "$(base64 < ` + r.p(SSHDropIn) + ` | tr -d '\n')"; fi`,
+		// sshd keeps the first value it reads: the main file up to its
+		// Include, then the drop-ins in lexical order. Only those read
+		// before depper's drop-in can override it.
 		`conflicts=""`,
+		`yes_re='^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitRootLogin)[[:space:]]+"?yes"?([[:space:]]|$)'`,
+		`if test -f ` + r.p(sshdMain) + ` && awk 'tolower($1) == "include" { exit } { print }' ` + r.p(sshdMain) + ` | grep -Eiq "$yes_re"; then conflicts="sshd_config"; fi`,
 		`for f in ` + r.p(sshdDropInD) + `/*.conf; do`,
 		`  test -f "$f" || continue`,
 		`  b=${f##*/}`,
-		`  test "$b" = 50-depper.conf && continue`,
-		`  first=$(printf '%s\n%s\n' "$b" 50-depper.conf | LC_ALL=C sort | head -n 1)`,
+		`  test "$b" = ` + sshDropInName + ` && continue`,
+		`  first=$(printf '%s\n%s\n' "$b" ` + sshDropInName + ` | LC_ALL=C sort | head -n 1)`,
 		`  test "$first" = "$b" || continue`,
-		`  if grep -Eiq '^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitRootLogin)[[:space:]]+yes' "$f"; then conflicts="$conflicts $b"; fi`,
+		`  if grep -Eiq "$yes_re" "$f"; then conflicts="$conflicts sshd_config.d/$b"; fi`,
 		`done`,
 		`printf 'sshd_conflicts=%s\n' "$conflicts"`,
 		`if systemctl is-active --quiet ssh.service 2>/dev/null; then echo sshd_unit=ssh; elif systemctl is-active --quiet sshd.service 2>/dev/null; then echo sshd_unit=sshd; fi`,

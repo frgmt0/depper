@@ -10,10 +10,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/BurntSushi/toml"
 	"github.com/spf13/cobra"
 
-	"github.com/frgmt0/depper/internal/config"
 	"github.com/frgmt0/depper/internal/dotenv"
 	"github.com/frgmt0/depper/internal/exitcode"
 	"github.com/frgmt0/depper/internal/host"
@@ -118,7 +116,7 @@ again changes nothing.`,
 	fl.StringVar(&f.identity, "identity", "", "private key for the admin login (default: ssh's own choice)")
 	fl.StringVar(&f.user, "user", host.DefaultUser, "deploy account to create")
 	fl.StringVar(&f.key, "key", "", "public key to authorize for the deploy user (default: first of ~/.ssh/id_ed25519.pub, id_ecdsa.pub, id_rsa.pub)")
-	fl.StringVar(&f.container, "container", "", "container engine to install: podman, docker, or none (default none; podman when depper.toml has [container] with engine unset or podman)")
+	fl.StringVar(&f.container, "container", "", "container engine to install: podman, docker, or none (default: the engine depper.toml resolves [container].engine to, docker when unset; none without [container])")
 	fl.BoolVar(&f.cloudflared, "cloudflared", false, "install cloudflared from Cloudflare's package repository")
 	fl.BoolVar(&f.hardenSSH, "harden-ssh", false, "disable password and keyboard-interactive SSH login (root key login stays allowed)")
 	fl.StringVar(&f.firewall, "firewall", "", "enable ufw/firewalld allowing these TCP ports, e.g. 22,80,443 (the SSH port is always included)")
@@ -209,11 +207,13 @@ func hostInitOptions(app *App, cmd *cobra.Command, f *hostInitFlags, args []stri
 		o.KnownHosts = filepath.Join(repo, ".depper", "known_hosts")
 	}
 
-	switch {
-	case f.container != "":
+	// Without --container, host init installs the engine the resolved
+	// configuration uses (host.ContainerAuto).
+	if cmd.Flags().Changed("container") {
+		if f.container == host.ContainerAuto {
+			return nil, fmt.Errorf("--container must be podman, docker, or none")
+		}
 		o.Container = f.container
-	default:
-		o.Container = defaultContainer(repo)
 	}
 
 	if f.firewall != "" || cmd.Flags().Changed("firewall") {
@@ -258,28 +258,6 @@ func parsePorts(s string) ([]int, error) {
 		return nil, fmt.Errorf("--firewall needs at least one port, such as 22,80,443")
 	}
 	return ports, nil
-}
-
-// defaultContainer is podman when the configuration has [container] with
-// engine unset or "podman", otherwise none.
-func defaultContainer(repo string) string {
-	file, err := config.FindFile(repo)
-	if err != nil {
-		return host.ContainerNone
-	}
-	var raw map[string]any
-	if _, err := toml.DecodeFile(file, &raw); err != nil {
-		return host.ContainerNone
-	}
-	c, ok := raw["container"].(map[string]any)
-	if !ok {
-		return host.ContainerNone
-	}
-	engine, set := c["engine"]
-	if !set || engine == host.ContainerPodman {
-		return host.ContainerPodman
-	}
-	return host.ContainerNone
 }
 
 func newHostStatusCommand(app *App) *cobra.Command {

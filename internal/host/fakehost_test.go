@@ -183,7 +183,7 @@ rest:
 		if exists(filepath.Join(root, "deny-deploy-login")) {
 			denied = true
 		}
-		if exists(filepath.Join(root, "deny-deploy-after-reload")) && exists(filepath.Join(root, "sshd-reloads")) && exists(filepath.Join(fs, "etc/ssh/sshd_config.d/50-depper.conf")) {
+		if exists(filepath.Join(root, "deny-deploy-after-reload")) && exists(filepath.Join(root, "sshd-reloads")) && exists(filepath.Join(fs, "etc/ssh/sshd_config.d/10-depper.conf")) {
 			denied = true
 		}
 		if denied {
@@ -380,11 +380,17 @@ main="$FS/etc/ssh/sshd_config"
 case "$1" in
   -t)
     echo sshd-t >> "$FAKE_ROOT/events"
-    if test -f "$FAKE_ROOT/sshd-t-fail"; then echo "50-depper.conf line 3: Bad configuration option" >&2; exit 255; fi ;;
+    if test -f "$FAKE_ROOT/sshd-t-fail"; then echo "10-depper.conf line 3: Bad configuration option" >&2; exit 255; fi ;;
   -T)
-    files=""
-    if grep -qi '^Include' "$main"; then for f in "$FS"/etc/ssh/sshd_config.d/*.conf; do test -f "$f" && files="$files $f"; done; fi
-    cat $files "$main" | awk '
+    # Like sshd: the main file up to its Include, then the drop-ins in
+    # lexical order, then the rest of the main file; the first value wins.
+    {
+      awk 'tolower($1) == "include" { exit } { print }' "$main"
+      if grep -qi '^Include' "$main"; then
+        for f in "$FS"/etc/ssh/sshd_config.d/*.conf; do test -f "$f" && cat "$f"; done
+        awk 'f { print } tolower($1) == "include" { f = 1 }' "$main"
+      fi
+    } | awk '
       { k = tolower($1) }
       k == "" || k ~ /^#/ || k == "include" { next }
       !(k in v) { v[k] = tolower($2) }
