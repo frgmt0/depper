@@ -137,3 +137,27 @@ func TestSecretsHelp(t *testing.T) {
 		t.Errorf("help = %s", text)
 	}
 }
+
+func TestSecretsHelpAligned(t *testing.T) {
+	lines := SecretsHelp("deploy@203.0.113.7", 2222, true)
+	col := -1
+	for _, name := range []string{SecretSSHKey, SecretKnownHosts, SecretEnv} {
+		found := false
+		for _, l := range lines {
+			if !strings.HasPrefix(l, "  "+name+" ") {
+				continue
+			}
+			found = true
+			rest := strings.TrimLeft(l[2+len(name):], " ")
+			c := len(l) - len(rest)
+			if col == -1 {
+				col = c
+			} else if c != col {
+				t.Errorf("%s description starts at column %d, want %d:\n%s", name, c, col, strings.Join(lines, "\n"))
+			}
+		}
+		if !found {
+			t.Errorf("no line for %s", name)
+		}
+	}
+}

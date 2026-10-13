@@ -18,6 +18,7 @@ var globalValueFlags = map[string]bool{"--target": true}
 //	depper [flags]            -> depper deploy [flags]
 //	depper [flags] REPO ...   -> depper deploy [flags] REPO ...
 //	depper REPO COMMAND ...   -> depper COMMAND REPO ...   (not init/help)
+//	depper REPO GROUP SUB ... -> depper GROUP SUB REPO ...
 //
 // The command name is placed first so cobra never mistakes it for a flag
 // value. Help, version, and "--" are never rewritten.
@@ -54,9 +55,39 @@ func rewriteArgs(root *cobra.Command, args []string) []string {
 		return args
 	}
 	if i+1 < len(args) && known[args[i+1]] && args[i+1] != "init" && args[i+1] != "help" {
-		out := []string{args[i+1]}
+		// Keep a command group's subcommand path together, so REPO lands
+		// after it: "REPO secrets list" -> "secrets list REPO".
+		path := []string{args[i+1]}
+		cur := findCommand(root, args[i+1])
+		j := i + 2
+		for cur != nil && cur.HasSubCommands() && j < len(args) {
+			sub := findCommand(cur, args[j])
+			if sub == nil {
+				break
+			}
+			path = append(path, args[j])
+			cur = sub
+			j++
+		}
+		out := append([]string{}, path...)
 		out = append(out, args[:i+1]...)
-		return append(out, args[i+2:]...)
+		return append(out, args[j:]...)
 	}
 	return append([]string{defaultCommand}, args...)
+}
+
+// findCommand returns the direct subcommand of parent with the given name or
+// alias, or nil.
+func findCommand(parent *cobra.Command, name string) *cobra.Command {
+	for _, c := range parent.Commands() {
+		if c.Name() == name {
+			return c
+		}
+		for _, alias := range c.Aliases {
+			if alias == name {
+				return c
+			}
+		}
+	}
+	return nil
 }

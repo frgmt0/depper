@@ -184,13 +184,22 @@ func SecretsHelp(host string, port int, secrets bool) []string {
 	if port == 0 {
 		port = 22
 	}
-	lines := []string{
-		"Create these repository secrets (Settings > Secrets and variables > Actions):",
-		"  " + SecretSSHKey + "      private key that can log in to the deploy host (a dedicated deploy key)",
-		"  " + SecretKnownHosts + "  the host key line(s): ssh-keyscan -p " + fmt.Sprint(port) + " " + host,
+	rows := [][2]string{
+		{SecretSSHKey, "private key that can log in to the deploy host (a dedicated deploy key)"},
+		{SecretKnownHosts, "the host key line(s): ssh-keyscan -p " + fmt.Sprint(port) + " " + host},
 	}
 	if secrets {
-		lines = append(lines, "  "+SecretEnv+"        the dotenv content of [secrets].file (for example: gh secret set "+SecretEnv+" < .env.prod)")
+		rows = append(rows, [2]string{SecretEnv, "the dotenv content of [secrets].file (for example: gh secret set " + SecretEnv + " < .env.prod)"})
+	}
+	width := 0
+	for _, r := range rows {
+		if len(r[0]) > width {
+			width = len(r[0])
+		}
+	}
+	lines := []string{"Create these repository secrets (Settings > Secrets and variables > Actions):"}
+	for _, r := range rows {
+		lines = append(lines, "  "+r[0]+strings.Repeat(" ", width-len(r[0]))+"  "+r[1])
 	}
 	lines = append(lines, "Verify the ssh-keyscan output against the host's real fingerprint before saving it.")
 	return lines
