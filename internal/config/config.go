@@ -338,6 +338,13 @@ func LoadTarget(repo, target string, lookup func(string) (string, bool)) (*Confi
 	return project.ResolveWithEnv(target, lookup)
 }
 
+// Parse validates configuration text as if it were read from file inside
+// repo (which must already be absolute and symlink-resolved, as Load does).
+// It lets a caller validate an edited configuration before writing it.
+func Parse(repo, file, text string) (*Project, error) {
+	return parse(repo, file, text)
+}
+
 func parse(repo, file, text string) (*Project, error) {
 	name := filepath.Base(file)
 	var raw map[string]any
