@@ -47,8 +47,31 @@ const (
 	// markReloaded is written just before sshd reloads the drop-in; a
 	// revert by host init reloads sshd only then (the timer always does).
 	markReloaded = "reloaded"
+	// markDisarmed is written when host init disarms the guard after the
+	// change was verified; a revert started by the timer or at boot then
+	// does nothing.
+	markDisarmed = "disarmed"
+	// markWasEnabled: firewalld was enabled (but not running) before; the
+	// revert stops it without disabling it.
+	markWasEnabled = "was-enabled"
+	// lockDir serializes the revert script and disarm (mkdir is atomic).
+	lockDir      = "lock"
 	revertScript = "revert.sh"
+	// bootScript runs every guard's revert at boot (transient timers do not
+	// survive a reboot); bootUnit is the system service that runs it.
+	bootScript = "boot.sh"
+	bootUnit   = "depper-guard-revert.service"
 )
+
+// lockLines take the guard lock in $d (waiting up to 90 s, then taking over
+// a lock left by a killed process) and release it when the script exits.
+func lockLines() []string {
+	return []string{
+		`depper_n=0`,
+		`while ! mkdir "$d/` + lockDir + `" 2>/dev/null; do depper_n=$((depper_n + 1)); if test "$depper_n" -ge 90; then echo "taking over the stale lock $d/` + lockDir + `" >&2; break; fi; sleep 1; done`,
+		`trap 'rmdir "$d/` + lockDir + `" 2>/dev/null' EXIT`,
+	}
+}
 
 // guardMarkers are the markers that mean a change is armed and not yet
 // verified (or not yet reverted).
@@ -107,23 +130,57 @@ func (g *guard) deadline(r *Runner) time.Time { return g.armedAt.Add(r.revertAft
 
 func clock(t time.Time) string { return t.Format("15:04:05 MST") }
 
-// revertScriptBody is the script the timer runs ("timer") and host init
-// runs itself ("now"). It records who ran it.
+// revertScriptBody is the revert script. Its argument says who runs it:
+// "timer" (the armed timer), "boot" (the boot service after a reboot),
+// "pending" (host init finishing an interrupted run) or "now" (host init
+// rolling back). It holds the guard lock while it works, does nothing when
+// started automatically after the guard was disarmed, and exits 1 without
+// writing the reverted marker unless every undo step succeeded (markers of
+// failed steps stay for the next attempt).
 func (r *Runner) revertScriptBody(g *guard) string {
 	d := r.guardDir(g.unit)
 	lines := []string{
 		"set +e",
 		"d=" + shell.Quote(d),
 		`depper_who=${1:-now}`,
-		`if test "$depper_who" = timer; then date +%s > "$d/` + markStarted + `"; fi`,
 	}
+	lines = append(lines, lockLines()...)
+	lines = append(lines,
+		`case "$depper_who" in timer|boot) if test -f "$d/`+markDisarmed+`"; then exit 0; fi; date +%s > "$d/`+markStarted+`" ;; esac`,
+		`depper_fail=0`,
+	)
 	lines = append(lines, g.revert...)
-	lines = append(lines, `printf '%s %s\n' "$depper_who" "$(date +%s)" > "$d/`+markReverted+`"`)
+	var tests []string
+	for _, m := range guardMarkers {
+		tests = append(tests, `test -e "$d/`+m+`"`)
+	}
+	lines = append(lines,
+		`if `+strings.Join(tests, " || ")+`; then depper_fail=1; fi`,
+		`if test "$depper_fail" != 0; then echo "`+g.unit+`: the revert did not complete; the markers of what is left to undo stay in $d" >&2; exit 1; fi`,
+		`printf '%s %s\n' "$depper_who" "$(date +%s)" > "$d/`+markReverted+`"`,
+	)
 	return shell.Script(lines...)
 }
 
+// bootScriptBody runs every guard's revert script at boot.
+func (r *Runner) bootScriptBody() string {
+	return shell.Script(
+		"for s in "+shell.Quote(r.raw(guardStateDir))+"/*/"+revertScript+"; do",
+		`  test -f "$s" && /bin/sh "$s" boot`,
+		"done",
+		"exit 0",
+	)
+}
+
+// bootUnitContent is the system service that runs bootScript at boot,
+// after sshd and the firewall started.
+func (r *Runner) bootUnitContent() string {
+	return "[Unit]\nDescription=depper: undo guarded changes a reboot left unverified\nAfter=network.target ssh.service sshd.service ufw.service firewalld.service\n\n[Service]\nType=oneshot\nExecStart=/bin/sh " + r.raw(guardStateDir) + "/" + bootScript + "\n\n[Install]\nWantedBy=multi-user.target\n"
+}
+
 // pendingLines are root lines that fail when a revert of unit is still
-// pending (an armed timer or markers left by an interrupted run).
+// pending (an armed timer, a running revert, or markers left by an
+// interrupted run).
 func (r *Runner) pendingCheck(unit string) []string {
 	d := shell.Quote(r.guardDir(unit))
 	var tests []string
@@ -131,7 +188,7 @@ func (r *Runner) pendingCheck(unit string) []string {
 		tests = append(tests, `test -e `+d+`/`+m)
 	}
 	return []string{
-		`if test "$(systemctl show -p SubState --value ` + shell.Quote(unit+".timer") + ` 2>/dev/null)" = waiting || ` + strings.Join(tests, " || ") + `; then echo "the revert of an earlier, interrupted host init (` + unit + `) is still pending; run host init again to finish it first" >&2; exit 1; fi`,
+		`if test "$(systemctl show -p SubState --value ` + shell.Quote(unit+".timer") + ` 2>/dev/null)" = waiting || test "$(systemctl show -p ActiveState --value ` + shell.Quote(unit+".service") + ` 2>/dev/null)" = activating || ` + strings.Join(tests, " || ") + `; then echo "the revert of an earlier, interrupted host init (` + unit + `) is still pending; run host init again to finish it first" >&2; exit 1; fi`,
 	}
 }
 
@@ -149,6 +206,8 @@ func (r *Runner) arm(ctx context.Context, admin *transport.Remote, g *guard) err
 	for _, m := range append(append([]string{}, guardMarkers...), markPrev, revertScript) {
 		markers = append(markers, `"$d/`+m+`"`)
 	}
+	base := r.raw(guardStateDir)
+	unitFile := r.raw("/etc/systemd/system/" + bootUnit)
 	lines := []string{"set -eu", "umask 022", "d=" + shell.Quote(d), `mkdir -p "$d"`}
 	lines = append(lines, r.pendingCheck(g.unit)...)
 	lines = append(lines,
@@ -156,8 +215,18 @@ func (r *Runner) arm(ctx context.Context, admin *transport.Remote, g *guard) err
 		// unit name; it has nothing left to do.
 		`if systemctl show -p LoadState --value `+timer+` 2>/dev/null | grep -qx loaded; then echo "clearing the finished `+g.unit+`.timer of an earlier run"; systemctl stop `+timer+` >/dev/null 2>&1 || true; fi`,
 		`systemctl reset-failed `+timer+` `+service+` >/dev/null 2>&1 || true`,
-		`rm -f "$d/`+markStarted+`" "$d/`+markReverted+`" "$d/`+markReloaded+`"`,
-		`printf '%s' `+shell.Quote(r.revertScriptBody(g))+` > "$d/`+revertScript+`"`,
+		// No revert runs now (checked above), so a lock left behind is stale.
+		`rmdir "$d/`+lockDir+`" 2>/dev/null || true`,
+		`rm -f "$d/`+markStarted+`" "$d/`+markReverted+`" "$d/`+markReloaded+`" "$d/`+markDisarmed+`" "$d/`+markWasEnabled+`"`,
+		`printf '%s' `+shell.Quote(r.revertScriptBody(g))+` > "$d/`+revertScript+`.tmp"`,
+		`mv -f "$d/`+revertScript+`.tmp" "$d/`+revertScript+`"`,
+		// Transient timers do not survive a reboot: a boot service runs
+		// the revert of a change a reboot left unverified.
+		`printf '%s' `+shell.Quote(r.bootScriptBody())+` > `+shell.Quote(base+"/"+bootScript+".tmp"),
+		`mv -f `+shell.Quote(base+"/"+bootScript+".tmp")+` `+shell.Quote(base+"/"+bootScript),
+		`mkdir -p `+shell.Quote(r.raw("/etc/systemd/system")),
+		`if ! test -f `+shell.Quote(unitFile)+` || test "$(cat `+shell.Quote(unitFile)+`)" != `+shell.Quote(strings.TrimSuffix(r.bootUnitContent(), "\n"))+`; then printf '%s' `+shell.Quote(r.bootUnitContent())+` > `+shell.Quote(unitFile+".tmp")+`; mv -f `+shell.Quote(unitFile+".tmp")+` `+shell.Quote(unitFile)+`; systemctl daemon-reload; fi`,
+		`systemctl is-enabled --quiet `+bootUnit+` 2>/dev/null || systemctl enable --quiet `+bootUnit,
 	)
 	lines = append(lines, g.prepare...)
 	lines = append(lines,
@@ -176,48 +245,69 @@ func (r *Runner) arm(ctx context.Context, admin *transport.Remote, g *guard) err
 }
 
 const (
-	stepDisarm    = "revert-disarm"
-	revertElapsed = "revert-elapsed"
+	stepDisarm       = "revert-disarm"
+	revertElapsed    = "revert-elapsed"
+	revertIncomplete = "revert-incomplete"
+	timerStopped     = "revert-timer-stopped"
 )
 
-// disarm stops the timer, then checks whether the revert service ever
-// started; elapsed reports that it did (the timer undid the change, or is
-// undoing it). On success the markers are removed.
-func (r *Runner) disarm(ctx context.Context, admin *transport.Remote, g *guard) (elapsed bool, err error) {
+// disarmResult is what disarm found on the host.
+type disarmResult struct {
+	// stopped: the timer is stopped (it will not fire any more).
+	stopped bool
+	// elapsed: the revert had started automatically (timer or boot);
+	// incomplete: it did not finish (markers are left).
+	elapsed, incomplete bool
+}
+
+// disarm stops the timer, then takes the guard lock (so a revert that has
+// started finishes first) and checks whether the revert ever started
+// automatically. If it did not, it marks the guard disarmed (a revert
+// started later does nothing) and removes the markers.
+func (r *Runner) disarm(ctx context.Context, admin *transport.Remote, g *guard) (disarmResult, error) {
 	d := r.guardDir(g.unit)
-	timer, service := shell.Quote(g.unit+".timer"), shell.Quote(g.unit+".service")
+	timer := shell.Quote(g.unit + ".timer")
 	var markers []string
-	for _, m := range append(append([]string{}, guardMarkers...), markPrev, markReloaded, revertScript) {
+	for _, m := range append(append([]string{}, guardMarkers...), markPrev, markReloaded, markWasEnabled, "zone", revertScript) {
 		markers = append(markers, `"$d/`+m+`"`)
 	}
-	lines := []string{
-		"d=" + shell.Quote(d),
-		`systemctl stop ` + timer + ` >/dev/null 2>&1 || true`,
-		`if test "$(systemctl show -p SubState --value ` + timer + ` 2>/dev/null)" = waiting; then echo "could not stop ` + g.unit + `.timer" >&2; exit 1; fi`,
-		`depper_entered=$(systemctl show -p ActiveEnterTimestampMonotonic --value ` + service + ` 2>/dev/null || true)`,
-		`if test -e "$d/` + markStarted + `" || { test -n "$depper_entered" && test "$depper_entered" != 0; }; then echo ` + shell.Quote(doneMarker+revertElapsed) + `; echo "` + g.unit + `.service had already started" >&2; exit 1; fi`,
-		`rm -f ` + strings.Join(markers, " "),
-	}
+	lines := []string{"d=" + shell.Quote(d)}
+	lines = append(lines,
+		`systemctl stop `+timer+` >/dev/null 2>&1 || true`,
+		`if test "$(systemctl show -p SubState --value `+timer+` 2>/dev/null)" = waiting; then echo "could not stop `+g.unit+`.timer" >&2; exit 1; fi`,
+		`echo `+shell.Quote(doneMarker+timerStopped),
+	)
+	lines = append(lines, lockLines()...)
+	lines = append(lines,
+		`if test -e "$d/`+markStarted+`"; then echo `+shell.Quote(doneMarker+revertElapsed)+`; if ! test -e "$d/`+markReverted+`"; then echo `+shell.Quote(doneMarker+revertIncomplete)+`; fi; echo "`+g.unit+` had already started the revert" >&2; exit 1; fi`,
+		`: > "$d/`+markDisarmed+`"`,
+		`rm -f `+strings.Join(markers, " "),
+	)
 	done, err := r.applySteps(ctx, admin, []*Step{{ID: stepDisarm, lines: lines}})
-	if err == nil {
-		return false, nil
-	}
-	return contains(done, revertElapsed), err
+	res := disarmResult{stopped: err == nil || contains(done, timerStopped), elapsed: contains(done, revertElapsed), incomplete: contains(done, revertIncomplete)}
+	return res, err
 }
 
 // finish disarms g after the change was verified. A failed disarm is
-// reported loudly: the timer would undo the verified change.
+// reported loudly: the timer, or the next host init, would undo the
+// verified change.
 func (r *Runner) finish(ctx context.Context, admin *transport.Remote, g *guard) error {
-	elapsed, err := r.disarm(ctx, admin, g)
+	res, err := r.disarm(ctx, admin, g)
+	d := r.guardDir(g.unit)
 	switch {
 	case err == nil:
 		r.printf("  verified; disarmed %s.timer\n", g.unit)
 		return nil
-	case elapsed:
-		return fmt.Errorf("%s: the change was verified, but %s.timer had already started the revert (the checks took longer than %s), so the change was undone; run host init again", g.name, g.unit, r.revertAfter())
+	case res.elapsed && res.incomplete:
+		return fmt.Errorf("%s: the change was verified, but %s had already started the revert (the checks took longer than %s) and it did not complete; the markers of what is left to undo are in %s, and the next host init finishes the revert first", g.name, g.unit, r.revertAfter(), d)
+	case res.elapsed:
+		return fmt.Errorf("%s: the change was verified, but %s had already started the revert (the checks took longer than %s), so the change was undone; run host init again", g.name, g.unit, r.revertAfter())
+	case res.stopped:
+		r.printf("WARNING: %s: stopped %s.timer, but could not clear the revert markers (%v)\n", g.name, g.unit, err)
+		return fmt.Errorf("%s: the change was verified and %s.timer is stopped, but clearing the revert markers in %s failed (%v); the next host init would undo the change: remove had-prev, prev, had-none, was-inactive and added-ports there yourself to keep it", g.name, g.unit, d, err)
 	}
 	r.printf("WARNING: %s: could not disarm %s.timer (%v); it will undo the change at %s\n", g.name, g.unit, err, clock(g.deadline(r)))
-	return fmt.Errorf("%s: the change was verified, but disarming %s.timer failed (%v), so it will undo the change at %s; run host init again, or stop the timer yourself with `sudo systemctl stop %s.timer`", g.name, g.unit, err, clock(g.deadline(r)), g.unit)
+	return fmt.Errorf("%s: the change was verified, but disarming %s.timer failed (%v), so it will undo the change at %s; run host init again, or to keep the change stop the timer yourself (`sudo systemctl stop %s.timer`) and remove the markers had-prev, prev, had-none, was-inactive and added-ports in %s", g.name, g.unit, err, clock(g.deadline(r)), g.unit, d)
 }
 
 // e2eLockout is a test-only hook (see docs/development.md): with
@@ -243,12 +333,14 @@ func (r *Runner) rollback(ctx context.Context, admin *transport.Remote, g *guard
 		rerr = r.runRoot(ctx, admin, []string{"/bin/sh " + shell.Quote(r.guardDir(g.unit)+"/"+revertScript) + " now"})
 	}
 	if rerr == nil {
-		elapsed, derr := r.disarm(ctx, admin, g)
+		res, derr := r.disarm(ctx, admin, g)
 		switch {
-		case elapsed:
-			return fmt.Errorf("%s: %v; rolled back the change, and %s.timer had also started the same revert (it does nothing twice)", g.name, cause, g.unit)
+		case res.elapsed:
+			return fmt.Errorf("%s: %v; rolled back the change, and %s had also started the same revert (the two ran one after the other; the second had nothing left to undo)", g.name, cause, g.unit)
+		case derr != nil && res.stopped:
+			return fmt.Errorf("%s: %v; rolled back the change and stopped %s.timer, but clearing its state in %s failed (%v); nothing is left to undo", g.name, cause, g.unit, r.guardDir(g.unit), derr)
 		case derr != nil:
-			return fmt.Errorf("%s: %v; rolled back the change, but disarming %s.timer failed (%v); it will run the revert again at %s, which then does nothing", g.name, cause, g.unit, derr, clock(g.deadline(r)))
+			return fmt.Errorf("%s: %v; rolled back the change, but stopping %s.timer failed (%v); it will run the revert again at %s, which then has nothing left to undo", g.name, cause, g.unit, derr, clock(g.deadline(r)))
 		}
 		return fmt.Errorf("%s: %v; rolled back the change and disarmed %s.timer", g.name, cause, g.unit)
 	}
@@ -260,7 +352,7 @@ func (r *Runner) rollback(ctx context.Context, admin *transport.Remote, g *guard
 		if err == nil && who != "" {
 			how := "the immediate rollback failed (" + rerr.Error() + "), so " + g.unit + ".timer on the host undid the change"
 			if who != "timer" {
-				how = "the change was undone by a revert outside the timer"
+				how = "the change was undone by a revert outside the timer (" + who + ")"
 			}
 			return fmt.Errorf("%s: %v; %s at %s; a new %s login works again", g.name, cause, how, clock(when), userOf(admin.Target))
 		}
@@ -268,7 +360,7 @@ func (r *Runner) rollback(ctx context.Context, admin *transport.Remote, g *guard
 			if err != nil {
 				return fmt.Errorf("%s: %v; the immediate rollback failed (%v); %s.timer on the host was due to undo the change at %s, but a new %s login still fails (%v): use the provider console to check %s and %s", g.name, cause, rerr, g.unit, clock(at), userOf(admin.Target), err, g.unit, r.guardDir(g.unit))
 			}
-			return fmt.Errorf("%s: %v; the immediate rollback failed (%v); %s.timer was due at %s but has not run the revert, although a new %s login works again: run host init again (it finishes the revert first)", g.name, cause, rerr, g.unit, clock(at), userOf(admin.Target))
+			return fmt.Errorf("%s: %v; the immediate rollback failed (%v); %s.timer was due at %s, but no completed revert is recorded in %s (it may not have run, or failed: see `journalctl -u %s.service` on the host), although a new %s login works again: run host init again (it finishes the revert first)", g.name, cause, rerr, g.unit, clock(at), r.guardDir(g.unit), g.unit, userOf(admin.Target))
 		}
 		select {
 		case <-ctx.Done():
@@ -331,6 +423,9 @@ func (r *Runner) applyFirewall(ctx context.Context, admin *transport.Remote, adm
 	if _, err := r.applySteps(ctx, admin, []*Step{{ID: StepFirewall, lines: s.lines}}); err != nil {
 		return r.rollback(ctx, admin, g, fmt.Errorf("configuring the firewall failed: %w", err))
 	}
+	if r.interruptAt == StepFirewall {
+		return errInterrupted
+	}
 	r.printf("  firewall enabled; checking new connections...\n")
 	if err := r.verifyBoth(ctx, adminT, deployT, false); err != nil {
 		return r.rollback(ctx, admin, g, fmt.Errorf("%w after enabling the firewall", err))
@@ -342,25 +437,33 @@ func (r *Runner) applyFirewall(ctx context.Context, admin *transport.Remote, adm
 // existed (its copy is kept) or not, and the revert restores or removes it
 // and reloads sshd.
 func (r *Runner) sshGuard(sshdUnit string) *guard {
-	file := shell.Quote(r.raw(SSHDropIn))
-	reload := `systemctl reload ssh.service 2>/dev/null || systemctl reload sshd.service 2>/dev/null || true`
+	file := r.raw(SSHDropIn)
+	f, tmp := shell.Quote(file), shell.Quote(file+".depper-revert.")+`"$$"`
+	reload := `systemctl reload ssh.service 2>/dev/null || systemctl reload sshd.service 2>/dev/null`
 	if sshdUnit != "" {
-		reload = `systemctl reload ` + shell.Quote(sshdUnit+".service") + ` || ` + reload
+		reload = `systemctl reload ` + shell.Quote(sshdUnit+".service") + ` 2>/dev/null || ` + reload
 	}
-	reload = `if test "$depper_who" = timer || test -f "$d/` + markReloaded + `"; then ` + reload + `; fi; rm -f "$d/` + markReloaded + `"`
 	return &guard{
 		name: "--harden-ssh",
 		unit: sshRevertUnit,
 		prepare: []string{
-			`if test -f ` + file + `; then cp -p ` + file + ` "$d/` + markPrev + `"; : > "$d/` + markHadPrev + `"; else : > "$d/` + markHadNone + `"; fi`,
+			`if test -f ` + f + `; then cp -p ` + f + ` "$d/` + markPrev + `"; : > "$d/` + markHadPrev + `"; else : > "$d/` + markHadNone + `"; fi`,
 		},
+		// Each marker is removed only after its undo step succeeded. sshd
+		// is reloaded when the file was restored and sshd may have loaded
+		// it: always when run automatically or for an interrupted run (a
+		// restart may have loaded it), on a rollback only after host init
+		// reloaded it.
 		revert: []string{
+			`depper_restored=no`,
 			`if test -f "$d/` + markHadPrev + `"; then`,
-			`  cp -p "$d/` + markPrev + `" ` + file + `.depper-tmp && mv -f ` + file + `.depper-tmp ` + file + ` && rm -f "$d/` + markHadPrev + `" "$d/` + markPrev + `"`,
-			`  ` + reload,
+			`  if cp -p "$d/` + markPrev + `" ` + tmp + ` && mv -f ` + tmp + ` ` + f + `; then rm -f "$d/` + markHadPrev + `" "$d/` + markPrev + `"; depper_restored=yes; else rm -f ` + tmp + `; echo "could not restore ` + SSHDropIn + ` from $d/` + markPrev + `" >&2; depper_fail=1; fi`,
 			`elif test -f "$d/` + markHadNone + `"; then`,
-			`  rm -f ` + file + ` && rm -f "$d/` + markHadNone + `"`,
-			`  ` + reload,
+			`  if rm -f ` + f + `; then rm -f "$d/` + markHadNone + `"; depper_restored=yes; else echo "could not remove ` + SSHDropIn + `" >&2; depper_fail=1; fi`,
+			`fi`,
+			`if test "$depper_restored" = yes; then`,
+			`  case "$depper_who" in now) test -f "$d/` + markReloaded + `" && depper_reload=yes || depper_reload=no ;; *) depper_reload=yes ;; esac`,
+			`  if test "$depper_reload" = yes; then if ` + reload + `; then rm -f "$d/` + markReloaded + `"; else echo "could not reload sshd after restoring ` + SSHDropIn + `" >&2; depper_fail=1; fi; else rm -f "$d/` + markReloaded + `"; fi`,
 			`fi`,
 		},
 	}
@@ -400,10 +503,16 @@ func (r *Runner) hardenSSH(ctx context.Context, admin *transport.Remote, adminT,
 	r.printf("  checking that %s can log in with its key before reloading sshd...\n", o.User)
 	if err := r.verifyLogin(ctx, deployT); err != nil {
 		if rerr := r.runRoot(ctx, admin, []string{revertNow}); rerr != nil {
-			return fmt.Errorf("--harden-ssh: %s cannot log in with its key (%v), and reverting %s failed: %v; %s.timer reverts it at %s", o.User, err, SSHDropIn, rerr, g.unit, clock(g.deadline(r)))
+			return fmt.Errorf("--harden-ssh: %s cannot log in with its key (%v), and reverting %s failed: %v; %s.timer retries the revert at %s", o.User, err, SSHDropIn, rerr, g.unit, clock(g.deadline(r)))
 		}
-		if _, derr := r.disarm(ctx, admin, g); derr != nil {
-			return fmt.Errorf("--harden-ssh: %s cannot log in with its key over a new connection (%v); reverted %s and did not reload sshd, but disarming %s.timer failed (%v; its revert does nothing more)", o.User, err, SSHDropIn, g.unit, derr)
+		res, derr := r.disarm(ctx, admin, g)
+		switch {
+		case res.elapsed:
+			return fmt.Errorf("--harden-ssh: %s cannot log in with its key over a new connection (%v); reverted %s, and %s had also started the same revert", o.User, err, SSHDropIn, g.unit)
+		case derr != nil && res.stopped:
+			return fmt.Errorf("--harden-ssh: %s cannot log in with its key over a new connection (%v); reverted %s and did not reload sshd; %s.timer is stopped, but clearing its state in %s failed (%v)", o.User, err, SSHDropIn, g.unit, r.guardDir(g.unit), derr)
+		case derr != nil:
+			return fmt.Errorf("--harden-ssh: %s cannot log in with its key over a new connection (%v); reverted %s and did not reload sshd, but stopping %s.timer failed (%v); its revert at %s has nothing left to undo", o.User, err, SSHDropIn, g.unit, derr, clock(g.deadline(r)))
 		}
 		return fmt.Errorf("--harden-ssh: %s cannot log in with its key over a new connection (%v); reverted %s and did not reload sshd", o.User, err, SSHDropIn)
 	}
@@ -432,6 +541,9 @@ func pendingGuards(f *Facts) string {
 	for _, unit := range guardUnits {
 		if st := f.Guards[unit]; st.Pending() {
 			what := unit + ".timer " + shellName(st.Timer)
+			if st.Service == "activating" {
+				what += ", revert running"
+			}
 			if st.Markers {
 				what += ", revert markers present"
 			}
@@ -441,10 +553,12 @@ func pendingGuards(f *Facts) string {
 	return strings.Join(out, "; ")
 }
 
-// finishPending completes guarded changes an interrupted host init left
-// armed: a waiting timer has its revert service started now (oneshot, so
-// systemctl waits for it); markers without a timer run the revert script
-// directly. It reports whether anything was pending.
+// finishPending completes guarded changes an interrupted host init (or a
+// reboot) left unverified: a waiting timer has its revert service started
+// now (oneshot, so systemctl waits for it), a running revert is waited for,
+// and markers left after that run the revert script directly (it holds the
+// guard lock, so it never overlaps the service). It reports whether
+// anything was pending.
 func (r *Runner) finishPending(ctx context.Context, admin *transport.Remote, f *Facts) (bool, error) {
 	var lines []string
 	for _, unit := range guardUnits {
@@ -453,22 +567,22 @@ func (r *Runner) finishPending(ctx context.Context, admin *transport.Remote, f *
 			continue
 		}
 		d := shell.Quote(r.guardDir(unit))
+		timer, service := shell.Quote(unit+".timer"), shell.Quote(unit+".service")
 		what := map[string]string{sshRevertUnit: "--harden-ssh", firewallRevertUnit: "--firewall"}[unit]
 		r.printf("Finishing an interrupted host init: its %s change was never verified, so %s reverts it now (timer %s).\n", what, unit, shellName(st.Timer))
-		lines = append(lines,
-			`if test "$(systemctl show -p SubState --value `+shell.Quote(unit+".timer")+` 2>/dev/null)" = waiting; then systemctl start `+shell.Quote(unit+".service")+`; fi`,
-			`systemctl stop `+shell.Quote(unit+".timer")+` >/dev/null 2>&1 || true`,
-		)
 		var tests []string
 		for _, m := range guardMarkers {
 			tests = append(tests, `test -e `+d+`/`+m)
 		}
 		lines = append(lines,
+			`if test "$(systemctl show -p SubState --value `+timer+` 2>/dev/null)" = waiting; then systemctl start `+service+` || echo "`+unit+`.service failed; running the revert script directly" >&2; fi`,
+			`systemctl stop `+timer+` >/dev/null 2>&1 || true`,
+			`depper_n=0`,
+			`while test "$(systemctl show -p ActiveState --value `+service+` 2>/dev/null)" = activating && test "$depper_n" -lt 150; do depper_n=$((depper_n + 1)); sleep 1; done`,
 			`if `+strings.Join(tests, " || ")+`; then`,
 			`  test -f `+d+`/`+revertScript+` || { echo "`+unit+`: revert markers without `+revertScript+` in `+r.guardDir(unit)+`; check them by hand" >&2; exit 1; }`,
-			`  /bin/sh `+d+`/`+revertScript+` now`,
+			`  /bin/sh `+d+`/`+revertScript+` pending || { echo "`+unit+`: the revert did not complete; what is left to undo is in `+r.guardDir(unit)+`" >&2; exit 1; }`,
 			`fi`,
-			`if `+strings.Join(tests, " || ")+`; then echo "`+unit+`: the revert left markers in `+r.guardDir(unit)+`" >&2; exit 1; fi`,
 		)
 	}
 	if len(lines) == 0 {

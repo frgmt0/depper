@@ -319,7 +319,9 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 	}
 	deployTarget := transport.Target{Host: o.User + "@" + o.Host, Port: o.Port, IdentityFile: deployIdentity, KnownHosts: o.KnownHosts, Options: sessionOptions}
 	if s := plan.step(StepFirewall); applyErr == nil && s != nil && s.Change {
-		if err := r.applyFirewall(ctx, admin, adminTarget, deployTarget, s); err != nil {
+		if err := r.applyFirewall(ctx, admin, adminTarget, deployTarget, s); errors.Is(err, errInterrupted) {
+			return err
+		} else if err != nil {
 			applyErr = err
 		} else {
 			res.Applied = append(res.Applied, StepFirewall)

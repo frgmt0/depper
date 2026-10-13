@@ -389,10 +389,9 @@ case "$cmd" in
     for u in $units; do
       case "$u" in user@*.service) id=${u#user@}; id=${id%.service}; mkdir -p "$FS/run/user/$id"; : > "$FS/run/user/$id/manager" ;; esac
       # A transient service of systemd-run runs its command now (oneshot:
-      # start returns when it finished); its timer has elapsed.
+      # start returns when it finished); like systemd, this leaves its
+      # timer as it is.
       if test -f "$S/$u.argv"; then
-        t=${u%.service}.timer
-        rm -f "$S/$t.active"; : > "$S/$t.loaded"
         echo "started $u" >> "$FAKE_ROOT/timer-events"
         date +%s > "$S/$u.entered"; : > "$S/$u.running"
         eval "$(cat "$S/$u.argv")" </dev/null; rc=$?
@@ -675,6 +674,7 @@ for a; do
     --list-ports) tr '\n' ' ' < "$f"; echo ;;
     --list-services) echo "ssh dhcpv6-client" ;;
     --add-port=*) p=${a#--add-port=}; grep -qx "$p" "$f" || echo "$p" >> "$f" ;;
+    --query-port=*) grep -qx "${a#--query-port=}" "$f"; exit ;;
     --remove-port=*) p=${a#--remove-port=}; grep -vx "$p" "$f" > "$f.new" || true; mv "$f.new" "$f" ;;
   esac
 done

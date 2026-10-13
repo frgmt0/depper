@@ -82,7 +82,7 @@ func TestRevertTimerAndImmediateRollbackBothRun(t *testing.T) {
 		o := h.options()
 		o.HardenSSH = true
 		_, err := h.runner().Init(context.Background(), o)
-		if err == nil || !strings.Contains(err.Error(), "depper-ssh-revert.timer had also started the same revert") {
+		if err == nil || !strings.Contains(err.Error(), "and depper-ssh-revert had also started the same revert (the two ran one after the other; the second had nothing left to undo)") {
 			t.Fatalf("err = %v", err)
 		}
 		if got := h.read("fs/etc/ssh/sshd_config.d/10-depper.conf"); got != old {
@@ -102,7 +102,7 @@ func TestRevertTimerAndImmediateRollbackBothRun(t *testing.T) {
 		r := h.runner()
 		r.revertDelay = 3 * time.Second
 		_, err := r.Init(context.Background(), o)
-		if err == nil || !strings.Contains(err.Error(), "rolled back the change, but disarming depper-ssh-revert.timer failed") || !strings.Contains(err.Error(), "which then does nothing") {
+		if err == nil || !strings.Contains(err.Error(), "rolled back the change, but stopping depper-ssh-revert.timer failed") || !strings.Contains(err.Error(), "which then has nothing left to undo") {
 			t.Fatalf("err = %v", err)
 		}
 		h.waitEvent("done depper-ssh-revert\n", 15*time.Second)
@@ -325,4 +325,182 @@ func TestPlatformGating(t *testing.T) {
 			t.Errorf("changed the host:\n%s", h.changes())
 		}
 	})
+}
+
+// runRevert runs a guard's revert script on the fake host as WHO and
+// returns its exit error and output.
+func (h *fakeHost) runRevert(unit, who string) (string, error) {
+	h.t.Helper()
+	cmd := exec.Command("/bin/sh", h.FS+guardStateDir+"/"+unit+"/"+revertScript, who)
+	cmd.Env = append(cmd.Environ(), "PATH="+fakeRemotePATH(h.Root), "FAKE_ROOT="+h.Root)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// installRevert writes g's revert script into the fake host's guard
+// directory, as arm does.
+func (h *fakeHost) installRevert(r *Runner, g *guard) {
+	h.t.Helper()
+	h.write("fs"+guardStateDir+"/"+g.unit+"/"+revertScript, r.revertScriptBody(g), 0o644)
+}
+
+// A revert step that fails keeps its marker, writes no reverted marker and
+// exits 1; the next attempt finishes the job.
+func TestRevertFailureKeepsItsMarkers(t *testing.T) {
+	t.Parallel()
+	h := newFakeHost(t, debian12)
+	r := h.runner()
+	h.installRevert(r, r.sshGuard("ssh"))
+	const old = "PasswordAuthentication no\n"
+	h.write("fs/etc/ssh/sshd_config.d/10-depper.conf", dropInContent(true), 0o644)
+	h.write(sshGuardDir+"/had-prev", "", 0o644)
+	// prev is a directory: cp fails.
+	h.write(sshGuardDir+"/prev/x", "", 0o644)
+	out, err := h.runRevert(sshRevertUnit, "timer")
+	if err == nil || !strings.Contains(out, "could not restore") || !strings.Contains(out, "the revert did not complete") {
+		t.Fatalf("revert: err %v, output %q", err, out)
+	}
+	if !h.has(sshGuardDir+"/had-prev") || h.has(sshGuardDir+"/reverted") || h.read("fs/etc/ssh/sshd_config.d/10-depper.conf") != dropInContent(true) {
+		t.Error("a failed restore removed its marker, wrote reverted, or changed the drop-in")
+	}
+	h.remove(sshGuardDir + "/prev")
+	h.write(sshGuardDir+"/prev", old, 0o644)
+	if out, err := h.runRevert(sshRevertUnit, "pending"); err != nil {
+		t.Fatalf("second revert: %v\n%s", err, out)
+	}
+	if h.read("fs/etc/ssh/sshd_config.d/10-depper.conf") != old || !strings.HasPrefix(h.read(sshGuardDir+"/reverted"), "pending ") {
+		t.Errorf("drop-in %q, reverted %q", h.read("fs/etc/ssh/sshd_config.d/10-depper.conf"), h.read(sshGuardDir+"/reverted"))
+	}
+	h.noGuardMarkers(sshRevertUnit)
+
+	// A firewall port that cannot be closed keeps added-ports.
+	fp, fr := firewallMarkers(firewallGuard{added: []int{80}, remove: func(string) string { return "false" }})
+	g := &guard{name: "--firewall", unit: firewallRevertUnit, prepare: fp, revert: fr}
+	h.installRevert(r, g)
+	h.write("fs"+guardStateDir+"/"+firewallRevertUnit+"/added-ports", "80\n", 0o644)
+	if out, err := h.runRevert(firewallRevertUnit, "now"); err == nil || !strings.Contains(out, "could not close port 80/tcp again") {
+		t.Errorf("firewall revert: err %v, output %q", err, out)
+	}
+	if !h.has("fs" + guardStateDir + "/" + firewallRevertUnit + "/added-ports") {
+		t.Error("added-ports removed although the port is still open")
+	}
+}
+
+// The revert waits for the guard lock (held by disarm or another revert),
+// and a revert the timer starts after the guard was disarmed does nothing.
+func TestRevertHoldsTheGuardLock(t *testing.T) {
+	t.Parallel()
+	h := newFakeHost(t, debian12)
+	r := h.runner()
+	h.installRevert(r, r.sshGuard("ssh"))
+	h.write("fs/etc/ssh/sshd_config.d/10-depper.conf", dropInContent(true), 0o644)
+	h.write(sshGuardDir+"/had-none", "", 0o644)
+	h.write(sshGuardDir+"/lock/.keep", "", 0o644)
+	h.remove(sshGuardDir + "/lock/.keep")
+	cmd := exec.Command("/bin/sh", h.FS+guardStateDir+"/"+sshRevertUnit+"/"+revertScript, "timer")
+	cmd.Env = append(cmd.Environ(), "PATH="+fakeRemotePATH(h.Root), "FAKE_ROOT="+h.Root)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if !h.has("fs/etc/ssh/sshd_config.d/10-depper.conf") || h.has(sshGuardDir+"/started") {
+		t.Fatal("the revert ran while the lock was held")
+	}
+	// The holder disarmed the guard meanwhile (as disarm does under the
+	// lock), then releases it.
+	h.write(sshGuardDir+"/disarmed", "", 0o644)
+	h.remove(sshGuardDir + "/had-none")
+	h.remove(sshGuardDir + "/lock")
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("revert: %v", err)
+	}
+	if !h.has("fs/etc/ssh/sshd_config.d/10-depper.conf") || h.has(sshGuardDir+"/started") || h.has(sshGuardDir+"/reverted") || h.has("sshd-reloads") {
+		t.Error("a revert started after disarming changed something")
+	}
+}
+
+// Transient timers do not survive a reboot: the boot service runs the
+// revert of a change a reboot left unverified, and when it did not run,
+// the next host init finishes it from the markers.
+func TestRevertAfterAReboot(t *testing.T) {
+	t.Parallel()
+	interrupted := func(t *testing.T) *fakeHost {
+		h := newFakeHost(t, debian12)
+		r := h.runner()
+		r.interruptAt = StepHardenSSH
+		if _, err := r.Init(context.Background(), h.optionsWith(func(o *Options) { o.HardenSSH = true })); !errors.Is(err, errInterrupted) {
+			t.Fatalf("err = %v", err)
+		}
+		// The reboot: the transient timer is gone.
+		h.remove("units/depper-ssh-revert.timer.active")
+		h.waitEvent("cancelled depper-ssh-revert\n", 5*time.Second)
+		return h
+	}
+	t.Run("boot service", func(t *testing.T) {
+		t.Parallel()
+		h := interrupted(t)
+		if !h.has("units/"+bootUnit+".enabled") || !strings.Contains(h.read("fs/etc/systemd/system/"+bootUnit), "ExecStart=/bin/sh "+h.FS+guardStateDir+"/"+bootScript) {
+			t.Fatalf("boot unit not installed and enabled: %q", h.read("fs/etc/systemd/system/"+bootUnit))
+		}
+		cmd := exec.Command("/bin/sh", h.FS+guardStateDir+"/"+bootScript)
+		cmd.Env = append(cmd.Environ(), "PATH="+fakeRemotePATH(h.Root), "FAKE_ROOT="+h.Root)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("boot script: %v\n%s", err, out)
+		}
+		if h.has("fs/etc/ssh/sshd_config.d/10-depper.conf") || !strings.HasPrefix(h.read(sshGuardDir+"/reverted"), "boot ") || !h.has("sshd-reloads") {
+			t.Error("the boot revert did not remove the drop-in and reload sshd")
+		}
+		h.noGuardMarkers(sshRevertUnit)
+		before := len(h.Out.String())
+		mustInit(t, h, h.optionsWith(func(o *Options) { o.HardenSSH = true }))
+		if strings.Contains(h.Out.String()[before:], "Finishing an interrupted host init") {
+			t.Error("a reverted guard was treated as pending")
+		}
+	})
+	t.Run("markers only", func(t *testing.T) {
+		t.Parallel()
+		h := interrupted(t)
+		before := len(h.Out.String())
+		res := mustInit(t, h, h.optionsWith(func(o *Options) { o.HardenSSH = true }))
+		if !strings.Contains(h.Out.String()[before:], "Finishing an interrupted host init: its --harden-ssh change was never verified, so depper-ssh-revert reverts it now (timer dead).") {
+			t.Errorf("output:\n%s", h.Out.String()[before:])
+		}
+		if strings.Contains(h.read("timer-events"), "started depper-ssh-revert.service") || !contains(res.Applied, StepHardenSSH) {
+			t.Errorf("timer events %q, applied %v", h.read("timer-events"), res.Applied)
+		}
+		h.noGuardMarkers(sshRevertUnit)
+	})
+}
+
+// An interrupted firewalld change is reverted in the zone recorded when
+// it was armed, even if the interface's zone changed since.
+func TestInterruptedFirewalldRevertUsesTheRecordedZone(t *testing.T) {
+	t.Parallel()
+	h := newFakeHost(t, rocky9)
+	h.write("packages", "coreutils\nca-certificates\nshadow-utils\ncurl\nfirewalld\n", 0o644)
+	h.write("pkg-bin/firewall-cmd", fakeFirewallCmd, 0o755)
+	h.write("pkg-bin/firewall-offline-cmd", fakeFirewallCmd, 0o755)
+	h.write("units/firewalld.service.active", "", 0o644)
+	h.write("firewalld-iface-zones", "eth0 internal\n", 0o644)
+	r := h.runner()
+	r.interruptAt = StepFirewall
+	if _, err := r.Init(context.Background(), h.optionsWith(func(o *Options) { o.Firewall = []int{443} })); !errors.Is(err, errInterrupted) {
+		t.Fatalf("err = %v", err)
+	}
+	if h.read("fwd/internal.runtime") != "443/tcp\n" || h.read("fs"+guardStateDir+"/"+firewallRevertUnit+"/zone") != "internal\n" {
+		t.Fatalf("runtime %q zone %q", h.read("fwd/internal.runtime"), h.read("fs"+guardStateDir+"/"+firewallRevertUnit+"/zone"))
+	}
+	h.write("firewalld-iface-zones", "eth0 dmz\n", 0o644)
+	res, err := h.runner().Init(context.Background(), h.optionsWith(func(o *Options) { o.DryRun = true }))
+	if err != nil || !strings.Contains(strings.Join(res.Warnings, "\n"), "depper-firewall-revert.timer waiting") {
+		t.Fatalf("dry run: %v %v", err, res.Warnings)
+	}
+	mustInit(t, h, h.options())
+	if !strings.Contains(h.Out.String(), "Finishing an interrupted host init: its --firewall change was never verified") {
+		t.Errorf("output:\n%s", h.Out.String())
+	}
+	if h.read("fwd/internal.runtime") != "" || h.read("fwd/internal.perm") != "" {
+		t.Errorf("runtime %q perm %q after the revert", h.read("fwd/internal.runtime"), h.read("fwd/internal.perm"))
+	}
+	h.noGuardMarkers(firewallRevertUnit)
 }

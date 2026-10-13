@@ -580,6 +580,10 @@ jobs:
           if [ "$took" -lt 118 ] || [ "$took" -gt 130 ]; then echo "::error::the revert ran ${took}s after host init started, want ~120s"; exit 1; fi
           sudo test ! -e /etc/ssh/sshd_config.d/10-depper.conf
           for m in had-none had-prev prev; do sudo test ! -e "/var/lib/depper/guard/depper-ssh-revert/$m"; done
+          # The boot service that reverts a change a reboot left unverified is
+          # installed and enabled on real systemd.
+          systemctl is-enabled depper-guard-revert.service
+          systemd-analyze verify /etc/systemd/system/depper-guard-revert.service
           expect_eq "sshd -T after the revert" "$(sshd_auth)" "$before"
           # sshd was reloaded with the original configuration: when it
           # allowed passwords before, the running server offers them again.

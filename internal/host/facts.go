@@ -139,7 +139,9 @@ type GuardState struct {
 
 // Pending reports that a guarded change of an earlier run was neither
 // verified nor reverted.
-func (g GuardState) Pending() bool { return g.Timer == "waiting" || g.Markers }
+func (g GuardState) Pending() bool {
+	return g.Timer == "waiting" || g.Service == "activating" || g.Markers
+}
 
 // pkgReq is one package requirement: satisfied when the package is installed
 // or, when Cmd is set, when the command exists (curl-minimal and

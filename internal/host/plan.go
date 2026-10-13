@@ -458,10 +458,13 @@ fi`
 					s.lines = append(s.lines, "ufw --force enable")
 					parts = append(parts, "enable ufw")
 				}
-				s.prepare, s.revert = firewallMarkers(!f.UFWActive, add,
-					[]string{"ufw --force disable"},
-					nil,
-					func(pt string) []string { return []string{"ufw delete allow " + pt + " || true"} })
+				s.prepare, s.revert = firewallMarkers(firewallGuard{
+					enabling: !f.UFWActive, disable: []string{"ufw --force disable >/dev/null"},
+					added: add,
+					remove: func(port string) string {
+						return `{ ufw delete allow ` + port + `/tcp >/dev/null 2>&1 || ! ufw status 2>/dev/null | grep -Eq "^` + port + `/tcp[[:space:]]"; }`
+					},
+				})
 				s.Detail = strings.Join(parts, ", then ") + "; reverted automatically unless new admin and " + o.User + " logins succeed"
 			}
 		} else {
@@ -498,8 +501,13 @@ fi`
 				if f.FirewalldActive {
 					fc = "firewall-cmd"
 				}
+				// The zone is determined when the revert is armed and
+				// recorded for it; the step and the revert both use it.
 				zone := firewalldZoneLines(fc, f.SSHInterface)
-				s.lines = append(s.lines, zone...)
+				fwDir := r.raw(guardStateDir + "/" + firewallRevertUnit)
+				s.lines = append(s.lines,
+					`depper_zone=$(cat `+shell.Quote(fwDir+"/zone")+`)`,
+					`case "$depper_zone" in ""|*[!A-Za-z0-9_-]*) echo "the firewalld zone recorded for the revert is missing or invalid" >&2; exit 1 ;; esac`)
 				if f.FirewalldActive {
 					// Runtime and permanent, so nothing depends on a reload.
 					for _, port := range add {
@@ -508,20 +516,30 @@ fi`
 							`firewall-cmd --zone="$depper_zone" --add-port=`+pt,
 							`firewall-cmd --permanent --zone="$depper_zone" --add-port=`+pt)
 					}
-					s.prepare, s.revert = firewallMarkers(false, add, nil, zone,
-						func(pt string) []string {
-							return []string{
-								`firewall-cmd --zone="$depper_zone" --remove-port=` + pt + ` || true`,
-								`firewall-cmd --permanent --zone="$depper_zone" --remove-port=` + pt + ` || true`,
-							}
-						})
+					s.prepare, s.revert = firewallMarkers(firewallGuard{
+						added: add, zone: zone,
+						remove: func(port string) string {
+							rt, pm := `firewall-cmd --zone="$depper_zone"`, `firewall-cmd --permanent --zone="$depper_zone"`
+							pt := port + "/tcp"
+							return `{ ` + rt + ` --remove-port=` + pt + ` >/dev/null 2>&1 || ! ` + rt + ` --query-port=` + pt + ` >/dev/null 2>&1; } && { ` + pm + ` --remove-port=` + pt + ` >/dev/null 2>&1 || ! ` + pm + ` --query-port=` + pt + ` >/dev/null 2>&1; }`
+						},
+					})
 					s.Detail = "allow " + intsString(add) + " (runtime and permanent)"
 				} else {
 					for _, port := range add {
 						s.lines = append(s.lines, `firewall-offline-cmd --zone="$depper_zone" --add-port=`+strconv.Itoa(port)+"/tcp")
 					}
 					s.lines = append(s.lines, "systemctl enable --now firewalld.service")
-					s.prepare, s.revert = firewallMarkers(true, nil, []string{"systemctl disable --now firewalld.service"}, nil, nil)
+					s.prepare, s.revert = firewallMarkers(firewallGuard{
+						enabling: true,
+						disable:  []string{`if test -f "$d/` + markWasEnabled + `"; then systemctl stop firewalld.service; else systemctl disable --now firewalld.service; fi`},
+						extra:    []string{`if systemctl is-enabled --quiet firewalld.service 2>/dev/null; then : > "$d/` + markWasEnabled + `"; fi`},
+						added:    add, zone: zone,
+						remove: func(port string) string {
+							pt := port + "/tcp"
+							return `{ firewall-offline-cmd --zone="$depper_zone" --remove-port=` + pt + ` >/dev/null 2>&1 || ! firewall-offline-cmd --zone="$depper_zone" --query-port=` + pt + ` >/dev/null 2>&1; }`
+						},
+					})
 					s.Detail = "allow " + intsString(add) + ", then enable firewalld"
 					if len(add) == 0 {
 						s.Detail = "enable firewalld"
@@ -868,34 +886,60 @@ func guardSupported(f *Facts, flag string) error {
 	return nil
 }
 
+// firewallGuard describes the revert of a firewall step for firewallMarkers.
+type firewallGuard struct {
+	// enabling: the step turns the firewall on (marker was-inactive); the
+	// revert runs disable, which must succeed as a whole.
+	enabling bool
+	disable  []string
+	// added are the ports the step opens (marker added-ports, one per
+	// line). For each, the revert runs remove(port) (a condition that
+	// holds when the port is closed again); zone, when set, are prepare
+	// lines that set $depper_zone, which is recorded for the revert.
+	added  []int
+	zone   []string
+	remove func(port string) string
+	// extra are further prepare lines (for example was-enabled).
+	extra []string
+}
+
 // firewallMarkers returns the prepare and revert lines of a firewall step.
-// enabling: the step turns the firewall on (marker was-inactive; the
-// revert runs disable). added: ports the step opens (marker added-ports,
-// one per line; the revert runs remove for each, after the setup lines).
-func firewallMarkers(enabling bool, added []int, disable, setup []string, remove func(pt string) []string) (prepare, revert []string) {
-	if enabling {
-		prepare = append(prepare, `: > "$d/`+markWasInactive+`"`)
-		revert = append(revert, `if test -f "$d/`+markWasInactive+`"; then`)
-		for _, l := range disable {
-			revert = append(revert, "  "+l)
-		}
-		revert = append(revert, `  rm -f "$d/`+markWasInactive+`"`, "fi")
+// Each marker is removed only when its undo succeeded; otherwise the
+// revert sets depper_fail and the marker stays for the next attempt.
+func firewallMarkers(fg firewallGuard) (prepare, revert []string) {
+	prepare = append(prepare, fg.zone...)
+	if len(fg.zone) > 0 {
+		prepare = append(prepare, `printf '%s\n' "$depper_zone" > "$d/zone"`)
 	}
-	if len(added) > 0 && remove != nil {
+	prepare = append(prepare, fg.extra...)
+	if fg.enabling {
+		prepare = append(prepare, `: > "$d/`+markWasInactive+`"`)
+		revert = append(revert,
+			`if test -f "$d/`+markWasInactive+`"; then`,
+			`  if { `+strings.Join(fg.disable, " && ")+`; }; then rm -f "$d/`+markWasInactive+`" "$d/`+markWasEnabled+`"; else echo "could not turn the firewall off again" >&2; depper_fail=1; fi`,
+			`fi`)
+	}
+	if len(fg.added) > 0 {
 		var ps []string
-		for _, p := range added {
+		for _, p := range fg.added {
 			ps = append(ps, strconv.Itoa(p))
 		}
 		prepare = append(prepare, "printf '%s\\n' "+strings.Join(ps, " ")+` > "$d/`+markAddedPorts+`"`)
-		revert = append(revert, `if test -f "$d/`+markAddedPorts+`"; then`)
-		for _, l := range setup {
-			revert = append(revert, "  "+l)
+		revert = append(revert, `if test -f "$d/`+markAddedPorts+`"; then`, `  depper_pfail=0`)
+		if len(fg.zone) > 0 {
+			revert = append(revert,
+				`  depper_zone=$(cat "$d/zone" 2>/dev/null)`,
+				`  case "$depper_zone" in ""|*[!A-Za-z0-9_-]*) echo "the recorded firewalld zone in $d/zone is missing or invalid" >&2; depper_pfail=1 ;; esac`)
 		}
-		revert = append(revert, `  while read -r depper_port; do`, `    case "$depper_port" in ""|*[!0-9]*) continue ;; esac`)
-		for _, l := range remove(`"$depper_port"/tcp`) {
-			revert = append(revert, "    "+l)
-		}
-		revert = append(revert, `  done < "$d/`+markAddedPorts+`"`, `  rm -f "$d/`+markAddedPorts+`"`, "fi")
+		revert = append(revert,
+			`  if test "$depper_pfail" = 0; then`,
+			`    while read -r depper_port; do`,
+			`      case "$depper_port" in ""|*[!0-9]*) continue ;; esac`,
+			`      `+fg.remove(`"$depper_port"`)+` || { echo "could not close port $depper_port/tcp again" >&2; depper_pfail=1; }`,
+			`    done < "$d/`+markAddedPorts+`"`,
+			`  fi`,
+			`  if test "$depper_pfail" = 0; then rm -f "$d/`+markAddedPorts+`" "$d/zone"; else depper_fail=1; fi`,
+			`fi`)
 	}
 	return prepare, revert
 }
