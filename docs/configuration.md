@@ -3,7 +3,7 @@
 depper reads one TOML file from the repository root.
 
 - The file is `depper.toml`. If it is absent, `deploy.toml` (the name used by the Python `deployer`) is read instead. If both exist, depper stops with an error; keep only `depper.toml`.
-- `depper init` writes a starter `depper.toml` and refuses to run when either file exists.
+- `depper init` writes a starter `depper.toml` pre-filled from what it finds in the repository (see [Generating a starter file](#generating-a-starter-file-with-depper-init)). It refuses to overwrite an existing `depper.toml` unless you pass `--force`, and refuses whenever a `deploy.toml` exists.
 - Unknown tables and unknown keys are errors, so a misspelled key is reported rather than ignored.
 - Both file names are excluded from the upload to the host.
 - Relative local paths in the file (`identity_file`, `known_hosts`, `[secrets].file`) are relative to the repository root. `~` is expanded. Paths given on the command line (`--env FILE`) are relative to the current directory.
@@ -46,6 +46,65 @@ start_period = 30
 interval = 2
 ```
 
+## Generating a starter file with `depper init`
+
+```sh
+depper init [REPO]
+```
+
+`depper init` inspects the repository root and writes a `depper.toml` pre-filled for the project it recognises. It only reads a few well-known files; it executes nothing in the repository, never reads `.env` files (it notes that `.env.prod` or `.env.production` exists, not what is in it), reads at most 1 MiB of any file, and does not follow a symbolic link at the final path element. Detection looks at the top level of the repository, apart from `cmd/` for Go and the project directories of a Django project.
+
+After writing the file it prints `Created PATH` and `Detected: KIND (evidence)`. Then set the server: run [`depper host init`](hosts.md#automated-setup-with-depper-host-init) to prepare one and fill in `[deploy]`, or edit `host` yourself.
+
+| Flag | Description |
+| --- | --- |
+| `--print` | Write the generated configuration to standard output instead of `depper.toml`. Nothing is written to disk. With `--json`: `{"detection": {...}, "config": "..."}`. |
+| `--force` | Replace an existing `depper.toml` (atomically; a symbolic link at that path is replaced, not followed). A `deploy.toml` still stops the command. |
+| `--json` | Without `--print`: `{"created": "PATH", "detection": {...}}`. The detection object has `kind`, `evidence`, `name`, `command`, `container`, `setup`, `port`, `port_from`, `health_url`, `excludes`, `secrets`, `requires`, and `warnings` (empty ones are omitted). |
+
+### Detectors and precedence
+
+The first detector that matches wins; the order is the order below. A repository with both a `compose.yaml` and a `go.mod` is a Docker Compose project.
+
+| # | Kind | Matches when the root has | Pre-fills |
+| --- | --- | --- | --- |
+| 1 | `compose` | `compose.yaml`, `compose.yml`, `docker-compose.yaml`, or `docker-compose.yml` (first of these) | `[container]` with `engine = "podman"` and `compose = "<file>"`. The port is the host port of the first `ports` entry of the first service (short syntax such as `8080:80` or `127.0.0.1:8080:80`, inline lists, and the long `published`/`target` syntax); 8080 is assumed when there is none. The file is read line by line, not parsed as YAML. |
+| 2 | `dockerfile` | `Dockerfile` | `[container]` with `engine = "podman"`, `build = "."`, and `ports = ["127.0.0.1:P:P"]`, where P is the first numeric `EXPOSE` port, or 8080 when there is none. |
+| 3 | `go` | `go.mod` | `setup = ["go build -o bin/<name> ./cmd/<dir>"]` when `cmd/` has exactly one directory with Go files (otherwise `./...`, with a warning when several exist), `command = "./bin/<name>"`, `exclude = ["bin/"]`, `PORT = "8080"`. The server needs Go. |
+| 4 | `node` | `package.json` | The package manager from the lock file: `pnpm-lock.yaml` (pnpm), `yarn.lock` (yarn), `package-lock.json` or `npm-shrinkwrap.json` (npm); npm without a lock file, with a note that versions are not pinned. `setup` installs from the lock file (`npm ci`, `pnpm install --frozen-lockfile`, `yarn install --frozen-lockfile`) and adds `<manager> run build` when `package.json` has a `build` script. Development dependencies are skipped (`--omit=dev`, `--prod`, `--production`) only when there is no build script. `command` is `<manager> start` when there is a `start` script, else `node <main>`, else a guess with a warning. `PORT = "3000"`. |
+| 5 | `python` | `uv.lock`, `pyproject.toml`, or `requirements.txt` | Setup: `uv sync --frozen --no-dev` with `uv.lock` (`uv sync --no-dev` with only `[tool.uv]`); otherwise `python3 -m venv .venv` and `.venv/bin/pip install -r requirements.txt`, or `.venv/bin/pip install .` for a `pyproject.toml` alone. Command, first match: Django (`manage.py`) with gunicorn listed and a `<project>/wsgi.py`, gunicorn on `127.0.0.1`, else `runserver` with a warning; FastAPI or uvicorn, `python -m uvicorn module:app`; Flask, gunicorn if listed, else `flask run` with a warning; the first (sorted) `[project.scripts]` entry; a package named after the project with a `__main__.py`; `main.py`, `app.py`, or `server.py`; otherwise a guess from the directory name, with a warning. Excludes `.venv/` and `__pycache__/`. `PORT = "8000"`. |
+| 6 | `rust` | `Cargo.toml` | `setup = ["cargo build --release"]`, `command = "./target/release/<bin>"` (from `[[bin]]`, else the package name, else the service name; a warning for a workspace root or several binaries), `exclude = ["target/"]`, `PORT = "8080"`. The server needs cargo. |
+| 7 | `static` | `index.html` | `command = "python3 -m http.server 8000 --bind 127.0.0.1"`, `PORT = "8000"`. |
+| 8 | `generic` | none of the above | A generic template with the placeholder command `python -m your_app`, no `[env]` port and no `[health]`. Replace the placeholders. |
+
+For every kind:
+
+- `[service].name` comes from the directory name: lowercase, runs of other characters replaced by one `-`, at most 63 characters, `app` if nothing is left. It satisfies both the unit-name and the image-name rules.
+- `[secrets].file` is set to `.env.prod` or `.env.production` (the first that exists as a regular file); the file is not opened.
+- `[health].url` is `http://127.0.0.1:<port>/` when a port is known, marked as assumed. Point it at a real health endpoint if the app has one.
+- `[deploy].host` is the placeholder `deploy@203.0.113.10` (a documentation address), and the other `[deploy]`, `[endpoint]`, `[tunnel]`, and `[targets]` keys appear as commented examples.
+- For container projects `command` is omitted and the engine is `podman`; change it to `docker` if you prefer, and see [Containers](containers.md#host-requirements) for what each needs on the host.
+
+### Provenance comments
+
+Everything inferred ends with a comment that says where it came from, for example:
+
+```toml
+[service]
+name = "my-api"  # from the directory name
+command = "./bin/my-api"  # the binary built by the setup step
+
+[deploy]
+setup = [
+  "go build -o bin/my-api ./cmd/api",  # from the single main package in cmd/api
+]
+
+[env]
+PORT = "8080"  # default for Go apps; make sure your app listens on it
+```
+
+The header names the detected kind and the files it was based on (`Detected from: go.mod, cmd/api`), lists what the server needs (`The server needs: go.`), and repeats each warning (`# Warning: ...`). A note above a line explains a caveat, such as `runserver` being Django's development server. Treat every line that ends in a `# ...` comment as a guess to review before you deploy.
+
 ## [service]
 
 | Key | Type | Default | Description |
@@ -72,7 +131,7 @@ The unit sets `RestartSec=3`. `depper stop` leaves the service stopped until `de
 | `source` | string | `"worktree"` | `"worktree"` uploads the working directory including uncommitted changes. `"git"` uploads the committed content of `HEAD` (`git archive`). `depper deploy --ref REF` forces git mode for one deployment. |
 | `healthcheck` | string | none | Alias of `[health].command`. Setting both is an error. |
 
-Always-excluded rsync patterns (applied before `exclude`): `.git/`, `.env`, `.env.*`, `deploy.toml`, `depper.toml`, `.cloudflared/`, `.cache/`, `node_modules/`, `venv/`, `.venv/`, `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`. The selected secrets file is also excluded by its anchored path when it lies inside the repository. `.gitignore` is not consulted in worktree mode: anything not excluded is uploaded, including ignored build output.
+Always-excluded rsync patterns (applied before `exclude`): `.git/`, `.env`, `.env.*`, `deploy.toml`, `depper.toml`, `.cloudflared/`, `/.depper/`, `.cache/`, `node_modules/`, `venv/`, `.venv/`, `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`. `/.depper/` keeps repository-local depper state out of releases, in particular the `.depper/known_hosts` that `depper host init` writes. Unlike the other patterns it is anchored with a leading `/`, so only the `.depper/` directory at the repository root is excluded and a `.depper/` directory deeper in the tree (for example `vendor/pkg/.depper/`) is uploaded normally. The selected secrets file is also excluded by its anchored path when it lies inside the repository. `.gitignore` is not consulted in worktree mode: anything not excluded is uploaded, including ignored build output.
 
 Examples of `host`:
 

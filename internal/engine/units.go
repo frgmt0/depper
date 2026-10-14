@@ -16,10 +16,14 @@ const StartScriptName = ".depper-start.sh"
 // ReleaseMetadataName is the release metadata file inside each release.
 const ReleaseMetadataName = ".depper-release.json"
 
-// StartScript is the process-mode start script: `exec` keeps the command as
-// the unit's main process.
+// StartScript is the process-mode start script. It first applies
+// shell.SessionEnv, so the service never runs with another user's
+// XDG_RUNTIME_DIR or unusable XDG base directories inherited from the
+// systemd user manager (pam_env and environment.d can put them there, and
+// UnsetEnvironment= is not available to every user unit). `exec` then keeps
+// the command as the unit's main process.
 func StartScript(command string) string {
-	return "#!/bin/sh\nexec " + command + "\n"
+	return "#!/bin/sh\n" + shell.Script(append(shell.SessionEnv(), "exec "+command)...)
 }
 
 // ProcessUnit renders the unit for [service].command.
@@ -61,6 +65,56 @@ func execLine(words ...string) string {
 		quoted[i] = unit.Arg(w)
 	}
 	return strings.Join(quoted, " ")
+}
+
+// EngineWrapperScript is the `sh -c` script every container-mode Exec*= line
+// runs the engine through: it applies shell.SessionEnv (rootless podman
+// refuses a runtime directory it does not own, and the systemd user manager
+// may carry another user's XDG_* variables, see StartScript) and then execs
+// the engine, which sh receives as $0, with its arguments as "$@".
+func EngineWrapperScript() string {
+	return strings.Join(shell.SessionEnv(), "; ") + `; exec "$0" "$@"`
+}
+
+// engineLine renders an Exec*= command line that runs enginePath with args
+// through /bin/sh -c EngineWrapperScript. Every word is quoted with
+// unit.Arg, so systemd expands neither $ nor % in the script; callers may
+// append further words, including an unquoted $VAR that systemd splits into
+// extra arguments, which sh passes on through "$@".
+func engineLine(enginePath string, args ...string) string {
+	return "/bin/sh -c " + unit.Arg(EngineWrapperScript()) + " " + execLine(append([]string{enginePath}, args...)...)
+}
+
+// composeRemoveLeftovers removes every container that still carries the
+// compose project label of $1, with the engine in $0. It runs after a
+// `compose down` that failed or left containers behind: a container whose
+// conmon was killed (an unclean stop of the user manager) stays listed as
+// running, `down` fails on it, and `up` would reuse it without its port
+// forwarding. The ids are engine-generated hex words.
+const composeRemoveLeftovers = `depper_ids=$("$0" ps -aq --filter "label=com.docker.compose.project=$1") || depper_ids=""; ` +
+	`if test -n "$depper_ids"; then echo "depper: removing leftover containers of compose project $1" >&2; "$0" rm -f $depper_ids; fi`
+
+// ComposeCleanupScript is the `sh -c` script of a compose unit's
+// ExecStartPre=: after shell.SessionEnv it runs `compose down
+// --remove-orphans` for project $1 and file $2 with the engine $0, then
+// force-removes any container of the project that is left, so the start
+// never meets a stale container.
+func ComposeCleanupScript() string {
+	return strings.Join(shell.SessionEnv(), "; ") + `; "$0" compose -p "$1" -f "$2" --env-file /dev/null down --remove-orphans; ` + composeRemoveLeftovers
+}
+
+// ComposeStopScript is the `sh -c` script of a compose unit's ExecStop=:
+// `compose down`, and when that fails, force-removal of the project's
+// containers, so a stop never leaves containers behind.
+func ComposeStopScript() string {
+	return strings.Join(shell.SessionEnv(), "; ") + `; if "$0" compose -p "$1" -f "$2" --env-file /dev/null down; then exit 0; fi; ` +
+		`echo "depper: compose down failed for project $1" >&2; ` + composeRemoveLeftovers
+}
+
+// composeScriptLine renders an Exec*= line that runs script with the engine
+// as $0, the project as $1 and the compose file as $2.
+func composeScriptLine(script, enginePath, project, file string) string {
+	return "/bin/sh -c " + unit.Arg(script) + " " + execLine(enginePath, project, file)
 }
 
 // ContainerEnvArgsVar is the variable depper adds to the environment file in
@@ -125,25 +179,37 @@ func ContainerUnit(cfg *config.Config, base, enginePath, releaseID string) (stri
 		"[Unit]",
 		"Description=depper: " + cfg.Service.Name,
 		"After=network.target",
+	}
+	if c.Mode() == config.ModeCompose && c.Engine == "podman" {
+		// A docker-compose provider talks to the podman API socket: start
+		// after it, and on manager stop, stop before it (and the podman
+		// service it activates).
+		lines = append(lines, "Wants=podman.socket", "After=podman.socket")
+	}
+	lines = append(lines,
 		"",
 		"[Service]",
 		"Type=simple",
-		"WorkingDirectory=" + unit.Path(base+"/current"),
-		"EnvironmentFile=" + unit.Path(base+"/.depper/environment"),
-	}
+		"WorkingDirectory="+unit.Path(base+"/current"),
+		"EnvironmentFile="+unit.Path(base+"/.depper/environment"),
+	)
 	switch c.Mode() {
 	case config.ModeCompose:
 		// --env-file /dev/null: interpolate ${VAR} only from the process
 		// environment (EnvironmentFile= above), never from a .env file in
 		// the release; `environment: [KEY]` passes values through as well.
+		// ExecStartPre= clears whatever an unclean stop left (see
+		// ComposeCleanupScript), --force-recreate never reuses a container,
+		// and ExecStop= falls back to removing the containers.
 		project := ComposeProject(cfg)
 		lines = append(lines,
-			"ExecStart="+execLine(enginePath, "compose", "-p", project, "-f", c.Compose, "--env-file", "/dev/null", "up", "--build", "--remove-orphans"),
-			"ExecStop="+execLine(enginePath, "compose", "-p", project, "-f", c.Compose, "--env-file", "/dev/null", "down"),
+			"ExecStartPre=-"+composeScriptLine(ComposeCleanupScript(), enginePath, project, c.Compose),
+			"ExecStart="+engineLine(enginePath, "compose", "-p", project, "-f", c.Compose, "--env-file", "/dev/null", "up", "--build", "--remove-orphans", "--force-recreate"),
+			"ExecStop="+composeScriptLine(ComposeStopScript(), enginePath, project, c.Compose),
 		)
 	default:
 		name := cfg.ContainerName()
-		run := execLine(enginePath, "run", "--rm", "--name", name) + " $" + ContainerEnvArgsVar
+		run := engineLine(enginePath, "run", "--rm", "--name", name) + " $" + ContainerEnvArgsVar
 		var rest []string
 		for _, p := range c.Ports {
 			rest = append(rest, "-p", p)
@@ -161,9 +227,9 @@ func ContainerUnit(cfg *config.Config, base, enginePath, releaseID string) (stri
 			rest = append(rest, words...)
 		}
 		lines = append(lines,
-			"ExecStartPre=-"+execLine(enginePath, "rm", "-f", name),
+			"ExecStartPre=-"+engineLine(enginePath, "rm", "-f", name),
 			"ExecStart="+run+" "+execLine(rest...),
-			"ExecStop="+execLine(enginePath, "stop", name),
+			"ExecStop="+engineLine(enginePath, "stop", name),
 		)
 	}
 	lines = append(lines,

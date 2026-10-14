@@ -317,14 +317,37 @@ func (e *Engine) runSetup(ctx context.Context, l *Layout, release, rid string, v
 		// environment instead: here exported in the script (stdin, never
 		// argv), and in the unit through EnvironmentFile=.
 		lines = append(lines, shell.Exports(values)...)
+		if c.Engine == "podman" {
+			lines = append(lines, PodmanSocketLines()...)
+		}
 		lines = append(lines, "cd "+shell.Quote(release))
 		compose := engine + " compose -p " + shell.Quote(ComposeProject(cfg)) + " -f " + shell.Quote(c.Compose) + " --env-file /dev/null"
-		lines = append(lines, compose+" config --quiet", compose+" build")
+		// config >/dev/null rather than config --quiet: podman-compose (the
+		// provider of `podman compose` on Ubuntu 24.04) has no --quiet.
+		lines = append(lines, compose+" config >/dev/null", compose+" build")
 	}
 	if err := e.Remote.Run(ctx, shell.Script(lines...)); err != nil {
 		return fmt.Errorf("container setup failed: %w", err)
 	}
 	return nil
+}
+
+// PodmanSocketLines make sure the deploy user's podman.socket is enabled
+// and active before any `podman compose` command. podman runs an external
+// compose provider, and when that is docker-compose (installed with docker,
+// and preferred by podman when present) it talks to the podman API socket
+// ($XDG_RUNTIME_DIR/podman/podman.sock): without the socket every compose
+// command fails, although `podman compose version` works. Enabling it is
+// harmless for podman-compose. The lines are idempotent and need the
+// shell.SessionEnv prelude (set -e scripts).
+func PodmanSocketLines() []string {
+	return []string{
+		`if ! systemctl --user is-enabled --quiet podman.socket 2>/dev/null || ! systemctl --user is-active --quiet podman.socket 2>/dev/null; then`,
+		`  echo "Enabling podman.socket for $(id -un) (the podman API socket a docker-compose provider of podman compose talks to)" >&2`,
+		`  systemctl --user enable --now podman.socket || { echo "depper: could not enable podman.socket for $(id -un) (systemctl --user enable --now podman.socket failed)" >&2; exit 1; }`,
+		`  systemctl --user is-active --quiet podman.socket || { echo "depper: podman.socket for $(id -un) is not active after enabling it" >&2; exit 1; }`,
+		`fi`,
+	}
 }
 
 var repoDigestRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$`)

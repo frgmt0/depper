@@ -38,12 +38,36 @@ The `test` workflow runs `go vet`, the gofmt check, and `go test -race -timeout 
 
 ### Tests never contact a real host
 
-No test connects to a real machine, and none should. The suite uses fakes at two levels:
+No `go test` test connects to a real machine, and none should. (The [end-to-end workflow](#end-to-end-tests) is separate: it runs in CI and targets the runner VM itself.) The suite uses fakes at two levels:
 
 - An injectable executor. Everything that runs a local program (`ssh`, `rsync`, `git`) goes through the `transport.Executor` interface. `transport.Local` runs real processes, `transport.DryRun` prints commands, and `transporttest.Recorder` records calls and returns canned results, so command-line construction and parsing are tested without running anything.
 - A fake host in a temporary directory, for end-to-end flows (`internal/engine`, `internal/tunnel`). The test binary re-executes itself as a fake `ssh` and `rsync` (selected with the `DEPPER_FAKE` environment variable through small wrapper scripts placed first on `PATH`). The fake `ssh` runs the received script with `sh -s` against a fake home directory and fake `systemctl`, `journalctl`, `docker`, `curl`, and `cloudflared`; `ssh -W` serves canned HTTP responses; the fake `rsync` copies with the local `rsync`. Deploy, rollback, secrets, lock, health, migration, and tunnel behaviour are exercised this way.
 
 When you add behaviour that talks to a host, extend the fakes rather than testing against a machine. Write table-driven tests where inputs vary. Tests must not print secret values, and assertions on output should check that dotenv values never appear.
+
+### End-to-end tests
+
+`.github/workflows/e2e.yml` runs depper against a real host. The host is the GitHub-hosted `ubuntu-latest` runner itself, a full Ubuntu virtual machine with systemd and passwordless `sudo`: the job starts the runner's sshd, authorizes two freshly generated keys (an administrator key for `root` and a deploy key), and uses `127.0.0.1` as the deploy target. Nothing else is contacted except GitHub, the Ubuntu archive (apt), and docker.io (container images). The unit tests use fakes (see above); this workflow checks the scripts against real `sshd`, `useradd`, `loginctl`, `systemctl --user`, `ufw`, rsync, and podman. It exercises the `root` administrator path only; the `sudo` administrator path is covered by unit tests alone.
+
+It runs on every push to `main` and to `feature/**` branches, and on demand. The job has a 30 minute timeout, and a newer run on the same ref cancels the older one. In order, the steps:
+
+1. Build depper, then write the helpers: `dep` runs depper with a timeout, keeps its output under `$RUNNER_TEMP/e2e/logs`, and fails unless the exit code is the expected one; `check` asserts on JSON output with `jq -e`.
+2. Start sshd (through `ssh.socket` on Ubuntu 24.04) and create the keys.
+3. `depper host init` on the `examples/basic` project, then assertions on the deploy user, lingering, the user manager, `/etc/depper/host.json`, the written `depper.toml`, and the mode of `.depper/known_hosts`.
+4. `doctor`, `deploy`, `health` (an `ssh -W` check), and `status`; a second deploy, `check`, and `rollback`.
+5. `secrets diff` and `secrets push` with a test-only secret that the job generates; it checks that the running service has the value, by hash, and that the value never appears in depper's output.
+6. `releases`, `logs`, a second `host init` that must change nothing, and `host status`.
+7. `unlock` with leftover and stale locks (a depper process killed mid-deploy), and the raw `ssh -W` forward that health checks use.
+8. podman in build mode (`examples/container`), image mode (digest pinning, nginx), and compose mode (`examples/compose` with `podman-compose`). Before the build-mode step the job removes the runner image's podman packages, so that `host init` installs them as it would on a fresh VPS.
+9. "SSH hardening reverts itself when the admin is locked out": runs `host init --harden-ssh` with the test hook described below, then asserts that the revert timer on the host undid the drop-in within about 120 seconds (the `reverted` marker in `/var/lib/depper/guard/depper-ssh-revert/` names the timer) and that `sshd -T` shows the original values again.
+10. `host init --harden-ssh --firewall 22`, then checks that password login is refused, root key login still works, ufw is active, the deploy user still deploys, and a repeat run changes nothing.
+11. On failure, a diagnostics step prints the depper logs, the deploy user's journal and units, sshd's configuration, and the firewall status.
+
+The runner image puts its own user's directories in `/etc/environment` (`XDG_RUNTIME_DIR=/run/user/1001`, `XDG_CONFIG_HOME=/home/runner/.config`). The "Start sshd" step saves those `XDG_` lines to `$RUNNER_TEMP/e2e/xdg-environment` and deletes them from `/etc/environment`, so the runner behaves like a fresh VPS and the deploy user's manager starts normally. Later, the "services ignore a foreign XDG environment" step gives the running deploy user manager the saved values with `systemctl --user set-environment` and checks that the main process of each depper service has the deploy user's `XDG_RUNTIME_DIR` and none of the foreign values. depper's own scripts ignore an `XDG_RUNTIME_DIR` that the current user does not own, and an `XDG_*_HOME` directory that is not owned by the user or is writable by group or others (`shell.SessionEnv`, covered by unit tests). The e2e test does not cover a user manager that starts with the foreign values, because depper does not control what the manager inherits. See [Preparing a host](hosts.md#another-users-xdg-variables-in-etcenvironment).
+
+The lockout test hook: step 9 needs a lockout that a test cannot cause for real, so `internal/host` has a hook for it. With both `DEPPER_E2E=1` and `DEPPER_E2E_LOCKOUT_ADMIN=1` set, `host init --harden-ssh` treats the administrator login after the sshd reload as failed and skips the immediate rollback. Only the revert timer on the host then undoes the drop-in, which is what the step asserts: the revert ran from the timer about 120 seconds after host init started, and `sshd -T` matches the original values. Both variables must be set; nothing else honours them. Never set them against a real server: the drop-in would stay in place until the timer reverts it, and host init would report a lockout that did not happen.
+
+To run it by hand, open the repository's Actions tab, choose the `e2e` workflow, and use "Run workflow" for a branch, or run `gh workflow run e2e.yml --ref BRANCH`. GitHub lists a `workflow_dispatch` workflow only once the file is on the default branch. Do not run these steps on your own machine: they create users, install packages, change sshd, and enable a firewall. To investigate a failure, read the diagnostics step and the `*.out` and `*.err` logs it prints, and reproduce on a disposable virtual machine.
 
 ## Code layout
 
@@ -59,6 +83,8 @@ When you add behaviour that talks to a host, extend the fakes rather than testin
 | `internal/dotenv` | The dotenv parser and source selection. |
 | `internal/tunnel` | Cloudflare Tunnel management. |
 | `internal/doctor` | Host readiness checks. |
+| `internal/host` | `depper host init` and `host status`: host facts, plan, host key pinning, sshd hardening, the host record, and the `depper.toml` edit. |
+| `internal/detect` | Project detection for `depper init`. File-based only; executes nothing. |
 | `internal/ci` | GitHub Actions workflow generation. |
 | `internal/exitcode` | Exit codes carried through errors. |
 | `internal/version` | Build version. |

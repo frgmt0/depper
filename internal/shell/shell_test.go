@@ -3,7 +3,10 @@ package shell
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -152,5 +155,184 @@ func TestWrapRunsNothingWhenTruncated(t *testing.T) {
 	}
 	if Wrap("echo x") != "set +xv\n{\necho x\n}\n" {
 		t.Errorf("Wrap without trailing newline = %q", Wrap("echo x"))
+	}
+}
+
+// An inherited XDG_RUNTIME_DIR that is missing or owned by another user
+// (pam_env applying /etc/environment, as on the GitHub runner image) is
+// replaced, with the bus address; the session's own one is kept.
+func TestSessionEnvReplacesForeignRuntimeDir(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not available")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root owns every directory used here")
+	}
+	own := t.TempDir()
+	run := "/run/user/" + strconv.Itoa(os.Geteuid())
+	for _, tt := range []struct {
+		name, xdg, dbus, wantXDG, wantDBus string
+	}{
+		{"unset", "", "", run, "unix:path=" + run + "/bus"},
+		{"another user's", "/", "unix:path=//bus", run, "unix:path=" + run + "/bus"},
+		{"missing", own + "/gone", "", run, "unix:path=" + run + "/bus"},
+		{"own", own, "unix:path=" + own + "/custom", own, "unix:path=" + own + "/custom"},
+		{"own without bus", own, "", own, "unix:path=" + own + "/bus"},
+	} {
+		cmd := exec.Command(sh, "-s")
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+		if tt.xdg != "" {
+			cmd.Env = append(cmd.Env, "XDG_RUNTIME_DIR="+tt.xdg)
+		}
+		if tt.dbus != "" {
+			cmd.Env = append(cmd.Env, "DBUS_SESSION_BUS_ADDRESS="+tt.dbus)
+		}
+		cmd.Stdin = strings.NewReader(Script(append(Prelude(), `printf '%s\n%s\n' "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS"`, `sh -c 'printf "%s\n" "$XDG_RUNTIME_DIR"'`)...))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: %v %s", tt.name, err, out)
+		}
+		want := tt.wantXDG + "\n" + tt.wantDBus + "\n" + tt.wantXDG + "\n"
+		if string(out) != want {
+			t.Errorf("%s: got %q, want %q", tt.name, out, want)
+		}
+	}
+}
+
+// posixShells returns /bin/sh and, when installed, dash: SessionEnv must run
+// under both (dash is /bin/sh on Debian and Ubuntu hosts).
+func posixShells(t *testing.T) []string {
+	t.Helper()
+	var shells []string
+	if _, err := os.Stat("/bin/sh"); err == nil {
+		shells = append(shells, "/bin/sh")
+	}
+	if dash, err := exec.LookPath("dash"); err == nil {
+		shells = append(shells, dash)
+	}
+	if len(shells) == 0 {
+		t.Skip("no POSIX shell available")
+	}
+	return shells
+}
+
+// writableForeignDir returns a directory the test user can write to but does
+// not own (the sticky, world-writable /tmp), or returns "" when there is none.
+func writableForeignDir() string {
+	for _, dir := range []string{"/tmp", "/var/tmp", "/dev/shm"} {
+		real, err := filepath.EvalSymlinks(dir)
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(real)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || int(st.Uid) == os.Geteuid() {
+			continue
+		}
+		if syscall.Access(real, 2) != nil { // W_OK
+			continue
+		}
+		return real
+	}
+	return ""
+}
+
+// XDG base directories are kept only when no other user can have planted
+// them: an existing directory must be owned by the current user and neither
+// group- nor other-writable; a missing one needs a parent that meets the same
+// test. Everything else (shared, foreign-owned, missing parent, not a
+// directory) is dropped so the defaults under $HOME apply. No helper
+// variables are left behind.
+func TestSessionEnvDropsForeignBaseDirs(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root owns every directory used here, so the foreign-owner cases cannot run")
+	}
+	root := t.TempDir()
+	mkdir := func(name string, mode os.FileMode) string {
+		t.Helper()
+		p := filepath.Join(root, name)
+		if err := os.Mkdir(p, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, mode); err != nil { // beat the umask
+			t.Fatal(err)
+		}
+		return p
+	}
+	private := mkdir("private", 0o700)
+	readable := mkdir("readable", 0o755)
+	groupWritable := mkdir("group", 0o775)
+	otherWritable := mkdir("other", 0o777)
+	file := filepath.Join(root, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	linkPrivate := filepath.Join(root, "link-private")
+	linkShared := filepath.Join(root, "link-shared")
+	linkDangling := filepath.Join(root, "link-dangling")
+	for link, target := range map[string]string{linkPrivate: private, linkShared: otherWritable, linkDangling: filepath.Join(root, "gone")} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := []struct {
+		name, value string
+		keep        bool
+	}{
+		{"owned 0700", private, true},
+		{"owned 0755", readable, true},
+		{"owned group-writable", groupWritable, false},
+		{"owned other-writable", otherWritable, false},
+		{"owned by root", "/", false},
+		{"missing in owned 0700", private + "/new", true},
+		{"missing in owned 0755", readable + "/new", true},
+		{"missing in group-writable", groupWritable + "/new", false},
+		{"missing in other-writable", otherWritable + "/new", false},
+		{"missing in root-owned", "/nonexistent-depper-test", false},
+		{"missing parent", private + "/a/b/c", false},
+		{"regular file", file, false},
+		{"symlink to private", linkPrivate, true},
+		{"symlink to shared", linkShared, false},
+		{"dangling symlink", linkDangling, false},
+	}
+	if foreign := writableForeignDir(); foreign != "" {
+		cases = append(cases,
+			struct {
+				name, value string
+				keep        bool
+			}{"world-writable, not owned", foreign, false},
+			struct {
+				name, value string
+				keep        bool
+			}{"missing in world-writable, not owned", filepath.Join(foreign, "depper-test-missing-"+strconv.Itoa(os.Getpid())), false})
+	}
+	for _, sh := range posixShells(t) {
+		for _, tt := range cases {
+			for _, strict := range []string{"set -eu", "set -e"} {
+				lines := append([]string{strict}, SessionEnv()...)
+				lines = append(lines, `printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "${XDG_CONFIG_HOME-unset}" "${XDG_DATA_HOME-unset}" "${XDG_CACHE_HOME-unset}" "${XDG_STATE_HOME-unset}" "${depper_xdg-gone}" "${depper_dir-gone}" "${depper_chk-gone}" "${depper_mode-gone}"`)
+				cmd := exec.Command(sh, "-s")
+				cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
+				for _, key := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"} {
+					cmd.Env = append(cmd.Env, key+"="+tt.value)
+				}
+				cmd.Stdin = strings.NewReader(Script(lines...))
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("%s %s (%s): %v %s", sh, tt.name, strict, err, out)
+				}
+				want := "unset"
+				if tt.keep {
+					want = tt.value
+				}
+				if w := strings.Repeat(want+"|", 4) + "gone|gone|gone|gone\n"; string(out) != w {
+					t.Errorf("%s %s (%s): got %q, want %q", sh, tt.name, strict, out, w)
+				}
+			}
+		}
 	}
 }

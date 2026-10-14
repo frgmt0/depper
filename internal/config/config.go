@@ -48,8 +48,14 @@ const (
 )
 
 // DefaultExcludes are always passed to rsync, ahead of [deploy].exclude.
+// "/.depper/" keeps repo-local depper state (the known_hosts file written by
+// `depper host init`) out of releases. The leading "/" anchors it at the
+// transfer root (rsync filter semantics), so only the repository-root
+// .depper is excluded, not a same-named directory deeper in the tree. It is a
+// transfer pattern only and never touches the remote <base>/.depper, which
+// lies outside the release directory rsync writes to.
 var DefaultExcludes = []string{
-	".git/", ".env", ".env.*", LegacyFileName, FileName, ".cloudflared/", ".cache/", "node_modules/",
+	".git/", ".env", ".env.*", LegacyFileName, FileName, ".cloudflared/", "/.depper/", ".cache/", "node_modules/",
 	"venv/", ".venv/", "__pycache__/", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/",
 }
 
@@ -336,6 +342,13 @@ func LoadTarget(repo, target string, lookup func(string) (string, bool)) (*Confi
 		return nil, err
 	}
 	return project.ResolveWithEnv(target, lookup)
+}
+
+// Parse validates configuration text as if it were read from file inside
+// repo (which must already be absolute and symlink-resolved, as Load does).
+// It lets a caller validate an edited configuration before writing it.
+func Parse(repo, file, text string) (*Project, error) {
+	return parse(repo, file, text)
 }
 
 func parse(repo, file, text string) (*Project, error) {

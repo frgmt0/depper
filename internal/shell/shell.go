@@ -51,12 +51,36 @@ func Script(lines ...string) string {
 }
 
 // Prelude returns the lines every systemd --user script starts with: strict
-// mode and the session bus variables a non-interactive SSH session lacks.
+// mode and the session variables (SessionEnv).
 func Prelude() []string {
+	return append([]string{"set -eu"}, SessionEnv()...)
+}
+
+// SessionEnv returns lines that export XDG_RUNTIME_DIR and
+// DBUS_SESSION_BUS_ADDRESS for systemctl --user and rootless podman. A
+// non-interactive SSH session may lack them, and the login (or the systemd
+// user manager, whose environment every unit inherits) may carry another
+// user's XDG directories: pam_env applies /etc/environment, which on some
+// images (the GitHub runner's, for one) names the image user's /run/user/UID
+// and ~/.config. podman refuses a runtime directory it does not own, so
+// unless the inherited XDG_RUNTIME_DIR exists and is owned by the current
+// user (test -O), both variables are set to /run/user/$(id -u).
+// XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_CACHE_HOME and XDG_STATE_HOME are
+// kept only when they cannot be planted by another user: the directory
+// exists, is owned by the current user (test -O) and is neither group- nor
+// other-writable, or it does not exist and its parent directory meets the
+// same test. Otherwise the variable is unset, so the defaults under $HOME
+// apply. Symlinks are followed (test -O and ls -L judge the target, not the
+// link), so a link to a private directory is kept and a link to a shared one
+// is dropped. The lines work with and without set -u and leave no helper
+// variables behind.
+func SessionEnv() []string {
 	return []string{
-		"set -eu",
-		`export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"`,
+		`if test -z "${XDG_RUNTIME_DIR:-}" || ! test -d "$XDG_RUNTIME_DIR" || ! test -O "$XDG_RUNTIME_DIR"; then XDG_RUNTIME_DIR="/run/user/$(id -u)"; DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"; fi`,
+		`export XDG_RUNTIME_DIR`,
 		`export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"`,
+		`for depper_xdg in XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME; do eval "depper_dir=\${$depper_xdg:-}"; if test -n "$depper_dir"; then if test -e "$depper_dir" || test -L "$depper_dir"; then depper_chk=$depper_dir; else depper_chk=$(dirname -- "$depper_dir"); fi; depper_mode=; if test -d "$depper_chk" && test -O "$depper_chk"; then depper_mode=$(ls -ldL -- "$depper_chk" | cut -c1-10); fi; case "$depper_mode" in ""|?????w*|????????w*) unset "$depper_xdg";; esac; fi; done`,
+		`unset depper_xdg depper_dir depper_chk depper_mode`,
 	}
 }
 

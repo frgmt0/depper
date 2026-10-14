@@ -1,0 +1,755 @@
+name: e2e
+
+# End-to-end test against a real host: the GitHub-hosted ubuntu-latest runner
+# is a full Ubuntu VM with systemd and passwordless sudo, so it acts as its
+# own deploy target over SSH to 127.0.0.1. Nothing else is contacted except
+# GitHub, the Ubuntu archive (apt) and docker.io (container images).
+#
+# Every depper invocation goes through `dep`, which runs it with a timeout,
+# keeps its stdout/stderr in $RUNNER_TEMP/e2e/logs, and fails the step unless
+# the exit code is the expected one; `check` asserts on the JSON output with
+# jq -e. No step prints a secret value.
+
+on:
+  push:
+    branches: ["main", "feature/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build depper
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          go build -o "$RUNNER_TEMP/bin/depper" ./cmd/depper
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/depper" --version
+
+      - name: Write the test helpers
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/e2e/logs" "$RUNNER_TEMP/e2e/keys"
+          cat > "$RUNNER_TEMP/e2e/lib.sh" <<'EOF'
+          set -euo pipefail
+          W="$RUNNER_TEMP/e2e"
+          LOG="$W/logs"
+          KEYS="$W/keys"
+          if [ "${RUNNER_DEBUG:-0}" = 1 ]; then set -x; fi
+
+          # dep WANT NAME [--timeout SECONDS] ARGS...: run depper ARGS, keep
+          # its output in $LOG/NAME.out and .err, fail unless it exits WANT.
+          dep() {
+            local want=$1 name=$2 secs=600 rc=0
+            shift 2
+            if [ "${1:-}" = --timeout ]; then secs=$2; shift 2; fi
+            echo "::group::depper $* (expect exit $want)"
+            timeout --kill-after=10 "$secs" depper "$@" >"$LOG/$name.out" 2>"$LOG/$name.err" || rc=$?
+            cat "$LOG/$name.err" "$LOG/$name.out"
+            echo "::endgroup::"
+            echo "depper $* -> exit $rc (want $want)" >>"$LOG/summary.txt"
+            if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+              echo "::error::depper $* did not finish within ${secs}s"
+              return 1
+            fi
+            if [ "$rc" != "$want" ]; then
+              echo "::error::depper $* exited $rc, want $want"
+              return 1
+            fi
+          }
+
+          # check NAME JQ: assert JQ (jq -e) on the JSON output of NAME.
+          check() {
+            if ! jq -e "$2" "$LOG/$1.out" >/dev/null; then
+              echo "::error::$1: assertion failed: $2"
+              jq . "$LOG/$1.out" || cat "$LOG/$1.out"
+              return 1
+            fi
+            echo "ok  $1: $2"
+          }
+
+          # grep_log NAME PATTERN: assert PATTERN in NAME's stdout or stderr.
+          grep_log() {
+            if ! grep -Eq -- "$2" "$LOG/$1.out" "$LOG/$1.err"; then
+              echo "::error::$1: output lacks /$2/"
+              return 1
+            fi
+            echo "ok  $1 prints /$2/"
+          }
+
+          # expect_eq WHAT GOT WANT
+          expect_eq() {
+            if [ "$2" != "$3" ]; then
+              echo "::error::$1: got '$2', want '$3'"
+              return 1
+            fi
+            echo "ok  $1 = $3"
+          }
+
+          # new_repo SRC DEST: copy an example into a fresh git repository.
+          new_repo() {
+            rm -rf "$2"
+            cp -R "$1" "$2"
+            git -C "$2" init -q -b main
+            git -C "$2" add -A
+            git -C "$2" commit -qm "example"
+          }
+
+          # host_fp: the runner's own ed25519 host key fingerprint, read on the
+          # host (as from a provider console), so --yes pins a verified key.
+          host_fp() {
+            ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{ print $2 }'
+          }
+
+          # host_init_as ADMIN NAME WANT [ARGS...]: depper host init as ADMIN
+          # with the admin key, authorizing the deploy key, in the current
+          # directory.
+          host_init_as() {
+            local admin=$1 name=$2 want=$3
+            shift 3
+            dep "$want" "$name" host init "$admin@127.0.0.1" --identity "$KEYS/admin" --key "$KEYS/deploy.pub" \
+              --host-key-fingerprint "$(host_fp)" --yes --json "$@"
+          }
+
+          # host_init NAME WANT [ARGS...]: host_init_as root.
+          host_init() {
+            host_init_as root "$@"
+          }
+
+          # as_deploy CMD...: run CMD as the deploy user with its user manager.
+          as_deploy() {
+            local uid
+            uid=$(id -u deploy)
+            (cd / && sudo -u deploy env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@")
+          }
+          EOF
+          git config --global user.email e2e@depper.invalid
+          git config --global user.name "depper e2e"
+          git config --global init.defaultBranch main
+
+      - name: Start sshd
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          if ! command -v sshd >/dev/null 2>&1 && ! test -x /usr/sbin/sshd; then
+            sudo apt-get update -q
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q openssh-server
+          fi
+          # Ubuntu 24.04 starts sshd on demand through ssh.socket; older
+          # releases run ssh.service directly.
+          if ! ssh-keyscan -T 2 127.0.0.1 >/dev/null 2>&1; then
+            if systemctl cat ssh.socket >/dev/null 2>&1; then
+              sudo systemctl enable --now ssh.socket
+            else
+              sudo systemctl enable --now ssh.service
+            fi
+          fi
+          for i in $(seq 1 30); do
+            if ssh-keyscan -T 2 127.0.0.1 >/dev/null 2>&1; then break; fi
+            if [ "$i" = 30 ]; then echo "::error::sshd does not answer on 127.0.0.1:22"; exit 1; fi
+            sleep 1
+          done
+          sudo sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication|allowtcpforwarding|port) '
+          ls -l /etc/ssh/sshd_config.d/ || true
+          # The runner image puts its own user's XDG_RUNTIME_DIR and XDG_CONFIG_HOME
+          # (/run/user/1001, /home/runner/.config) into /etc/environment, which pam_env
+          # applies to every login and environment.d to every systemd user manager.
+          # Any other user's manager then breaks (its generators cannot open
+          # /home/runner/.config; rootless podman refuses /run/user/1001), so remove
+          # them to make the runner look like a fresh VPS. depper's scripts and the
+          # services it starts ignore such foreign directories (shell.SessionEnv),
+          # which the "foreign XDG" step checks with the lines put back; the user
+          # manager itself is not depper's to fix.
+          echo "/etc/environment sets: $(grep -o "^[A-Za-z_][A-Za-z0-9_]*=" /etc/environment | tr -d = | tr "\n" " ")"
+          grep -E "^XDG_[A-Z_]+=" /etc/environment > "$RUNNER_TEMP/e2e/xdg-environment" || true
+          sudo sed -i -E "/^XDG_[A-Z_]+=/d" /etc/environment
+
+      - name: Create the admin and deploy keys
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          ssh-keygen -q -t ed25519 -N '' -C depper-e2e-admin -f "$KEYS/admin"
+          ssh-keygen -q -t ed25519 -N '' -C depper-e2e-deploy -f "$KEYS/deploy"
+          sudo install -d -m 700 -o root -g root /root/.ssh
+          cat "$KEYS/admin.pub" | sudo tee -a /root/.ssh/authorized_keys >/dev/null
+          sudo chmod 600 /root/.ssh/authorized_keys
+          # The admin key logs in as root (strict host key checking starts
+          # with host init, which pins the key in the repository).
+          got=$(ssh -i "$KEYS/admin" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1 'id -u')
+          expect_eq "root login uid" "$got" 0
+          if id deploy >/dev/null 2>&1; then echo "::error::the runner already has a deploy user"; exit 1; fi
+
+      - name: host init (basic example)
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          new_repo "$GITHUB_WORKSPACE/examples/basic" "$W/basic"
+          cd "$W/basic"
+          export FP
+          FP=$(host_fp)
+          host_init host-init 0
+          check host-init '.error == null and .host_key_status == "added" and .user == "deploy" and .admin == "root"'
+          # Only the key matching --host-key-fingerprint is pinned.
+          check host-init '.host_keys == [{"type": "ssh-ed25519", "fingerprint": env.FP}]'
+          expect_eq "pinned keys" "$(grep -c . .depper/known_hosts)" 1
+          # The record lists the local steps too.
+          sudo jq -e '.steps as $s | ["known-hosts", "config", "record", "user"] | all(. as $x | $s | index($x) != null)' /etc/depper/host.json
+          check host-init '.facts.privilege == "root" and .facts.family == "debian" and .facts.systemd == true'
+          # shellcheck disable=SC2016 # $a is a jq variable
+          check host-init '.applied as $a | ["known-hosts", "user", "authorized-key", "linger", "user-manager", "record", "config"] | all(. as $s | $a | index($s) != null)'
+          check host-init '([.doctor.checks[] | select(.status == "fail")] | length) == 0'
+          check host-init '.config_written == true and .next == "depper deploy"'
+          # No [container]: no engine step.
+          check host-init '[.plan[] | select(.id == "subids" or .id == "docker-group")] | length == 0'
+          expect_eq "deploy shell" "$(getent passwd deploy | cut -d: -f7)" /bin/bash
+          expect_eq "deploy linger" "$(loginctl show-user deploy -p Linger --value)" yes
+          as_deploy systemctl --user show-environment | grep -qx "XDG_RUNTIME_DIR=/run/user/$(id -u deploy)"
+          sudo test -f /etc/depper/host.json
+          sudo jq -e '.deploy_user == "deploy" and .container == "none"' /etc/depper/host.json
+          if id -nG deploy | grep -Eqw 'sudo|admin|docker'; then echo "::error::deploy is privileged: $(id -nG deploy)"; exit 1; fi
+          grep -qx 'host = "127.0.0.1"' depper.toml
+          grep -qx 'user = "deploy"' depper.toml
+          grep -qx 'known_hosts = ".depper/known_hosts"' depper.toml
+          grep -qx "identity_file = \"~/${KEYS#"$HOME"/}/deploy\"" depper.toml
+          test "$(stat -c %a .depper/known_hosts)" = 600
+          git add -A
+          git commit -qm "connect to the runner"
+
+      - name: doctor, deploy, health, status
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          cd "$W/basic"
+          dep 0 doctor doctor --json
+          check doctor '([.checks[] | select(.status == "fail")] | length) == 0'
+          dep 0 deploy1 deploy --json
+          check deploy1 '.service == "basic" and .mode == "process" and (.release | length) > 0 and .health.ok == true'
+          export REL1 C1
+          REL1=$(jq -r .release "$LOG/deploy1.out")
+          C1=$(git rev-parse HEAD)
+          check deploy1 '.metadata.git_commit == env.C1 and .metadata.git_dirty == false and .metadata.source == "worktree"'
+          expect_eq "greeting" "$(curl -fsS http://127.0.0.1:8080/)" "hello from depper"
+          # The url check runs through `ssh -W` and its LocalCommand ready
+          # marker; a missing marker would hang until the dial timeout, so
+          # bound it tightly.
+          dep 0 health1 --timeout 60 health --json
+          check health1 '.ok == true and .check == "url" and .method == "ssh-forward" and .status == 200 and .body.state == "running" and .error == ""'
+          dep 0 status1 --timeout 60 status --json
+          check status1 '.service == "basic" and .deployed == true and .unit == "depper-basic.service" and .host == "127.0.0.1"'
+          check status1 '.current_release == env.REL1 and .previous_release == "" and .release.git_commit == env.C1'
+          check status1 '.health.ok == true and .health.method == "ssh-forward" and .health_error == ""'
+          as_deploy systemctl --user is-active depper-basic.service
+          as_deploy systemctl --user is-enabled depper-basic.service
+
+      - name: second deploy, check, rollback
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          cd "$W/basic"
+          export REL1 REL2 C2
+          REL1=$(jq -r .release "$LOG/deploy1.out")
+          sed -i 's/^GREETING = .*/GREETING = "hello again from depper"/' depper.toml
+          git commit -qam "new greeting"
+          C2=$(git rev-parse HEAD)
+          dep 0 deploy2 deploy --json
+          check deploy2 '.health.ok == true and .release != env.REL1 and .metadata.git_commit == env.C2'
+          REL2=$(jq -r .release "$LOG/deploy2.out")
+          expect_eq "greeting" "$(curl -fsS http://127.0.0.1:8080/)" "hello again from depper"
+          dep 0 check1 check --json
+          check check1 '.state == "up-to-date" and .drift == false and .local_commit == env.C2 and .deployed.id == env.REL2 and .secrets.state == "in-sync"'
+          check check1 '.unit.active_state == "active"'
+          dep 0 rollback rollback --json
+          check rollback '.service == "basic" and .from == env.REL2 and .to == env.REL1 and .health.ok == true'
+          dep 0 status2 status --json
+          check status2 '.current_release == env.REL1 and .previous_release == env.REL2 and .health.ok == true'
+          expect_eq "greeting after rollback" "$(curl -fsS http://127.0.0.1:8080/)" "hello from depper"
+          # The deployed commit is now behind HEAD.
+          dep 3 check2 check --json
+          check check2 '.state == "outdated" and .drift == true'
+
+      - name: secrets diff and push
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          cd "$W/basic"
+          # A test-only secret, generated here and never printed.
+          (umask 077 && openssl rand -hex 24 | sed 's/^/API_TOKEN=/' >.env.prod)
+          echo ".env.prod" >>.gitignore
+          printf '\n[secrets]\nfile = ".env.prod"\n' >>depper.toml
+          git add .gitignore depper.toml
+          git commit -qm "secrets file"
+          dep 3 sdiff1 secrets diff --json
+          check sdiff1 '.state == "drift" and .keys.added == ["API_TOKEN"] and (.keys.removed | length) == 0'
+          dep 0 spush secrets push --json
+          check spush '.service == "basic" and .env.added == ["API_TOKEN"] and .health.ok == true'
+          dep 0 sdiff2 secrets diff --json
+          check sdiff2 '.state == "in-sync" and (.keys.added + .keys.removed + .keys.changed | length) == 0 and .file_modified == false'
+          dep 0 slist secrets list --json
+          check slist '.known == true and (.keys | index("API_TOKEN")) != null and (.keys | index("GREETING")) != null'
+          # The running service has the value (compared by hash, not shown).
+          pid=$(as_deploy systemctl --user show -p MainPID --value depper-basic.service)
+          test "$pid" -gt 0
+          want=$(grep '^API_TOKEN=' .env.prod | sha256sum)
+          got=$(sudo cat "/proc/$pid/environ" | tr '\0' '\n' | grep '^API_TOKEN=' | sha256sum)
+          expect_eq "API_TOKEN in the service environment (sha256)" "$got" "$want"
+          if grep -rqF -f <(cut -d= -f2 .env.prod) "$LOG"; then echo "::error::the secret value appears in depper output"; exit 1; fi
+
+      - name: releases, logs, host init again, host status
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          cd "$W/basic"
+          export REL1 REL2
+          REL1=$(jq -r .release "$LOG/deploy1.out")
+          REL2=$(jq -r .release "$LOG/deploy2.out")
+          dep 0 releases releases --json
+          check releases '.current == env.REL1 and .previous == env.REL2'
+          check releases '([.releases[].id] | index(env.REL1) != null and index(env.REL2) != null) and ([.releases[] | select(.current)] | length) == 1'
+          dep 0 logs logs --lines 20
+          grep_log logs 'GET /health'
+          host_init host-init2 0
+          check host-init2 '.error == null and .host_key_status == "already-pinned" and .applied == [] and .config_written == false'
+          check host-init2 '[.plan[] | select(.change)] == []'
+          grep_log host-init2 'Nothing to change'
+          git diff --exit-code depper.toml
+          dep 0 host-status host status --json
+          check host-status '.user == "deploy" and .record.deploy_user == "deploy" and .record.container == "none"'
+          check host-status '([.checks[] | select(.status == "fail")] | length) == 0'
+          # shellcheck disable=SC2016 # $p is a jq variable
+          check host-status '[.checks[] | select(.status == "pass") | .name] as $p | ["record", "user", "linger", "systemd"] | all(. as $n | $p | index($n) != null)'
+
+      - name: host init again as a passwordless-sudo admin
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          cd "$W/basic"
+          sudo useradd --create-home --shell /bin/bash e2eadmin
+          sudo usermod -p '*' e2eadmin
+          echo 'e2eadmin ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/90-e2e-admin >/dev/null
+          sudo chmod 440 /etc/sudoers.d/90-e2e-admin
+          sudo install -d -m 700 -o e2eadmin -g e2eadmin /home/e2eadmin/.ssh
+          sudo install -m 600 -o e2eadmin -g e2eadmin "$KEYS/admin.pub" /home/e2eadmin/.ssh/authorized_keys
+          host_init_as e2eadmin host-init-sudo 0
+          check host-init-sudo '.error == null and .admin == "e2eadmin" and .facts.privilege == "sudo" and .facts.admin_user == "e2eadmin"'
+          check host-init-sudo '.applied == [] and [.plan[] | select(.change)] == [] and .config_written == false'
+          check host-init-sudo '([.doctor.checks[] | select(.status == "fail")] | length) == 0'
+          git diff --exit-code depper.toml
+
+      - name: unlock and the ssh -W health check
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          cd "$W/basic"
+          lock=/home/deploy/.local/share/depper/basic/.depper/lock
+          dep 0 unlock0 unlock --json
+          check unlock0 '.removed == false and .lock.held == false'
+
+          # kill_mid_deploy NAME: start a deploy, SIGKILL depper while it
+          # holds the lock, and leave the lock behind.
+          kill_mid_deploy() {
+            git commit -q --allow-empty -m "$1"
+            setsid depper deploy >"$LOG/$1.out" 2>"$LOG/$1.err" &
+            local pid=$!
+            for _ in $(seq 1 600); do
+              if sudo test -d "$lock"; then break; fi
+              sleep 0.05
+            done
+            kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid"
+            wait "$pid" || true
+            cat "$LOG/$1.err"
+            sudo test -d "$lock" || { echo "::error::$1: no lock was left behind"; return 1; }
+          }
+
+          kill_mid_deploy killed1
+          dep 1 deploy-locked deploy
+          grep_log deploy-locked 'Another depper operation is already running'
+          dep 1 unlock-young unlock
+          grep_log unlock-young 'less than 15 minutes ago'
+          dep 0 unlock-force unlock --force --json
+          check unlock-force '.removed == true and .lock.held == true and .lock.stale == false and .lock.info.command == "deploy"'
+          if sudo test -e "$lock"; then echo "::error::the lock is still there"; exit 1; fi
+          dep 0 deploy-after-force deploy --json
+          check deploy-after-force '.health.ok == true'
+
+          # A lock not refreshed for 20 minutes (host clock) is stale.
+          kill_mid_deploy killed2
+          sudo -u deploy touch -d '20 minutes ago' "$lock"
+          dep 0 unlock-stale unlock --json
+          check unlock-stale '.removed == true and .lock.stale == true and .lock.age_seconds >= 1200'
+          dep 0 deploy-after-stale deploy --json
+          check deploy-after-stale '.health.ok == true'
+          dep 0 check-after-unlock check --json
+          check check-after-unlock '.state == "up-to-date" and .drift == false'
+
+          # The raw forward depper uses: ssh -W with the LocalCommand ready
+          # marker on stderr and the HTTP exchange on stdio.
+          rc=0
+          printf 'GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n' | timeout 20 ssh -i "$KEYS/deploy" -o IdentitiesOnly=yes \
+            -o UserKnownHostsFile="$W/basic/.depper/known_hosts" -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            -o ControlPath=none -o PermitLocalCommand=yes -o "LocalCommand=echo depper-forward-ready 1>&2" \
+            -W 127.0.0.1:8080 -- deploy@127.0.0.1 >"$LOG/ssh-w.out" 2>"$LOG/ssh-w.err" || rc=$?
+          cat "$LOG/ssh-w.err" "$LOG/ssh-w.out"
+          expect_eq "ssh -W exit" "$rc" 0
+          grep -qx 'depper-forward-ready' "$LOG/ssh-w.err"
+          head -n 1 "$LOG/ssh-w.out" | grep -q '^HTTP/1\.[01] 200'
+          grep -q '"state": "running"' "$LOG/ssh-w.out"
+
+          # Through depper, healthy and (after stop) unhealthy, both fast.
+          dep 0 health2 --timeout 45 health --json
+          check health2 '.ok == true and .method == "ssh-forward" and .latency_ms < 15000'
+          dep 0 stop stop
+          start=$(date +%s)
+          dep 2 health-down --timeout 45 health --json
+          check health-down '.ok == false and .method == "ssh-forward" and .status == 0 and (.error | length) > 0'
+          elapsed=$(( $(date +%s) - start ))
+          echo "unhealthy result after ${elapsed}s"
+          test "$elapsed" -lt 15
+          dep 0 restart restart
+          dep 0 health3 --timeout 45 health --watch 1 --count 3 --json
+          test "$(jq -s 'map(select(.ok and .method == "ssh-forward")) | length' "$LOG/health3.out")" = 3
+
+      - name: podman (container example, build mode)
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          new_repo "$GITHUB_WORKSPACE/examples/container" "$W/container"
+          cd "$W/container"
+          # podman instead of docker, port 8081 (the basic service has 8080),
+          # a distinctive greeting, and a secret, so --env pass-through of
+          # [env] and secrets is visible in /health and /.
+          sed -i -e 's/^engine = "docker".*/engine = "podman"/' \
+                 -e 's/127.0.0.1:8080:8080/127.0.0.1:8081:8080/' \
+                 -e 's#^url = "http://127.0.0.1:8080/health"#url = "http://127.0.0.1:8081/health"#' \
+                 -e 's/^GREETING = .*/GREETING = "hello from the e2e container"/' \
+                 -e 's/^# \[secrets\]/[secrets]/' -e 's/^# file = ".env.production"/file = ".env.production"/' depper.toml
+          grep -qx 'engine = "podman"' depper.toml
+          grep -qx 'file = ".env.production"' depper.toml
+          (umask 077 && openssl rand -hex 24 | sed 's/^/API_TOKEN=/' >.env.production)
+          echo ".env.production" >>.gitignore
+          git add -A
+          git commit -qm "podman on the runner"
+          # The runner image ships podman; remove it (and its uid mapping
+          # helpers) so host init installs them from the Ubuntu archive as on
+          # a fresh VPS.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y -q podman uidmap slirp4netns
+          if command -v podman >/dev/null 2>&1; then echo "::error::podman is still installed"; exit 1; fi
+          # No --container: host init installs the engine depper.toml uses.
+          host_init host-init-podman 0
+          check host-init-podman '.error == null and .host_key_status == "added"'
+          check host-init-podman '[.plan[] | select(.id == "packages")][0] | .change == true and (.detail | test("podman")) and (.detail | test("uidmap")) and (.detail | test("slirp4netns"))'
+          check host-init-podman '(.applied | index("packages")) != null'
+          # Ubuntu's useradd already assigns subordinate ids; the step is
+          # planned and satisfied.
+          check host-init-podman '[.plan[] | select(.id == "subids")] | length == 1'
+          check host-init-podman '([.doctor.checks[] | select(.status == "fail")] | length) == 0'
+          command -v podman
+          grep -q '^deploy:' /etc/subuid
+          grep -q '^deploy:' /etc/subgid
+          sudo jq -e '.container == "podman" and (.packages | index("podman")) != null' /etc/depper/host.json
+          git add -A
+          git commit -qm "connect to the runner"
+          dep 0 host-status-podman host status --json
+          check host-status-podman '.record.container == "podman" and ([.checks[] | select(.name == "container engine")][0].status == "pass")'
+          dep 0 cdeploy1 --timeout 900 deploy --json
+          check cdeploy1 '.service == "container-demo" and .mode == "build" and .health.ok == true'
+          dep 0 chealth --timeout 60 health --json
+          check chealth '.ok == true and .method == "ssh-forward" and .body.state == "running" and .body.api_token_configured == true'
+          expect_eq "container greeting" "$(curl -fsS http://127.0.0.1:8081/)" "hello from the e2e container"
+          as_deploy podman ps --format '{{.Names}} {{.Image}}'
+          # A second release builds its own image; rollback runs the first.
+          export CR1
+          CR1=$(jq -r .release "$LOG/cdeploy1.out")
+          sed -i 's/^GREETING = .*/GREETING = "hello again from the e2e container"/' depper.toml
+          git commit -qam "new greeting"
+          dep 0 cdeploy2 --timeout 900 deploy --json
+          check cdeploy2 '.health.ok == true and .release != env.CR1'
+          expect_eq "container greeting" "$(curl -fsS http://127.0.0.1:8081/)" "hello again from the e2e container"
+          dep 0 crollback --timeout 300 rollback --json
+          check crollback '.to == env.CR1 and .health.ok == true'
+          expect_eq "container greeting after rollback" "$(curl -fsS http://127.0.0.1:8081/)" "hello from the e2e container"
+          dep 0 cstatus status --json
+          check cstatus '.current_release == env.CR1 and .health.ok == true'
+          if grep -rqF -f <(cut -d= -f2 .env.production) "$LOG"; then echo "::error::the secret value appears in depper output"; exit 1; fi
+
+      - name: podman (image mode, digest pinning)
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          mkdir -p "$W/image"
+          cd "$W/image"
+          cat >depper.toml <<'TOML'
+          [service]
+          name = "image-demo"
+          restart = "on-failure"
+
+          [deploy]
+          host = "deploy@127.0.0.1"
+
+          [container]
+          engine = "podman"
+          image = "docker.io/library/nginx:1.27-alpine"
+          ports = ["127.0.0.1:8082:80"]
+
+          [health]
+          url = "http://127.0.0.1:8082/"
+          expect_status = 200
+          TOML
+          git init -q -b main
+          git add -A
+          git commit -qm "image example"
+          host_init host-init-image 0
+          check host-init-image '.error == null and ([.doctor.checks[] | select(.status == "fail")] | length) == 0'
+          git add -A
+          git commit -qm "connect to the runner"
+          dep 0 ideploy --timeout 600 deploy --json
+          check ideploy '.mode == "image" and .health.ok == true and .metadata.image == "docker.io/library/nginx:1.27-alpine"'
+          check ideploy '.metadata.image_digest | test("^docker\\.io/library/nginx@sha256:[0-9a-f]{64}$")'
+          curl -fsS http://127.0.0.1:8082/ | grep -q 'Welcome to nginx'
+          dep 0 ihealth --timeout 60 health --json
+          check ihealth '.ok == true and .status == 200 and .method == "ssh-forward"'
+
+      - name: podman compose (compose example)
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          # host init installs the compose provider (podman-compose) itself;
+          # make sure the runner does not have it already.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y -q podman-compose
+          if command -v podman-compose >/dev/null 2>&1; then echo "::error::podman-compose is still installed"; exit 1; fi
+          # The runner image also ships docker's compose plugin, which `podman
+          # compose` prefers over podman-compose and which needs the podman API
+          # socket. A plain VPS has no docker plugin, so select podman-compose
+          # for podman, as such a host would use it.
+          sudo install -d /etc/containers/containers.conf.d
+          printf '[engine]\ncompose_providers = ["/usr/bin/podman-compose"]\ncompose_warning_logs = false\n' | sudo tee /etc/containers/containers.conf.d/50-e2e-compose.conf >/dev/null
+          new_repo "$GITHUB_WORKSPACE/examples/compose" "$W/compose"
+          cd "$W/compose"
+          sed -i -e 's/^engine = "docker".*/engine = "podman"/' \
+                 -e 's#^url = "http://127.0.0.1:8080/health"#url = "http://127.0.0.1:8083/health"#' \
+                 -e 's/^GREETING = .*/GREETING = "hello from e2e compose"/' depper.toml
+          sed -i 's/127.0.0.1:8080:8080/127.0.0.1:8083:8080/' compose.yaml
+          grep -qx 'engine = "podman"' depper.toml
+          git add -A
+          git commit -qm "podman compose on the runner"
+          host_init host-init-compose 0
+          check host-init-compose '.error == null and ([.doctor.checks[] | select(.status == "fail")] | length) == 0'
+          check host-init-compose '[.plan[] | select(.id == "packages")][0] | .change == true and (.detail | test("podman-compose"))'
+          check host-init-compose '[.doctor.checks[] | select(.name == "compose")][0].status == "pass"'
+          command -v podman-compose
+          sudo jq -e '(.packages | index("podman-compose")) != null' /etc/depper/host.json
+          git add -A
+          git commit -qm "connect to the runner"
+          dep 0 kdeploy --timeout 900 deploy --json
+          check kdeploy '.mode == "compose" and .health.ok == true'
+          expect_eq "compose greeting" "$(curl -fsS http://127.0.0.1:8083/)" "hello from e2e compose"
+          dep 0 khealth --timeout 60 health --json
+          check khealth '.ok == true and .method == "ssh-forward" and .body.state == "running"'
+
+      - name: SSH hardening reverts itself when the admin is locked out
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          cd "$W/basic"
+          sshd_auth() { sudo sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin) ' | sort; }
+          before=$(sshd_auth)
+          echo "before: $(tr '\n' ' ' <<<"$before")"
+          sudo test ! -e /etc/ssh/sshd_config.d/10-depper.conf
+          # The test hook (docs/development.md) reports the admin login after
+          # the sshd reload as failed and skips the immediate rollback, so
+          # only the timer armed on the host can undo the drop-in.
+          start=$(date +%s)
+          export DEPPER_E2E=1 DEPPER_E2E_LOCKOUT_ADMIN=1
+          host_init lockout 1 --harden-ssh
+          unset DEPPER_E2E DEPPER_E2E_LOCKOUT_ADMIN
+          check lockout '.error | test("a new login as root failed .*DEPPER_E2E_LOCKOUT_ADMIN")'
+          check lockout '.error | test("so depper-ssh-revert.timer on the host undid the change at [0-9:]+ UTC; a new root login works again")'
+          check lockout '(.applied | index("harden-ssh")) == null'
+          grep_log lockout 'armed depper-ssh-revert.timer: it undoes this change at'
+          grep_log lockout 'waiting for depper-ssh-revert.timer'
+          # The revert ran from the timer, on time (120 s, AccuracySec=1s).
+          read -r who at < <(sudo cat /var/lib/depper/guard/depper-ssh-revert/reverted)
+          expect_eq "reverted by" "$who" timer
+          took=$((at - start))
+          echo "the timer reverted the drop-in ${took}s after host init started"
+          if [ "$took" -lt 118 ] || [ "$took" -gt 130 ]; then echo "::error::the revert ran ${took}s after host init started, want ~120s"; exit 1; fi
+          sudo test ! -e /etc/ssh/sshd_config.d/10-depper.conf
+          for m in had-none had-prev prev; do sudo test ! -e "/var/lib/depper/guard/depper-ssh-revert/$m"; done
+          # The boot service that reverts a change a reboot left unverified is
+          # installed and enabled on real systemd.
+          systemctl is-enabled depper-guard-revert.service
+          systemd-analyze verify /etc/systemd/system/depper-guard-revert.service
+          expect_eq "sshd -T after the revert" "$(sshd_auth)" "$before"
+          # sshd was reloaded with the original configuration: when it
+          # allowed passwords before, the running server offers them again.
+          if grep -qx 'passwordauthentication yes' <<<"$before"; then
+            rc=0
+            ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o BatchMode=yes \
+              -o UserKnownHostsFile="$W/basic/.depper/known_hosts" -o StrictHostKeyChecking=yes \
+              deploy@127.0.0.1 true >"$LOG/password-reverted.out" 2>"$LOG/password-reverted.err" || rc=$?
+            cat "$LOG/password-reverted.err"
+            if grep -q 'Permission denied (publickey)\.' "$LOG/password-reverted.err"; then echo "::error::sshd still refuses passwords after the revert (ssh exit $rc)"; exit 1; fi
+          fi
+
+      - name: SSH hardening and firewall
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          cd "$W/basic"
+          echo "before: $(sudo sshd -T | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin) ' | tr '\n' ' ')"
+          # Traffic from the runner to its own addresses goes through lo,
+          # which ufw always accepts. To see the firewall, probe the
+          # runner's non-loopback address from a network namespace joined by
+          # a veth pair, so packets arrive on a real interface.
+          export IP
+          IP=$(hostname -I | awk '{ print $1 }')
+          test -n "$IP"
+          sudo ip netns add probe
+          sudo ip link add vh-probe type veth peer name vp-probe
+          sudo ip link set vp-probe netns probe
+          sudo ip addr add 10.200.0.1/24 dev vh-probe
+          sudo ip link set vh-probe up
+          sudo ip netns exec probe ip addr add 10.200.0.2/24 dev vp-probe
+          sudo ip netns exec probe ip link set vp-probe up
+          sudo ip netns exec probe ip link set lo up
+          sudo ip netns exec probe ip route add default via 10.200.0.1
+          # probe_tcp PORT: can the namespace open TCP PORT on $IP?
+          probe_tcp() { sudo ip netns exec probe timeout 5 bash -c "exec 3<>/dev/tcp/$IP/$1" 2>/dev/null; }
+          # A throwaway listener on a port the firewall will not allow.
+          (setsid nc -lk 9999 </dev/null >/dev/null 2>&1 &)
+          for _ in $(seq 1 50); do if ss -ltn | grep -q ':9999 '; then break; fi; sleep 0.1; done
+          probe_tcp 9999 || { echo "::error::port 9999 is not reachable from the probe namespace before the firewall"; exit 1; }
+          probe_tcp 22 || { echo "::error::port 22 is not reachable from the probe namespace"; exit 1; }
+          host_init harden 0 --harden-ssh --firewall 22
+          check harden '.error == null and (.applied | index("harden-ssh")) != null and (.applied | index("firewall")) != null'
+          # The timer that already ran in the lockout step (systemd unloads
+          # it with --collect) is not mistaken for an interrupted run.
+          if grep -q 'Finishing an interrupted host init' "$LOG/harden.out" "$LOG/harden.err"; then echo "::error::the elapsed timer was treated as pending"; exit 1; fi
+          sudo test -f /etc/ssh/sshd_config.d/10-depper.conf
+          eff=$(sudo sshd -T)
+          grep -qx 'passwordauthentication no' <<<"$eff"
+          grep -qx 'kbdinteractiveauthentication no' <<<"$eff"
+          grep -Eqx 'permitrootlogin (prohibit-password|without-password)' <<<"$eff"
+          # The server no longer offers password or keyboard-interactive.
+          rc=0
+          ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o BatchMode=yes \
+            -o UserKnownHostsFile="$W/basic/.depper/known_hosts" -o StrictHostKeyChecking=yes \
+            deploy@127.0.0.1 true >"$LOG/password.out" 2>"$LOG/password.err" || rc=$?
+          cat "$LOG/password.err"
+          test "$rc" = 255
+          grep -q 'Permission denied (publickey)' "$LOG/password.err"
+          # Root key login still works.
+          got=$(ssh -i "$KEYS/admin" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$W/basic/.depper/known_hosts" -o StrictHostKeyChecking=yes root@127.0.0.1 'id -u')
+          expect_eq "root login uid" "$got" 0
+          # ufw is active and allows 22/tcp.
+          sudo ufw status verbose
+          sudo ufw status | grep -q '^Status: active'
+          sudo ufw status | grep -Eq '^22/tcp +ALLOW'
+          # Through a real interface: 22 is open (a deploy login works over
+          # the non-loopback address), 9999 is blocked.
+          probe_tcp 22 || { echo "::error::port 22 is blocked from $IP"; exit 1; }
+          if probe_tcp 9999; then echo "::error::port 9999 is reachable through the firewall"; exit 1; fi
+          got=$(sudo ip netns exec probe ssh -i "$KEYS/deploy" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=10 \
+            -o UserKnownHostsFile="$W/basic/.depper/known_hosts" -o HostKeyAlias=127.0.0.1 -o StrictHostKeyChecking=yes \
+            "deploy@$IP" 'id -un')
+          expect_eq "deploy login over $IP" "$got" deploy
+          # The guarded changes were disarmed, not left to fire.
+          if systemctl list-timers --all --no-pager | grep -q 'depper-.*-revert'; then echo "::error::a revert timer is still armed"; systemctl list-timers --all --no-pager; exit 1; fi
+          for u in depper-ssh-revert depper-firewall-revert; do
+            for m in had-none had-prev prev was-inactive added-ports started; do sudo test ! -e "/var/lib/depper/guard/$u/$m"; done
+          done
+          # The deploy user still deploys.
+          git commit -q --allow-empty -m "deploy after hardening"
+          dep 0 deploy-hardened deploy --json
+          check deploy-hardened '.health.ok == true'
+          dep 0 host-status-hardened host status --json
+          check host-status-hardened '([.checks[] | select(.status == "fail")] | length) == 0 and .record.hardening.ssh == true and .record.hardening.firewall == [22]'
+          check host-status-hardened '[.checks[] | select(.name == "ssh hardening" or .name == "firewall") | .status] == ["pass", "pass"]'
+          host_init harden-again 0 --harden-ssh --firewall 22
+          check harden-again '.applied == [] and [.plan[] | select(.change)] == []'
+
+      - name: services ignore a foreign XDG environment
+        run: |
+          . "$RUNNER_TEMP/e2e/lib.sh"
+          uid=$(id -u deploy)
+          # With the runner image's XDG lines in /etc/environment the deploy
+          # user's manager does not start at all (user@.service times out; its
+          # generators read /home/runner/.config), which depper cannot fix, so
+          # "Start sshd" removes them. What depper controls is the services:
+          # give the running manager the foreign values, as environment.d
+          # would, and check that the services it starts do not inherit them.
+          test -s "$W/xdg-environment" || { echo "::error::the runner image no longer sets XDG_* in /etc/environment; this step tests nothing"; exit 1; }
+          mapfile -t foreign <"$W/xdg-environment"
+          as_deploy systemctl --user set-environment "${foreign[@]}"
+          menv=$(as_deploy systemctl --user show-environment)
+          for line in "${foreign[@]}"; do
+            grep -qxF -- "$line" <<<"$menv" || { echo "::error::the user manager did not take the foreign $line; this step tests nothing"; exit 1; }
+          done
+          echo "user manager: $(grep '^XDG_' <<<"$menv" | tr '\n' ' ')"
+          # check_service UNIT: the main process has the deploy user's runtime
+          # directory and none of the foreign values.
+          check_service() {
+            local pid penv k v
+            pid=$(as_deploy systemctl --user show -p MainPID --value "$1")
+            test "$pid" -gt 0
+            penv=$(sudo cat "/proc/$pid/environ" | tr '\0' '\n')
+            echo "$1: $(grep '^XDG_' <<<"$penv" | tr '\n' ' ')"
+            expect_eq "$1 XDG_RUNTIME_DIR" "$(grep '^XDG_RUNTIME_DIR=' <<<"$penv")" "XDG_RUNTIME_DIR=/run/user/$uid"
+            while IFS='=' read -r k v; do
+              if grep -qx "$k=$v" <<<"$penv"; then echo "::error::$1 inherited the foreign $k=$v"; return 1; fi
+            done <"$W/xdg-environment"
+          }
+          # The process service: the start script sanitises its environment.
+          cd "$W/basic"
+          dep 0 restart-xdg restart
+          check_service depper-basic.service
+          dep 0 health-xdg --timeout 60 health --json
+          check health-xdg '.ok == true'
+          # The podman service: the unit's sh -c wrapper sanitises the
+          # engine's environment, so rootless podman starts the container.
+          cd "$W/container"
+          dep 0 crestart-xdg --timeout 300 restart
+          # The main process is the engine itself (podman run).
+          check_service depper-container-demo.service
+          dep 0 chealth-xdg --timeout 120 health --json
+          check chealth-xdg '.ok == true'
+          # Restore the fresh-VPS state.
+          as_deploy systemctl --user unset-environment "${foreign[@]%%=*}"
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          W="$RUNNER_TEMP/e2e"
+          echo "::group::depper exit codes"
+          cat "$W/logs/summary.txt" 2>/dev/null || true
+          echo "::endgroup::"
+          for f in "$W"/logs/*.err "$W"/logs/*.out; do
+            test -s "$f" || continue
+            echo "::group::$(basename "$f")"
+            cat "$f"
+            echo "::endgroup::"
+          done
+          if uid=$(id -u deploy 2>/dev/null); then
+            echo "::group::journalctl --user (deploy)"
+            sudo -u deploy env XDG_RUNTIME_DIR="/run/user/$uid" journalctl --user --no-pager -n 300 || true
+            echo "::endgroup::"
+            echo "::group::journalctl _UID=$uid"
+            sudo journalctl "_UID=$uid" --no-pager -n 300 || true
+            echo "::endgroup::"
+            echo "::group::systemctl --user (deploy)"
+            sudo -u deploy env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user list-units --all --no-pager 'depper-*' || true
+            sudo -u deploy env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user status --no-pager 'depper-*' || true
+            echo "::endgroup::"
+          fi
+          echo "::group::sshd"
+          sudo sshd -T 2>&1 | grep -E '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication|allowtcpforwarding|port) ' || true
+          ls -l /etc/ssh/sshd_config.d/ || true
+          sudo journalctl -u ssh.service -u ssh.socket --no-pager -n 100 || true
+          echo "::endgroup::"
+          echo "::group::firewall"
+          sudo ufw status verbose || true
+          echo "::endgroup::"

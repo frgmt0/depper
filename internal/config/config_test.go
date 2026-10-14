@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -104,7 +105,7 @@ FEATURE_FLAG = "yes"
 			count++
 		}
 	}
-	for _, want := range []string{".env", "build/", FileName, LegacyFileName} {
+	for _, want := range []string{".env", "build/", FileName, LegacyFileName, "/.depper/"} {
 		if !contains(cfg.Deploy.Exclude, want) {
 			t.Errorf("exclude lacks %q", want)
 		}
@@ -773,6 +774,49 @@ func TestDeployPathAlphabet(t *testing.T) {
 	for _, good := range []string{"/srv/api", "/srv/a+b@c_d.e-f"} {
 		if cfg := mustLoad(t, minimal+"path = \""+good+"\"\n"); cfg.Deploy.Path != good {
 			t.Errorf("path = %q", cfg.Deploy.Path)
+		}
+	}
+}
+
+// "/.depper/" is anchored at the transfer root: rsync, which applies the
+// excludes, must skip ./.depper/ but keep ./sub/.depper/ and files that merely
+// contain the name.
+func TestDefaultDepperExcludeIsAnchoredAtTransferRoot(t *testing.T) {
+	rsync, err := exec.LookPath("rsync")
+	if err != nil {
+		t.Skip("rsync not installed")
+	}
+	if !contains(DefaultExcludes, "/.depper/") || contains(DefaultExcludes, ".depper/") {
+		t.Fatalf("DefaultExcludes = %v, want anchored /.depper/ and no unanchored .depper/", DefaultExcludes)
+	}
+	src, dst := t.TempDir(), t.TempDir()
+	for _, name := range []string{".depper/known_hosts", "sub/.depper/keep", "sub/.depper-x/keep", "app.py"} {
+		path := filepath.Join(src, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := []string{"-a"}
+	for _, pattern := range DefaultExcludes {
+		args = append(args, "--exclude", pattern)
+	}
+	args = append(args, src+"/", dst+"/")
+	if out, err := exec.Command(rsync, args...).CombinedOutput(); err != nil {
+		t.Fatalf("rsync: %v\n%s", err, out)
+	}
+	exists := func(name string) bool {
+		_, err := os.Stat(filepath.Join(dst, name))
+		return err == nil
+	}
+	if exists(".depper") {
+		t.Errorf("root .depper/ was transferred")
+	}
+	for _, name := range []string{"sub/.depper/keep", "sub/.depper-x/keep", "app.py"} {
+		if !exists(name) {
+			t.Errorf("%s was not transferred", name)
 		}
 	}
 }
