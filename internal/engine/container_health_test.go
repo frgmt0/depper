@@ -228,6 +228,45 @@ func TestComposeUnit(t *testing.T) {
 	}
 }
 
+// With docker installed, `podman compose` runs docker-compose as its
+// provider, which talks to the user's podman API socket: every compose
+// command fails until podman.socket is active (`compose version` works
+// without it). The compose setup enables the socket first, once.
+func TestComposePodmanEnablesSocket(t *testing.T) {
+	h := newFakeHost(t)
+	toml := "[service]\nname = \"shop\"\n[deploy]\nhost = \"fakehost\"\n[container]\nengine = \"podman\"\ncompose = \"compose.yaml\"\n"
+	repo := writeRepo(t, toml, map[string]string{"compose.yaml": "services: {}\n"})
+	needSocket := "#!/bin/sh\n" +
+		"if test \"$1\" = compose && test \"$2\" != version; then\n" +
+		"  echo '>>>> Executing external compose provider \"/usr/lib/docker/cli-plugins/docker-compose\". Please see podman-compose(1) for how to disable this message. <<<<' >&2\n" +
+		"  test -f \"$FAKE_ROOT/systemd/podman.socket.active\" || { echo 'failed to connect to the docker API at unix:///run/user/1003/podman/podman.sock; check if the path is correct and if the daemon is running: dial unix /run/user/1003/podman/podman.sock: connect: no such file or directory' >&2; exit 1; }\n" +
+		"fi\n"
+	h.writeExec("remote-bin/podman", needSocket+strings.TrimPrefix(strings.Replace(fakeDocker, "docker.log", "podman.log", 1), "#!/bin/sh\n"))
+	e := h.Engine(loadConfig(t, repo))
+	deploy(t, e, DeployOptions{})
+	log := h.log("systemctl.log")
+	if !strings.Contains(log, "systemctl --user enable --now podman.socket\n") {
+		t.Errorf("podman.socket was not enabled:\n%s", log)
+	}
+	if _, err := os.Stat(filepath.Join(h.Root, "systemd", "podman.socket.enabled")); err != nil {
+		t.Errorf("podman.socket is not enabled: %v", err)
+	}
+	// Idempotent: a second deploy finds it enabled and active.
+	deploy(t, e, DeployOptions{})
+	if n := strings.Count(h.log("systemctl.log"), "enable --now podman.socket"); n != 1 {
+		t.Errorf("podman.socket enabled %d times, want once", n)
+	}
+	checkScriptSyntax(t, h.Exec.Scripts())
+
+	// docker never needs the podman socket.
+	h2 := newFakeHost(t)
+	repo2 := writeRepo(t, strings.Replace(toml, `"podman"`, `"docker"`, 1), map[string]string{"compose.yaml": "services: {}\n"})
+	deploy(t, h2.Engine(loadConfig(t, repo2)), DeployOptions{})
+	if strings.Contains(h2.log("systemctl.log"), "podman.socket") {
+		t.Errorf("docker compose touched podman.socket:\n%s", h2.log("systemctl.log"))
+	}
+}
+
 func TestContainerEngineMissing(t *testing.T) {
 	h := newFakeHost(t)
 	repo := writeRepo(t, strings.Replace(containerToml, "[container]", "[container]\nengine = \"podman\"", 1), map[string]string{"Dockerfile": "x"})

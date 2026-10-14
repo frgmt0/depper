@@ -112,16 +112,26 @@ func Script(cfg *config.Config) string {
 		lines = append(lines, `printf 'engine=%s\n' "$(command -v `+engineName+` 2>/dev/null || true)"`)
 		if c.Mode() == config.ModeCompose {
 			// Only with the engine present (otherwise the container engine
-			// check already fails). The first meaningful output line: podman
-			// announces its external compose provider on stderr first, and
-			// PODMAN_COMPOSE_WARNING_LOGS=false asks it not to.
+			// check already fails). The first meaningful output line is the
+			// version; podman first announces the external compose provider
+			// it runs (">>>> Executing external compose provider PATH"),
+			// which is reported separately.
 			lines = append(lines,
 				`if command -v `+engineName+` >/dev/null 2>&1; then`,
-				`  if compose_out=$(PODMAN_COMPOSE_WARNING_LOGS=false `+engineName+` compose version 2>&1 </dev/null); then compose_rc=0; else compose_rc=$?; fi`,
+				`  if compose_out=$(`+engineName+` compose version 2>&1 </dev/null); then compose_rc=0; else compose_rc=$?; fi`,
 				`  printf 'compose_rc=%s\n' "$compose_rc"`,
 				`  printf 'compose_out=%s\n' "$(printf '%s\n' "$compose_out" | sed -e '/^>>>> /d' -e '/^[[:space:]]*$/d' | head -n 1 | cut -c 1-`+strconv.Itoa(maxComposeLine)+`)"`,
+				`  printf 'compose_provider=%s\n' "$(printf '%s\n' "$compose_out" | sed -n 's/.*[Ee]xternal compose provider[[:space:]]*"\{0,1\}\([^"[:space:]]*\).*/\1/p' | head -n 1 | cut -c 1-`+strconv.Itoa(maxComposeLine)+`)"`,
 				`fi`,
 			)
+			if c.Engine == "podman" {
+				// docker-compose as podman's provider talks to the podman
+				// API socket of the user.
+				lines = append(lines, PodmanSocketLines()...)
+			}
+		}
+		if c.Engine == "docker" {
+			lines = append(lines, DockerGroupLines("")...)
 		}
 	}
 	if cfg.Tunnel != nil {
@@ -227,8 +237,12 @@ func (d *Doctor) evaluate(f map[string]string) []Check {
 		if path := clean(f["engine"]); path != "" {
 			add("container engine", Pass, path)
 			if c.Mode() == config.ModeCompose {
-				status, detail := composeCheck(c.Engine, f)
+				status, detail := composeCheck(c.Engine, user, f)
 				add("compose", status, detail)
+			}
+			if c.Engine == "docker" {
+				status, detail := DockerGroupCheck(user, f)
+				add("docker group", status, detail)
 			}
 		} else {
 			add("container engine", Fail, c.Engine+" is not installed on the deploy host (required by [container])")
@@ -265,13 +279,16 @@ const maxComposeLine = 200
 
 // composeCheck evaluates `<engine> compose version`, which doctor runs for a
 // compose-mode [container] when the engine is installed.
-func composeCheck(engineName string, f map[string]string) (Status, string) {
+func composeCheck(engineName, user string, f map[string]string) (Status, string) {
 	msg := truncate(clean(f["compose_out"]), maxComposeLine)
 	if f["compose_rc"] == "0" {
 		if msg == "" {
 			msg = "`" + engineName + " compose version` succeeded"
 		}
-		return Pass, msg
+		if engineName != "podman" {
+			return Pass, msg
+		}
+		return podmanComposeCheck(msg, user, f)
 	}
 	if msg == "" {
 		if rc := clean(f["compose_rc"]); rc != "" {
@@ -281,6 +298,151 @@ func composeCheck(engineName string, f map[string]string) (Status, string) {
 		}
 	}
 	return Fail, "`" + engineName + " compose version` failed: " + msg + " (install a compose provider: podman-compose for podman, the docker compose plugin for docker; `depper host init` installs one)"
+}
+
+// Compose providers podman can run.
+const (
+	providerDockerCompose = "docker-compose"
+	providerPodmanCompose = "podman-compose"
+)
+
+// ComposeProviderKind classifies the provider `podman compose` runs: from
+// the path podman announces ("Executing external compose provider PATH"),
+// else from the version line the provider printed. It returns "" when
+// neither names a known provider.
+func ComposeProviderKind(provider, versionLine string) string {
+	name := provider
+	if i := strings.LastIndexByte(name, '/'); i >= 0 {
+		name = name[i+1:]
+	}
+	switch {
+	case strings.HasPrefix(name, providerDockerCompose):
+		return providerDockerCompose
+	case strings.HasPrefix(name, providerPodmanCompose):
+		return providerPodmanCompose
+	}
+	v := strings.ToLower(versionLine)
+	switch {
+	case strings.HasPrefix(v, "docker compose version"), strings.HasPrefix(v, "docker-compose version"):
+		return providerDockerCompose
+	case strings.HasPrefix(v, "podman-compose version"):
+		return providerPodmanCompose
+	}
+	return ""
+}
+
+// PodmanSocketLines print the state of the user's podman.socket
+// (podman_socket_enabled: the first word `systemctl --user is-enabled`
+// prints, "" when the unit is not found; podman_socket_active: the
+// ActiveState word). They need shell.SessionEnv.
+func PodmanSocketLines() []string {
+	return []string{
+		`printf 'podman_socket_enabled=%s\n' "$(systemctl --user is-enabled podman.socket 2>/dev/null | head -n 1 | tr -cd 'a-z-')"`,
+		`printf 'podman_socket_active=%s\n' "$(systemctl --user is-active podman.socket 2>/dev/null | head -n 1 | tr -cd 'a-z-')"`,
+	}
+}
+
+// podmanSocketEnabled reports an is-enabled state that starts the unit
+// with the user manager.
+func podmanSocketEnabled(state string) bool {
+	return state == "enabled" || state == "enabled-runtime"
+}
+
+// podmanComposeCheck reports the provider `podman compose` runs. A
+// docker-compose provider talks to the podman API socket of the user
+// (podman points DOCKER_HOST at it), so podman.socket must be active, or
+// enabled so the user manager starts it; `podman compose version` works
+// without it, so the version alone proves nothing.
+func podmanComposeCheck(msg, user string, f map[string]string) (Status, string) {
+	provider := clean(f["compose_provider"])
+	kind := ComposeProviderKind(provider, msg)
+	enabled, active := clean(f["podman_socket_enabled"]), clean(f["podman_socket_active"]) == "active"
+	state := enabled
+	if state == "" {
+		state = "not found"
+	}
+	who := provider + " (" + kind + ")"
+	if provider == "" {
+		who = kind + " (named by its version line)"
+	}
+	fix := "`systemctl --user enable --now podman.socket` as " + user
+	switch kind {
+	case providerPodmanCompose:
+		return Pass, msg + "; provider " + who + ", which runs podman itself (no API socket needed)"
+	case providerDockerCompose:
+		lead := msg + "; provider " + who + ", which needs the podman API socket: podman.socket "
+		switch {
+		case active:
+			return Pass, lead + "is active for " + user
+		case podmanSocketEnabled(enabled):
+			return Pass, lead + "is enabled for " + user + " (not running now; the next deploy starts it)"
+		case enabled == "disabled":
+			return Warn, lead + "is disabled for " + user + "; the next `depper deploy` enables it (" + fix + ")"
+		}
+		return Fail, lead + "is " + state + " for " + user + ", so compose cannot reach podman; run " + fix + " (`systemctl --user unmask podman.socket` first if it is masked), or install podman-compose and make it podman's provider"
+	}
+	lead := msg + "; podman did not name its compose provider and the version line names neither docker-compose nor podman-compose; "
+	if active || podmanSocketEnabled(enabled) {
+		return Pass, lead + "podman.socket, which a docker-compose provider needs, is " + map[bool]string{true: "active", false: "enabled"}[active] + " for " + user
+	}
+	return Warn, lead + "if it is docker-compose, it needs podman.socket, which is " + state + " for " + user + "; the next `depper deploy` enables it (" + fix + ")"
+}
+
+// DockerGroupLines print what DockerGroupCheck needs, as the deploy user:
+// the gid of the docker group, the groups of this login, and the groups of
+// the user's systemd manager (user@UID.service), whose services inherit
+// its credentials. A manager started before the user joined the docker
+// group lacks it, while new SSH logins have it. root prefixes /etc/group
+// and /proc (tests only).
+func DockerGroupLines(root string) []string {
+	group, proc := shell.Quote(root+"/etc/group"), shell.Quote(root+"/proc")
+	return []string{
+		`depper_dgid=$(getent group docker 2>/dev/null | cut -d: -f3)`,
+		`if test -z "$depper_dgid" && test -r ` + group + `; then depper_dgid=$(awk -F: '$1 == "docker" { print $3; exit }' ` + group + `); fi`,
+		`case "$depper_dgid" in *[!0-9]*) depper_dgid="" ;; esac`,
+		`printf 'docker_gid=%s\n' "$depper_dgid"`,
+		`printf 'session_groups=%s\n' "$(id -G 2>/dev/null | tr -cd '0-9 ')"`,
+		`depper_uid=$(id -u 2>/dev/null || true)`,
+		`case "$depper_uid" in *[!0-9]*) depper_uid="" ;; esac`,
+		`printf 'uid=%s\n' "$depper_uid"`,
+		`depper_mpid=""`,
+		`if test -n "$depper_uid"; then depper_mpid=$(systemctl show -p MainPID --value "user@$depper_uid.service" 2>/dev/null || true); fi`,
+		`case "$depper_mpid" in ""|0|*[!0-9]*) depper_mpid="" ;; esac`,
+		`printf 'manager_pid=%s\n' "$depper_mpid"`,
+		`if test -n "$depper_mpid" && test -r ` + proc + `/"$depper_mpid/status"; then`,
+		`  printf 'manager_groups=%s\n' "$(awk '$1 == "Groups:" { $1 = ""; print }' ` + proc + `/"$depper_mpid/status" | tr -cd '0-9 ')"`,
+		`  echo manager_groups_read=1`,
+		`fi`,
+		`unset depper_dgid depper_uid depper_mpid`,
+	}
+}
+
+// DockerGroupCheck evaluates the facts of DockerGroupLines for user.
+func DockerGroupCheck(user string, f map[string]string) (Status, string) {
+	gid, uid := clean(f["docker_gid"]), clean(f["uid"])
+	unit := "user@UID.service"
+	if uid != "" {
+		unit = "user@" + uid + ".service"
+	}
+	has := func(list string) bool {
+		for _, g := range strings.Fields(list) {
+			if g == gid {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case gid == "":
+		return Warn, "there is no docker group on the deploy host, so " + user + " can reach the docker daemon only some other way; `depper host init` installs docker and adds " + user + " to its group"
+	case !has(f["session_groups"]):
+		return Warn, user + " is not in the docker group (gid " + gid + ") in this login, so docker commands cannot reach the docker daemon unless DOCKER_HOST points elsewhere; run `depper host init` again"
+	case f["manager_groups_read"] != "1":
+		return Warn, "could not read the groups of " + user + "'s service manager (" + unit + "); check that `systemd-run --user --wait -P id -G` as " + user + " lists " + gid
+	case !has(f["manager_groups"]):
+		return Fail, "service manager lacks docker group: " + unit + " started before " + user + " joined the docker group (gid " + gid + "), so the services it starts get \"permission denied\" on the docker socket; run `depper host init` again or restart " + unit + " (`sudo systemctl restart " + unit + "`, which restarts every service of " + user + ")"
+	}
+	return Pass, unit + " has the docker group (gid " + gid + "), so services can reach the docker daemon"
 }
 
 // truncate shortens s to at most n runes.
