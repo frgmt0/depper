@@ -51,7 +51,7 @@ engine = "docker"
 compose = "compose.yaml"
 ```
 
-depper uses the compose plugin (`<engine> compose`); `depper doctor` checks it (see [Host requirements](#host-requirements)). During setup it runs `compose config` with its output discarded (`>/dev/null`, to validate the file; not `--quiet`, which podman-compose does not accept) and `compose build` in the release directory. The unit runs `compose up --build --remove-orphans` and stops with `compose down`. Every one of these commands passes `--env-file /dev/null`, so a `.env` file in the repository or the release is ignored (see [How secrets reach containers](#how-secrets-reach-containers)). The compose project name is `depper-<name>`, lowercased, with `.` replaced by `_`. `ports`, `volumes`, `args`, and `command` are rejected in `depper.toml` in this mode; define them in the compose file.
+depper uses the compose plugin (`<engine> compose`); `depper doctor` checks it (see [Host requirements](#host-requirements)). During setup it runs `compose config` with its output discarded (`>/dev/null`, to validate the file; not `--quiet`, which podman-compose does not accept) and `compose build` in the release directory. The unit runs `compose up --build --remove-orphans --force-recreate` and stops with `compose down`; see [The generated unit](#the-generated-unit) for the cleanup around them. Every one of these commands passes `--env-file /dev/null`, so a `.env` file in the repository or the release is ignored (see [How secrets reach containers](#how-secrets-reach-containers)). The compose project name is `depper-<name>`, lowercased, with `.` replaced by `_`. `ports`, `volumes`, `args`, and `command` are rejected in `depper.toml` in this mode; define them in the compose file.
 
 ## The generated unit
 
@@ -79,15 +79,19 @@ WantedBy=default.target
 For compose mode:
 
 ```ini
-ExecStart=/bin/sh -c "..." "/usr/bin/docker" "compose" "-p" "depper-api" "-f" "compose.yaml" "--env-file" "/dev/null" "up" "--build" "--remove-orphans"
-ExecStop=/bin/sh -c "..." "/usr/bin/docker" "compose" "-p" "depper-api" "-f" "compose.yaml" "--env-file" "/dev/null" "down"
+ExecStartPre=-/bin/sh -c "<sanitise>; <engine> compose ... down --remove-orphans; <rm -f leftovers>" "/usr/bin/docker" "depper-api" "compose.yaml"
+ExecStart=/bin/sh -c "..." "/usr/bin/docker" "compose" "-p" "depper-api" "-f" "compose.yaml" "--env-file" "/dev/null" "up" "--build" "--remove-orphans" "--force-recreate"
+ExecStop=/bin/sh -c "<sanitise>; <engine> compose ... down || <rm -f leftovers>" "/usr/bin/docker" "depper-api" "compose.yaml"
 ```
+
+A podman compose unit also has `Wants=podman.socket` and `After=podman.socket` in `[Unit]`: a docker-compose provider talks to the podman API socket, and the ordering makes the manager stop the service before the socket.
 
 (In the unit, `"..."` is the environment-sanitising script described below.)
 Notes:
 
 - `"..."` stands for a script that every engine invocation (`ExecStart`, `ExecStartPre`, and `ExecStop`, in all three modes) runs through `/bin/sh -c '<sanitise>; exec "$0" "$@"'`, with the engine path and its arguments as `$0` and `"$@"`. It applies the same environment sanitising as depper's own scripts: `XDG_RUNTIME_DIR` is reset to `/run/user/UID` unless the inherited one is owned by the user, and `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME` are kept only when the user can write to them (or when the directory is missing and its parent is writable). A service therefore does not inherit a foreign `XDG_*` from the systemd user manager, for example from `/etc/environment` through `pam_env`; rootless podman refuses a runtime directory it does not own. Process-mode services get the same treatment from `.depper-start.sh`. depper cannot change what the user manager itself inherits, so on images that put another user's `XDG_*` in `/etc/environment`, remove those lines as well (see [Preparing a host](hosts.md#another-users-xdg-variables-in-etcenvironment)).
 - The container name is `depper-<name>`. `ExecStartPre=-... rm -f` removes a stale container left by a crash; the leading `-` means a failure there is ignored.
+- Compose mode survives an unclean stop. When the user manager is stopped or restarted abruptly, conmon can be killed while podman still lists the container as running without its port forwarding; `compose down` then fails on it and a plain `compose up` would reuse it, so the service starts but its port refuses connections. So `ExecStartPre=-` runs `compose down --remove-orphans` and then force-removes (`rm -f`) every container still labelled `com.docker.compose.project=<project>` (failures ignored); `up` uses `--force-recreate`, so a container is never reused; and `ExecStop` falls back to the same label-based `rm -f` when `compose down` fails, so a stop never leaves containers behind. These lines take the engine, project, and file as `$0`, `$1`, and `$2` and apply the same environment sanitising. `depper restart`, `secrets push`, and `rollback` restart the unit, so they get the same cleanup (a rollback to a release deployed by an older depper restores that release's older unit, without it).
 - depper resolves the engine's absolute path on the host with `command -v` and writes it into the unit.
 - The order of `run` arguments is: `--rm --name`, the `--env KEY` arguments from `$DEPPER_CONTAINER_ENV_ARGS`, `-p` entries, `-v` entries, `args`, the image, then the `command` words.
 - `args` are passed through verbatim to `<engine> run`. Anything there (`--network`, `--cap-add`, `--privileged`) is your responsibility.
