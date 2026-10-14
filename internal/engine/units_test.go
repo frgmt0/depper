@@ -279,13 +279,51 @@ func TestContainerUnitEngineLinesSanitiseEnv(t *testing.T) {
 		key  string
 		want []string
 	}{
-		{"ExecStart", []string{"compose", "-p", project, "-f", "compose.yaml", "--env-file", "/dev/null", "up", "--build", "--remove-orphans"}},
-		{"ExecStop", []string{"compose", "-p", project, "-f", "compose.yaml", "--env-file", "/dev/null", "down"}},
+		{"ExecStart", []string{"compose", "-p", project, "-f", "compose.yaml", "--env-file", "/dev/null", "up", "--build", "--remove-orphans", "--force-recreate"}},
 	} {
 		vars, args := runEngineLine(t, unitDirective(t, rendered, tt.key), nil)
 		checkSanitised(t, "compose "+tt.key, vars)
 		if fmt.Sprintf("%q", args) != fmt.Sprintf("%q", tt.want) {
 			t.Errorf("compose %s argv = %q, want %q", tt.key, args, tt.want)
+		}
+	}
+}
+
+// The compose cleanup (ExecStartPre=) and stop (ExecStop=) lines run the
+// engine with a sanitised environment and the project and file unchanged,
+// whatever characters they hold.
+func TestComposeCleanupLinesSanitiseEnv(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root owns and can write every directory used here")
+	}
+	engine := fakeEngine(t)
+	cfg := testConfig(t, "[service]\nname = \"shop\"\n[deploy]\nhost = \"server\"\n[container]\nengine = \"docker\"\ncompose = \"deploy/compose.prod.yaml\"\n")
+	rendered, err := ContainerUnit(cfg, "/srv/shop", engine, "release-20260101T000000Z-00000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rendered, "podman.socket") {
+		t.Error("docker compose unit depends on podman.socket")
+	}
+	project := ComposeProject(cfg)
+	for key, script := range map[string]string{"ExecStartPre": ComposeCleanupScript(), "ExecStop": ComposeStopScript()} {
+		line := unitDirective(t, rendered, key)
+		if key == "ExecStartPre" && !strings.HasPrefix(line, "-") {
+			t.Errorf("ExecStartPre failure is not ignored: %s", line)
+		}
+		argv := systemdArgv(t, strings.TrimPrefix(line, "-"), nil)
+		if fmt.Sprintf("%q", argv) != fmt.Sprintf("%q", []string{"/bin/sh", "-c", script, engine, project, "deploy/compose.prod.yaml"}) {
+			t.Fatalf("%s argv = %q", key, argv)
+		}
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Env = foreignXDGEnv()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: %v %s", key, err, out)
+		}
+		checkSanitised(t, key, envLines(string(out)))
+		if !strings.Contains(string(out), "ARG<compose>\nARG<-p>\nARG<"+project+">\nARG<-f>\nARG<deploy/compose.prod.yaml>\nARG<--env-file>\nARG</dev/null>\nARG<down>\n") {
+			t.Errorf("%s did not run compose down with the project and file:\n%s", key, out)
 		}
 	}
 }

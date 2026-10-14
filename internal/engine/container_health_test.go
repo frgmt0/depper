@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/frgmt0/depper/internal/unit"
 )
 
 const containerToml = `[service]
@@ -198,8 +201,9 @@ func TestComposeUnit(t *testing.T) {
 	unitFile := h.read(".config/systemd/user/depper-Shop.App.service")
 	for _, want := range []string{
 		"EnvironmentFile=" + h.path(".local/share/depper/Shop.App") + "/.depper/environment",
-		`ExecStart=` + engineWrap + `"` + podman + `" "compose" "-p" "depper-shop_app" "-f" "compose.yaml" "--env-file" "/dev/null" "up" "--build" "--remove-orphans"`,
-		`ExecStop=` + engineWrap + `"` + podman + `" "compose" "-p" "depper-shop_app" "-f" "compose.yaml" "--env-file" "/dev/null" "down"`,
+		`ExecStart=` + engineWrap + `"` + podman + `" "compose" "-p" "depper-shop_app" "-f" "compose.yaml" "--env-file" "/dev/null" "up" "--build" "--remove-orphans" "--force-recreate"`,
+		`ExecStop=/bin/sh -c ` + unit.Arg(ComposeStopScript()) + ` "` + podman + `" "depper-shop_app" "compose.yaml"`,
+		`ExecStartPre=-/bin/sh -c ` + unit.Arg(ComposeCleanupScript()) + ` "` + podman + `" "depper-shop_app" "compose.yaml"`,
 	} {
 		if !strings.Contains(unitFile, want) {
 			t.Errorf("unit missing %s\n%s", want, unitFile)
@@ -455,5 +459,104 @@ func TestCommandHealthTimeoutIsEnforcedOnTheHost(t *testing.T) {
 	r, err = e.CheckHealth(context.Background(), l)
 	if err != nil || r.OK || r.Error != "health command timed out after 5s" {
 		t.Errorf("expired = %+v (%v)", r, err)
+	}
+}
+
+// fakeComposeEngine is a podman whose compose containers live in
+// FAKE_ROOT/ctr (one file per id holding "PROJECT STATE"). A "stale"
+// container is one whose conmon died: `compose down` fails on it, and `up`
+// without --force-recreate reuses it ("Started") with no port forwarding.
+const fakeComposeEngine = `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_ROOT/podman.log"
+C="$FAKE_ROOT/ctr"; mkdir -p "$C"
+ids() { for f in "$C"/*; do test -f "$f" || continue; set -- $(cat "$f"); test "$1" = "$p" && printf '%s\n' "${f##*/}"; done; }
+case "$1" in
+  compose)
+    shift; p=""; act=""; force=no
+    while test $# -gt 0; do case "$1" in -p) p=$2; shift ;; -f|--env-file) shift ;; --force-recreate) force=yes ;; -*) ;; *) test -z "$act" && act=$1 ;; esac; shift; done
+    case "$act" in
+      down)
+        for id in $(ids); do if grep -q ' stale$' "$C/$id"; then echo "Error while Stopping $id: conmon exited prematurely" >&2; exit 1; fi; done
+        for id in $(ids); do rm -f "$C/$id"; done ;;
+      up)
+        cur=$(ids)
+        if test -n "$cur" && test "$force" = no; then for id in $cur; do echo "Container $id Started"; done; exit 0; fi
+        for id in $cur; do if grep -q ' stale$' "$C/$id"; then echo "Error: $id: conmon exited prematurely" >&2; exit 1; fi; rm -f "$C/$id"; done
+        n=$(ls "$C" | wc -l | tr -d ' '); echo "$p running" > "$C/fresh$n"; echo "Container fresh$n Started" ;;
+    esac ;;
+  ps)
+    p=""; for a; do case "$a" in label=com.docker.compose.project=*) p=${a#label=com.docker.compose.project=} ;; esac; done
+    ids ;;
+  rm) shift; test "$1" = -f && shift; for id; do rm -f "$C/$id"; done ;;
+esac
+exit 0
+`
+
+// runUnitLine runs an Exec*= line of a rendered unit the way systemd
+// would (argv split with systemd's quoting rules) and returns its error.
+func runUnitLine(t *testing.T, line string) ([]byte, error) {
+	t.Helper()
+	argv := systemdArgv(t, strings.TrimPrefix(line, "-"), nil)
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Env = foreignXDGEnv("FAKE_ROOT=" + os.Getenv("FAKE_ROOT"))
+	return cmd.CombinedOutput()
+}
+
+// After an unclean stop (the user manager restarted and killed conmon), a
+// compose container stays listed as running: `down` fails on it and `up`
+// would reuse it without port forwarding. The unit's ExecStartPre= removes
+// it, `up --force-recreate` starts a fresh one, and ExecStop= falls back to
+// removing the containers when `down` fails.
+func TestComposeUnitRecoversStaleContainer(t *testing.T) {
+	h := newFakeHost(t)
+	toml := "[service]\nname = \"pcompose\"\n[deploy]\nhost = \"fakehost\"\n[container]\nengine = \"podman\"\ncompose = \"compose.yaml\"\n"
+	repo := writeRepo(t, toml, map[string]string{"compose.yaml": "services: {}\n"})
+	h.writeExec("remote-bin/podman", fakeComposeEngine)
+	cfg := loadConfig(t, repo)
+	deploy(t, h.Engine(cfg), DeployOptions{})
+	unitFile := h.read(".config/systemd/user/" + cfg.UnitName())
+	for _, want := range []string{"Wants=podman.socket\n", "After=podman.socket\n", `"up" "--build" "--remove-orphans" "--force-recreate"`} {
+		if !strings.Contains(unitFile, want) {
+			t.Errorf("unit lacks %s:\n%s", want, unitFile)
+		}
+	}
+	project := ComposeProject(cfg)
+	stale := filepath.Join(h.Root, "ctr", "stale0")
+	writeFile(t, stale, project+" stale\n")
+	writeFile(t, filepath.Join(h.Root, "ctr", "other0"), "depper-other stale\n")
+
+	// A start: the cleanup may fail as a whole (ExecStartPre=-), but it
+	// must leave no container of the project, and up must make a new one.
+	_, _ = runUnitLine(t, unitDirective(t, unitFile, "ExecStartPre"))
+	if out, err := runUnitLine(t, unitDirective(t, unitFile, "ExecStart")); err != nil {
+		t.Fatalf("ExecStart: %v\n%s", err, out)
+	} else if strings.Contains(string(out), "stale0") {
+		t.Errorf("up reused the stale container:\n%s", out)
+	}
+	if _, err := os.Stat(stale); err == nil {
+		t.Error("the stale container is still there")
+	}
+	entries, _ := os.ReadDir(filepath.Join(h.Root, "ctr"))
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if strings.Join(names, ",") != "fresh1,other0" && strings.Join(names, ",") != "fresh0,other0" {
+		t.Errorf("containers = %v, want one fresh container and the other project's untouched", names)
+	}
+
+	// A stop whose down fails still removes the project's containers.
+	writeFile(t, stale, project+" stale\n")
+	if out, err := runUnitLine(t, unitDirective(t, unitFile, "ExecStop")); err != nil {
+		t.Errorf("ExecStop: %v\n%s", err, out)
+	} else if !strings.Contains(string(out), "compose down failed") {
+		t.Errorf("ExecStop output:\n%s", out)
+	}
+	entries, _ = os.ReadDir(filepath.Join(h.Root, "ctr"))
+	if len(entries) != 1 || entries[0].Name() != "other0" {
+		t.Errorf("after ExecStop: %v", entries)
+	}
+	if !strings.Contains(h.log("podman.log"), "ps -aq --filter label=com.docker.compose.project="+project+"\n") {
+		t.Errorf("podman log:\n%s", h.log("podman.log"))
 	}
 }

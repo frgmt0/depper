@@ -85,6 +85,38 @@ func engineLine(enginePath string, args ...string) string {
 	return "/bin/sh -c " + unit.Arg(EngineWrapperScript()) + " " + execLine(append([]string{enginePath}, args...)...)
 }
 
+// composeRemoveLeftovers removes every container that still carries the
+// compose project label of $1, with the engine in $0. It runs after a
+// `compose down` that failed or left containers behind: a container whose
+// conmon was killed (an unclean stop of the user manager) stays listed as
+// running, `down` fails on it, and `up` would reuse it without its port
+// forwarding. The ids are engine-generated hex words.
+const composeRemoveLeftovers = `depper_ids=$("$0" ps -aq --filter "label=com.docker.compose.project=$1") || depper_ids=""; ` +
+	`if test -n "$depper_ids"; then echo "depper: removing leftover containers of compose project $1" >&2; "$0" rm -f $depper_ids; fi`
+
+// ComposeCleanupScript is the `sh -c` script of a compose unit's
+// ExecStartPre=: after shell.SessionEnv it runs `compose down
+// --remove-orphans` for project $1 and file $2 with the engine $0, then
+// force-removes any container of the project that is left, so the start
+// never meets a stale container.
+func ComposeCleanupScript() string {
+	return strings.Join(shell.SessionEnv(), "; ") + `; "$0" compose -p "$1" -f "$2" --env-file /dev/null down --remove-orphans; ` + composeRemoveLeftovers
+}
+
+// ComposeStopScript is the `sh -c` script of a compose unit's ExecStop=:
+// `compose down`, and when that fails, force-removal of the project's
+// containers, so a stop never leaves containers behind.
+func ComposeStopScript() string {
+	return strings.Join(shell.SessionEnv(), "; ") + `; if "$0" compose -p "$1" -f "$2" --env-file /dev/null down; then exit 0; fi; ` +
+		`echo "depper: compose down failed for project $1" >&2; ` + composeRemoveLeftovers
+}
+
+// composeScriptLine renders an Exec*= line that runs script with the engine
+// as $0, the project as $1 and the compose file as $2.
+func composeScriptLine(script, enginePath, project, file string) string {
+	return "/bin/sh -c " + unit.Arg(script) + " " + execLine(enginePath, project, file)
+}
+
 // ContainerEnvArgsVar is the variable depper adds to the environment file in
 // build/image mode: "--env KEY ..." for every key. The unit expands it
 // unquoted in ExecStart= (systemd splits it into words), so the container
@@ -147,21 +179,33 @@ func ContainerUnit(cfg *config.Config, base, enginePath, releaseID string) (stri
 		"[Unit]",
 		"Description=depper: " + cfg.Service.Name,
 		"After=network.target",
+	}
+	if c.Mode() == config.ModeCompose && c.Engine == "podman" {
+		// A docker-compose provider talks to the podman API socket: start
+		// after it, and on manager stop, stop before it (and the podman
+		// service it activates).
+		lines = append(lines, "Wants=podman.socket", "After=podman.socket")
+	}
+	lines = append(lines,
 		"",
 		"[Service]",
 		"Type=simple",
-		"WorkingDirectory=" + unit.Path(base+"/current"),
-		"EnvironmentFile=" + unit.Path(base+"/.depper/environment"),
-	}
+		"WorkingDirectory="+unit.Path(base+"/current"),
+		"EnvironmentFile="+unit.Path(base+"/.depper/environment"),
+	)
 	switch c.Mode() {
 	case config.ModeCompose:
 		// --env-file /dev/null: interpolate ${VAR} only from the process
 		// environment (EnvironmentFile= above), never from a .env file in
 		// the release; `environment: [KEY]` passes values through as well.
+		// ExecStartPre= clears whatever an unclean stop left (see
+		// ComposeCleanupScript), --force-recreate never reuses a container,
+		// and ExecStop= falls back to removing the containers.
 		project := ComposeProject(cfg)
 		lines = append(lines,
-			"ExecStart="+engineLine(enginePath, "compose", "-p", project, "-f", c.Compose, "--env-file", "/dev/null", "up", "--build", "--remove-orphans"),
-			"ExecStop="+engineLine(enginePath, "compose", "-p", project, "-f", c.Compose, "--env-file", "/dev/null", "down"),
+			"ExecStartPre=-"+composeScriptLine(ComposeCleanupScript(), enginePath, project, c.Compose),
+			"ExecStart="+engineLine(enginePath, "compose", "-p", project, "-f", c.Compose, "--env-file", "/dev/null", "up", "--build", "--remove-orphans", "--force-recreate"),
+			"ExecStop="+composeScriptLine(ComposeStopScript(), enginePath, project, c.Compose),
 		)
 	default:
 		name := cfg.ContainerName()
