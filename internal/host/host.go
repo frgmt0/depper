@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/frgmt0/depper/internal/doctor"
 	"github.com/frgmt0/depper/internal/transport"
 )
 
@@ -316,12 +317,4 @@ func (o *Options) Validate() error {
 
 // clean removes control characters from text that may come from the remote
 // host or the user, so it cannot manipulate the terminal.
-func clean(s string) string {
-	s = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return ' '
-		}
-		return r
-	}, s)
-	return strings.TrimSpace(s)
-}
+func clean(s string) string { return doctor.Clean(s) }

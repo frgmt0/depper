@@ -52,13 +52,13 @@ func (s *StatusResult) Failed() bool {
 // WriteHuman prints the report.
 func (s *StatusResult) WriteHuman(w io.Writer) {
 	if s.Record != nil {
-		_, _ = fmt.Fprintf(w, "Prepared by depper %s (created %s, updated %s) for %s\n", s.Record.DepperVersion, s.Record.CreatedAt, s.Record.UpdatedAt, s.Record.DeployUser)
+		_, _ = fmt.Fprintf(w, "Prepared by depper %s (created %s, updated %s) for %s\n", clean(s.Record.DepperVersion), clean(s.Record.CreatedAt), clean(s.Record.UpdatedAt), clean(s.Record.DeployUser))
 		if len(s.Record.Packages) > 0 {
-			_, _ = fmt.Fprintf(w, "Packages installed by depper: %s\n", strings.Join(s.Record.Packages, " "))
+			_, _ = fmt.Fprintf(w, "Packages installed by depper: %s\n", clean(strings.Join(s.Record.Packages, " ")))
 		}
 	}
 	for _, c := range s.Checks {
-		_, _ = fmt.Fprintf(w, "%-5s %s: %s\n", strings.ToUpper(c.Status), c.Name, c.Detail)
+		_, _ = fmt.Fprintf(w, "%-5s %s: %s\n", strings.ToUpper(c.Status), clean(c.Name), clean(c.Detail))
 	}
 }
 
@@ -115,7 +115,7 @@ func (r *Runner) Status(ctx context.Context, cfg *config.Config) (*StatusResult,
 	rem := r.remote(cfg.SSHTarget())
 	out, err := rem.Capture(ctx, r.statusScript())
 	if err != nil {
-		return nil, fmt.Errorf("cannot connect to %s: %w", cfg.Deploy.Host, err)
+		return nil, fmt.Errorf("cannot connect to %s: %s", cfg.Deploy.Host, clean(err.Error()))
 	}
 	i := strings.Index(out, statusMarker+"\n")
 	if i < 0 {
@@ -304,7 +304,7 @@ func (r *Runner) probeAuthMethods(ctx context.Context, cfg *config.Config, users
 			if err == nil {
 				return nil, fmt.Errorf("%s logged in without credentials", u)
 			}
-			return nil, fmt.Errorf("%s: %s", u, lastLines(text, 1))
+			return nil, fmt.Errorf("%s: %s", u, clean(lastLines(text, 1)))
 		}
 		out[u] = strings.Split(m[1], ",")
 	}

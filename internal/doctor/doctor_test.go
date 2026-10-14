@@ -356,7 +356,7 @@ func TestComposeCheck(t *testing.T) {
 	engineFacts := with(healthyFacts, "engine", "/usr/bin/podman")
 
 	report, _ := runWith(t, composeConfig("podman"), with(with(engineFacts, "compose_rc", "0"), "compose_out", "podman-compose version 1.0.6"), nil)
-	if c := byName(report, "compose"); c.Status != Pass || c.Detail != "podman-compose version 1.0.6; provider podman-compose (named by its version line), which runs podman itself (no API socket needed)" {
+	if c := byName(report, "compose"); c.Status != Pass || c.Detail != "provider podman-compose (named by its version line), which runs podman itself (no API socket needed)" {
 		t.Errorf("compose = %+v", c)
 	}
 	if report.Failed() {
@@ -419,7 +419,7 @@ func TestComposeProbeRunsUnderPOSIXShell(t *testing.T) {
 		status             Status
 		detail             string
 	}{
-		{"working", "podman", "#!/bin/sh\ntest \"$1 $2\" = 'compose version' || exit 9\necho '>>>> Executing external compose provider \"/usr/bin/podman-compose\". Please refer to the documentation for details. <<<<' >&2\necho >&2\necho 'podman-compose version 1.0.6'\necho 'podman version 4.9.3'\n", Pass, "podman-compose version 1.0.6; provider /usr/bin/podman-compose (podman-compose), which runs podman itself (no API socket needed)"},
+		{"working", "podman", "#!/bin/sh\ntest \"$1 $2\" = 'compose version' || exit 9\necho '>>>> Executing external compose provider \"/usr/bin/podman-compose\". Please refer to the documentation for details. <<<<' >&2\necho >&2\necho 'podman-compose version 1.0.6'\necho 'podman version 4.9.3'\n", Pass, "provider /usr/bin/podman-compose (podman-compose), which runs podman itself (no API socket needed)"},
 		{"failing", "docker", "#!/bin/sh\necho \"docker: '$1' is not a docker command.\" >&2\necho \"See 'docker --help'\" >&2\nexit 1\n", Fail, "`docker compose version` failed: docker: 'compose' is not a docker command. " + composeHint},
 		{"no engine", "podman", "", "", ""},
 	} {
@@ -656,4 +656,57 @@ func runOut(t *testing.T, name string, args ...string) string {
 		t.Skipf("%s: %v", name, err)
 	}
 	return string(out)
+}
+
+func TestCleanStripsANSI(t *testing.T) {
+	tests := []struct{ name, in, want string }{
+		{"underline", "\x1b[4mhello\x1b[0m", "hello"},
+		{"params and intermediate", "a\x1b[1;31;40mb\x1b[2 qc", "abc"},
+		{"other control", "a\x07b\x1b]0;x\x07c\tz", "a b ]0;x c z"},
+		{"plain", "  plain text  ", "plain text"},
+	}
+	for _, tt := range tests {
+		if got := Clean(tt.in); got != tt.want {
+			t.Errorf("%s: Clean(%q) = %q, want %q", tt.name, tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestComposeDetailPodman(t *testing.T) {
+	base := with(healthyFacts, "engine", "/usr/bin/podman")
+	tests := []struct {
+		name   string
+		facts  map[string]string
+		status Status
+		want   string
+	}{
+		{"banner with escapes", map[string]string{
+			"compose_out":      "Docker Compose version v2.29.1",
+			"compose_provider": "\x1b[4m/usr/lib/docker/cli-plugins/docker-compose\x1b[0m",
+		}, Pass, "provider /usr/lib/docker/cli-plugins/docker-compose (docker-compose), podman.socket is active for app"},
+		{"plain banner", map[string]string{
+			"compose_out":      "Docker Compose version v2.29.1",
+			"compose_provider": "/usr/lib/docker/cli-plugins/docker-compose",
+		}, Pass, "provider /usr/lib/docker/cli-plugins/docker-compose (docker-compose), podman.socket is active for app"},
+		{"version only", map[string]string{
+			"compose_out": "podman-compose version 1.0.6",
+		}, Pass, "provider podman-compose (named by its version line), which runs podman itself (no API socket needed)"},
+		{"escaped version only", map[string]string{
+			"compose_out": "\x1b[1mdocker-compose version 1.29.2\x1b[0m",
+		}, Pass, "provider docker-compose (named by its version line), podman.socket is active for app"},
+	}
+	for _, tt := range tests {
+		facts := with(with(base, "compose_rc", "0"), "podman_socket_active", "active")
+		for k, v := range tt.facts {
+			facts = with(facts, k, v)
+		}
+		report, _ := runWith(t, composeConfig("podman"), facts, nil)
+		c := byName(report, "compose")
+		if c.Status != tt.status || c.Detail != tt.want {
+			t.Errorf("%s: compose = %+v, want %s %q", tt.name, c, tt.status, tt.want)
+		}
+		if strings.ContainsRune(c.Detail, 0x1b) || strings.Contains(c.Detail, "[4m") || strings.Contains(c.Detail, ">>>>") {
+			t.Errorf("%s: escape or banner text in %q", tt.name, c.Detail)
+		}
+	}
 }

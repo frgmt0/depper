@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -114,13 +115,13 @@ func Script(cfg *config.Config) string {
 			// Only with the engine present (otherwise the container engine
 			// check already fails). The first meaningful output line is the
 			// version; podman first announces the external compose provider
-			// it runs (">>>> Executing external compose provider PATH"),
-			// which is reported separately.
+			// it runs (">>>> Executing external compose provider PATH <<<<", possibly wrapped in ANSI
+			// escapes), which is reported separately.
 			lines = append(lines,
 				`if command -v `+engineName+` >/dev/null 2>&1; then`,
 				`  if compose_out=$(`+engineName+` compose version 2>&1 </dev/null); then compose_rc=0; else compose_rc=$?; fi`,
 				`  printf 'compose_rc=%s\n' "$compose_rc"`,
-				`  printf 'compose_out=%s\n' "$(printf '%s\n' "$compose_out" | sed -e '/^>>>> /d' -e '/^[[:space:]]*$/d' | head -n 1 | cut -c 1-`+strconv.Itoa(maxComposeLine)+`)"`,
+				`  printf 'compose_out=%s\n' "$(printf '%s\n' "$compose_out" | sed -e '/>>>> /d' -e '/^[[:space:]]*$/d' | head -n 1 | cut -c 1-`+strconv.Itoa(maxComposeLine)+`)"`,
 				`  printf 'compose_provider=%s\n' "$(printf '%s\n' "$compose_out" | sed -n 's/.*[Ee]xternal compose provider[[:space:]]*"\{0,1\}\([^"[:space:]]*\).*/\1/p' | head -n 1 | cut -c 1-`+strconv.Itoa(maxComposeLine)+`)"`,
 				`fi`,
 			)
@@ -169,9 +170,15 @@ func ParseFacts(out string) map[string]string {
 	return facts
 }
 
-// clean removes control characters from text that came from the remote host
-// so it cannot manipulate the terminal.
-func clean(s string) string {
+// ansiCSI matches ANSI CSI sequences: ESC '[', parameter bytes, intermediate
+// bytes, and a final byte.
+var ansiCSI = regexp.MustCompile("\x1b\\[[0-?]*[ -/]*[@-~]")
+
+// Clean strips ANSI CSI sequences and then replaces the remaining control
+// characters in text that came from the remote host, so it cannot manipulate
+// the terminal and no escape-sequence remnants such as "[4m" reach the output.
+func Clean(s string) string {
+	s = ansiCSI.ReplaceAllString(s, "")
 	s = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
 			return ' '
@@ -180,6 +187,8 @@ func clean(s string) string {
 	}, s)
 	return strings.TrimSpace(s)
 }
+
+func clean(s string) string { return Clean(s) }
 
 type lockInfo struct {
 	CreatedAt string `json:"created_at"`
@@ -368,9 +377,9 @@ func podmanComposeCheck(msg, user string, f map[string]string) (Status, string) 
 	fix := "`systemctl --user enable --now podman.socket` as " + user
 	switch kind {
 	case providerPodmanCompose:
-		return Pass, msg + "; provider " + who + ", which runs podman itself (no API socket needed)"
+		return Pass, "provider " + who + ", which runs podman itself (no API socket needed)"
 	case providerDockerCompose:
-		lead := msg + "; provider " + who + ", which needs the podman API socket: podman.socket "
+		lead := "provider " + who + ", podman.socket "
 		switch {
 		case active:
 			return Pass, lead + "is active for " + user
