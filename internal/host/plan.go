@@ -63,6 +63,9 @@ type Plan struct {
 	// rootBefore is yes).
 	rootBefore string
 	hardenRoot bool
+	// unsynced are packages to install on Arch that the pacman sync
+	// database does not have; buildPlan refuses when there are any.
+	unsynced []string
 }
 
 // Changes reports whether any step changes something.
@@ -123,8 +126,20 @@ func (r *Runner) aptLines() []string {
 	}
 }
 
+// installLines installs pkgs with the family's package manager; update
+// refreshes the apt lists first. On Arch the sync database is never
+// refreshed (pacman -Sy alone makes a partial upgrade): pacman installs from
+// the database as it is, which buildPlan checked has every package.
 func (r *Runner) installLines(family string, pkgs []string, update bool) []string {
-	if family == FamilyDebian {
+	switch family {
+	case FamilyArch:
+		return []string{
+			"if ! pacman -S --needed --noconfirm --noprogressbar " + shell.Join(pkgs...) + "; then",
+			`  echo "pacman could not install ` + strings.Join(pkgs, " ") + `; if it failed to download a package, the sync database is older than the mirrors: run sudo pacman -Syu on the host yourself, then host init again (depper never runs pacman -Sy)" >&2`,
+			"  exit 1",
+			"fi",
+		}
+	case FamilyDebian:
 		lines := r.aptLines()
 		if update {
 			lines = append(lines, "apt-get $apt_opts -q update")
@@ -132,6 +147,72 @@ func (r *Runner) installLines(family string, pkgs []string, update bool) []strin
 		return append(lines, "apt-get $apt_opts -q -y install "+shell.Join(pkgs...))
 	}
 	return []string{"dnf -y -q install " + shell.Join(pkgs...)}
+}
+
+// install returns the lines that install pkgs. On Arch it also records the
+// packages the pacman sync database does not have (see Plan.unsynced).
+func (p *Plan) install(r *Runner, f *Facts, pkgs []string, update bool) []string {
+	if f.Family == FamilyArch {
+		for _, pkg := range pkgs {
+			if _, ok := f.PacmanSync[pkg]; !ok && !contains(p.unsynced, pkg) {
+				p.unsynced = append(p.unsynced, pkg)
+			}
+		}
+	}
+	return r.installLines(f.Family, pkgs, update)
+}
+
+// pacmanSyncError is the refusal when the pacman sync database lacks
+// packages to install. depper never refreshes it: `pacman -Sy` without
+// upgrading the system is a partial upgrade, which Arch does not support.
+func pacmanSyncError(f *Facts, pkgs []string) error {
+	why := "the local pacman sync database does not have " + strings.Join(pkgs, ", ")
+	if f.PacmanSyncEmpty {
+		why = "the local pacman sync database is empty (/var/lib/pacman/sync has no *.db), so it does not have " + strings.Join(pkgs, ", ")
+	}
+	return &ErrUnsupported{Reason: fmt.Sprintf("%s. depper installs on Arch only from the sync database as it is and never runs `pacman -Sy` (refreshing it without upgrading makes a partial upgrade, which Arch does not support). Run `sudo pacman -Syu` on the host yourself (and reboot if it upgraded the kernel), then run host init again", why)}
+}
+
+// Firewall tools host init can configure.
+const (
+	firewallUFW       = "ufw"
+	firewallFirewalld = "firewalld"
+)
+
+// firewallTool picks the firewall for --firewall: ufw on Debian, firewalld
+// on Fedora. On Arch it uses the one that is active (ufw first), and
+// installs ufw when none is; it refuses when a hand-written nftables or
+// iptables ruleset is active, or when firewalld would start at boot next to
+// ufw.
+func firewallTool(f *Facts) (string, error) {
+	switch f.Family {
+	case FamilyDebian:
+		return firewallUFW, nil
+	case FamilyArch:
+	default:
+		return firewallFirewalld, nil
+	}
+	switch {
+	case f.UFWActive:
+		return firewallUFW, nil
+	case f.FirewalldActive:
+		return firewallFirewalld, nil
+	case len(f.RulesetServices) > 0:
+		return "", &ErrUnsupported{Reason: fmt.Sprintf("--firewall: %s is active, and neither ufw nor firewalld is; depper does not replace a hand-written ruleset. Open the ports in that ruleset yourself and drop --firewall, or move to ufw or firewalld (stop and disable %s first), then run host init again", strings.Join(f.RulesetServices, " and "), rulesetUnits(f.RulesetServices))}
+	case f.FirewalldEnabled:
+		return "", &ErrUnsupported{Reason: "--firewall: firewalld.service is enabled but not running, so it would start at the next boot next to the ufw depper would enable; start it (`sudo systemctl start firewalld`) so depper uses firewalld, or disable it (`sudo systemctl disable firewalld`), then run host init again"}
+	}
+	return firewallUFW, nil
+}
+
+// rulesetUnits returns the unit names of RulesetServices entries.
+func rulesetUnits(entries []string) string {
+	var units []string
+	for _, e := range entries {
+		u, _, _ := strings.Cut(e, " ")
+		units = append(units, u)
+	}
+	return strings.Join(units, ", ")
 }
 
 // buildPlan decides every remote step from the facts. It refuses
@@ -142,7 +223,21 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 		if id == "" {
 			id = "unknown (no /etc/os-release)"
 		}
-		return nil, &ErrUnsupported{Reason: fmt.Sprintf("unsupported operating system %q (ID_LIKE %q): depper host init supports Debian/Ubuntu (apt) and Fedora/RHEL/CentOS/Rocky/AlmaLinux (dnf)", id, f.OSLike)}
+		return nil, &ErrUnsupported{Reason: fmt.Sprintf("unsupported operating system %q (ID_LIKE %q): depper host init supports Debian/Ubuntu (apt), Fedora/RHEL/CentOS/Rocky/AlmaLinux (dnf), and Arch Linux and its derivatives (pacman)", id, f.OSLike)}
+	}
+	arch := f.Family == FamilyArch
+	if arch && !f.Pacman {
+		return nil, &ErrUnsupported{Reason: fmt.Sprintf("%s (ID %q) is an Arch Linux system, but pacman was not found on the host", o.Host, f.OSID)}
+	}
+	if arch && o.AutoUpdates {
+		return nil, &ErrUnsupported{Reason: fmt.Sprintf("--auto-updates is not supported on Arch Linux (ID %q): unattended upgrades are not supported practice on Arch, where an upgrade can need manual steps (see the news on archlinux.org before upgrading). Run `sudo pacman -Syu` on the host regularly yourself, and drop --auto-updates", f.OSID)}
+	}
+	fwTool := ""
+	if o.Firewall != nil {
+		var err error
+		if fwTool, err = firewallTool(f); err != nil {
+			return nil, err
+		}
 	}
 	if f.OSID == "amzn" {
 		major, _, _ := strings.Cut(f.VersionID, ".")
@@ -169,7 +264,25 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 			return nil, &ErrUnsupported{Reason: fmt.Sprintf("Amazon Linux (%s) has no supported rootless podman packages; use docker (--container docker, or engine = \"docker\" in [container])", f.VersionID)}
 		}
 		reqs = append(reqs, pkgReq{Pkg: "podman", Cmd: "podman"})
-		if f.Family == FamilyDebian {
+		if arch {
+			// newuidmap is in shadow; rootless networking needs passt
+			// (pasta, podman 5's default) or slirp4netns: whichever is
+			// installed, else the first the sync database has.
+			reqs = append(reqs, pkgReq{Pkg: "shadow", Cmd: "newuidmap"})
+			net := "passt"
+			switch {
+			case f.Packages["passt"]:
+			case f.Packages["slirp4netns"]:
+				net = "slirp4netns"
+			default:
+				if _, ok := f.PacmanSync["passt"]; !ok {
+					if _, ok := f.PacmanSync["slirp4netns"]; ok {
+						net = "slirp4netns"
+					}
+				}
+			}
+			reqs = append(reqs, pkgReq{Pkg: net})
+		} else if f.Family == FamilyDebian {
 			reqs = append(reqs, pkgReq{Pkg: "uidmap", Cmd: "newuidmap"}, pkgReq{Pkg: "slirp4netns", Cmd: ""})
 		} else if fedoraProper {
 			reqs = append(reqs, pkgReq{Pkg: "shadow-utils", Cmd: "newuidmap"}, pkgReq{Pkg: "passt", Cmd: ""})
@@ -180,6 +293,8 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 		switch {
 		case f.Family == FamilyDebian:
 			reqs = append(reqs, pkgReq{Pkg: "docker.io", Cmd: "docker"})
+		case arch:
+			reqs = append(reqs, pkgReq{Pkg: "docker", Cmd: "docker"})
 		case fedoraProper:
 			reqs = append(reqs, pkgReq{Pkg: "moby-engine", Cmd: "docker"})
 		case amazon:
@@ -189,7 +304,7 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 		}
 	}
 	if o.Firewall != nil {
-		if f.Family == FamilyDebian {
+		if fwTool == firewallUFW {
 			reqs = append(reqs, pkgReq{Pkg: "ufw", Cmd: "ufw"})
 		} else {
 			reqs = append(reqs, pkgReq{Pkg: "firewalld", Cmd: "firewall-cmd"})
@@ -220,8 +335,8 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 	pkgStep := p.add(&Step{ID: StepPackages, Title: "Install packages"})
 	if len(missing) > 0 {
 		pkgStep.Change = true
-		pkgStep.Detail = "install " + strings.Join(missing, " ") + " with " + map[string]string{FamilyDebian: "apt-get", FamilyFedora: "dnf"}[f.Family]
-		pkgStep.lines = r.installLines(f.Family, missing, true)
+		pkgStep.Detail = "install " + strings.Join(missing, " ") + " with " + map[string]string{FamilyDebian: "apt-get", FamilyFedora: "dnf", FamilyArch: "pacman (from the sync database as it is; no -Sy)"}[f.Family]
+		pkgStep.lines = p.install(r, f, missing, true)
 		pkgStep.packages = missing
 	} else {
 		pkgStep.Detail = "already installed: " + strings.Join(present, " ")
@@ -230,11 +345,17 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 	// cloudflared from Cloudflare's signed package repository.
 	if o.Cloudflared {
 		s := p.add(&Step{ID: StepCloudflared, Title: "Install cloudflared from pkg.cloudflare.com"})
+		if arch {
+			s.Title = "Install cloudflared from the Arch Linux repositories"
+		}
 		if f.has(pkgReq{Pkg: "cloudflared", Cmd: "cloudflared"}) {
 			s.Detail = "already installed"
 		} else {
 			s.Change, s.packages = true, []string{"cloudflared"}
-			if f.Family == FamilyDebian {
+			if arch {
+				s.Detail = "install cloudflared with pacman"
+				s.lines = p.install(r, f, []string{"cloudflared"}, false)
+			} else if f.Family == FamilyDebian {
 				keyring := r.raw("/usr/share/keyrings/cloudflare-main.gpg")
 				list := r.raw("/etc/apt/sources.list.d/cloudflared.list")
 				s.Detail = "add the Cloudflare apt repository (signed-by /usr/share/keyrings/cloudflare-main.gpg) and install cloudflared"
@@ -262,8 +383,14 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 	// Tailscale from its official package repository.
 	if o.TailscaleKey.Set() {
 		s := p.add(&Step{ID: StepTailscalePkg, Title: "Install Tailscale from pkgs.tailscale.com"})
+		if arch {
+			s.Title = "Install Tailscale from the Arch Linux repositories"
+		}
 		if f.has(pkgReq{Pkg: "tailscale", Cmd: "tailscale"}) {
 			s.Detail = "already installed"
+		} else if arch {
+			s.Change, s.Detail, s.packages = true, "install tailscale with pacman (tailscaled.service is enabled when joining the tailnet)", []string{"tailscale"}
+			s.lines = p.install(r, f, []string{"tailscale"}, false)
 		} else {
 			lines, detail, err := r.tailscaleInstall(f)
 			if err != nil {
@@ -435,7 +562,7 @@ fi`
 		if listen := unionInts(f.SSHDPorts, f.SSHSocketPorts); len(listen) > 0 && !containsInt(listen, o.Port) {
 			p.warn("host init connects to port %d, but sshd listens on %s: assuming a port forward or NAT in between, so the firewall allows %s", o.Port, intsString(listen), portList)
 		}
-		if f.Family == FamilyDebian {
+		if fwTool == firewallUFW {
 			s = p.add(&Step{ID: StepFirewall, Title: "Firewall (ufw): allow TCP " + portList})
 			var add []int
 			for _, port := range want {
@@ -443,8 +570,14 @@ fi`
 					add = append(add, port)
 				}
 			}
-			if f.UFWActive && len(add) == 0 {
+			// Debian's package enables ufw.service; on Arch depper enables
+			// it, or ufw would be off again after a reboot.
+			bootUnit := arch && !f.UFWEnabled
+			if f.UFWActive && len(add) == 0 && !bootUnit {
 				s.Detail = "ufw is active and allows " + portList
+				if arch {
+					s.Detail += "; ufw.service is enabled"
+				}
 			} else {
 				s.Change = true
 				for _, port := range add {
@@ -458,13 +591,19 @@ fi`
 					s.lines = append(s.lines, "ufw --force enable")
 					parts = append(parts, "enable ufw")
 				}
-				s.prepare, s.revert = firewallMarkers(firewallGuard{
+				fg := firewallGuard{
 					enabling: !f.UFWActive, disable: []string{"ufw --force disable >/dev/null"},
 					added: add,
 					remove: func(port string) string {
 						return `{ ufw delete allow ` + port + `/tcp >/dev/null 2>&1 || ! ufw status 2>/dev/null | grep -Eq "^` + port + `/tcp[[:space:]]"; }`
 					},
-				})
+				}
+				if bootUnit {
+					s.lines = append(s.lines, "systemctl enable ufw.service")
+					parts = append(parts, "enable ufw.service at boot")
+					fg.bootUnit = "ufw.service"
+				}
+				s.prepare, s.revert = firewallMarkers(fg)
 				s.Detail = strings.Join(parts, ", then ") + "; reverted automatically unless new admin and " + o.User + " logins succeed"
 			}
 		} else {
@@ -666,6 +805,9 @@ fi`
 		}
 	}
 
+	if len(p.unsynced) > 0 {
+		return nil, pacmanSyncError(f, p.unsynced)
+	}
 	for _, st := range p.Steps {
 		p.Packages = append(p.Packages, st.packages...)
 	}
@@ -850,6 +992,10 @@ func composeProvider(engine string, f *Facts) (pkgReq, error) {
 	}
 	reason += ")"
 	switch {
+	case f.Family == FamilyArch && f.PacmanSyncEmpty:
+		reason += ". The pacman sync database is empty: run `sudo pacman -Syu` on the host yourself (depper never runs pacman -Sy), then host init again"
+	case f.Family == FamilyArch:
+		reason += ". On Arch the provider (podman-compose, or docker-compose, which installs the docker CLI plugin) comes from the official repositories; if the local sync database lacks it, run `sudo pacman -Syu` on the host yourself (depper never runs pacman -Sy), then host init again"
 	case f.AptListsEmpty:
 		reason += ". The apt package lists are empty: run `sudo apt-get update` on the host, then host init again"
 	case engine == ContainerPodman && f.Family == FamilyFedora && f.OSID != "fedora":
@@ -901,6 +1047,10 @@ type firewallGuard struct {
 	remove func(port string) string
 	// extra are further prepare lines (for example was-enabled).
 	extra []string
+	// bootUnit is a firewall service the step enables at boot (ufw.service
+	// on Arch). When it is not enabled yet, prepare writes the marker
+	// enabled-unit, and the revert disables it again.
+	bootUnit string
 }
 
 // firewallMarkers returns the prepare and revert lines of a firewall step.
@@ -912,6 +1062,10 @@ func firewallMarkers(fg firewallGuard) (prepare, revert []string) {
 		prepare = append(prepare, `printf '%s\n' "$depper_zone" > "$d/zone"`)
 	}
 	prepare = append(prepare, fg.extra...)
+	if fg.bootUnit != "" {
+		u := shell.Quote(fg.bootUnit)
+		prepare = append(prepare, `if ! systemctl is-enabled --quiet `+u+` 2>/dev/null; then : > "$d/`+markEnabledUnit+`"; fi`)
+	}
 	if fg.enabling {
 		prepare = append(prepare, `: > "$d/`+markWasInactive+`"`)
 		revert = append(revert,
@@ -939,6 +1093,13 @@ func firewallMarkers(fg firewallGuard) (prepare, revert []string) {
 			`    done < "$d/`+markAddedPorts+`"`,
 			`  fi`,
 			`  if test "$depper_pfail" = 0; then rm -f "$d/`+markAddedPorts+`" "$d/zone"; else depper_fail=1; fi`,
+			`fi`)
+	}
+	if fg.bootUnit != "" {
+		u := shell.Quote(fg.bootUnit)
+		revert = append(revert,
+			`if test -f "$d/`+markEnabledUnit+`"; then`,
+			`  if systemctl disable --quiet `+u+`; then rm -f "$d/`+markEnabledUnit+`"; else echo "could not disable `+fg.bootUnit+` again" >&2; depper_fail=1; fi`,
 			`fi`)
 	}
 	return prepare, revert

@@ -18,6 +18,7 @@ import (
 const (
 	FamilyDebian = "debian"
 	FamilyFedora = "fedora"
+	FamilyArch   = "arch"
 )
 
 // Privilege of the admin session.
@@ -100,6 +101,22 @@ type Facts struct {
 	// while firewalld is stopped).
 	FirewalldPorts  []int `json:"firewalld_ports,omitempty"`
 	FirewalldSSHSvc bool  `json:"firewalld_ssh_service"`
+	// UFWEnabled and FirewalldEnabled report that ufw.service and
+	// firewalld.service start at boot.
+	UFWEnabled       bool `json:"ufw_enabled"`
+	FirewalldEnabled bool `json:"firewalld_enabled"`
+	// RulesetServices lists the active nftables.service, iptables.service
+	// and ip6tables.service whose ruleset is not empty (or could not be
+	// read), as "UNIT (N rules)".
+	RulesetServices []string `json:"ruleset_services,omitempty"`
+
+	// Pacman is set when pacman is installed. PacmanSync maps each package
+	// depper may install on Arch to its version in the local sync database
+	// (absent when the database does not have it); PacmanSyncEmpty reports
+	// that there is no sync database at all.
+	Pacman          bool              `json:"pacman,omitempty"`
+	PacmanSync      map[string]string `json:"pacman_sync,omitempty"`
+	PacmanSyncEmpty bool              `json:"pacman_sync_empty,omitempty"`
 
 	// Compose maps each compose provider package to its installed and
 	// candidate versions ("" when absent); AptListsEmpty reports that apt
@@ -117,8 +134,9 @@ type Facts struct {
 	// SSHDRootBase is the PermitRootLogin sshd would use without depper's
 	// drop-in ("" when it could not be determined).
 	SSHDRootBase string `json:"sshd_permitrootlogin_without_dropin,omitempty"`
-	// SSHSocketPorts are the ports of ssh.socket when it is active
-	// (socket-activated sshd listens there, whatever sshd -T says).
+	// SSHSocketPorts are the ports of ssh.socket and sshd.socket when they
+	// are active (socket-activated sshd listens there, whatever sshd -T
+	// says).
 	SSHSocketPorts []int `json:"ssh_socket_ports,omitempty"`
 	// Guards is the state of each automatic revert (depper-ssh-revert,
 	// depper-firewall-revert) left on the host.
@@ -187,6 +205,15 @@ var queriedCommands = []string{
 	"ufw", "firewall-cmd", "firewall-offline-cmd", "sshd", "runuser", "newuidmap", "systemd-run",
 }
 
+// archPackages are the packages depper may install on Arch Linux; the facts
+// script asks pacman which are installed (pacman -Q) and which the local
+// sync database has (pacman -Si), without refreshing it.
+var archPackages = []string{
+	"rsync", "curl", "ca-certificates", "coreutils", "shadow",
+	"podman", "passt", "slirp4netns", "podman-compose", "docker", "docker-compose",
+	"cloudflared", "tailscale", "ufw",
+}
+
 // classify maps os-release ID / ID_LIKE to a supported family.
 func classify(id, like string) string {
 	switch id {
@@ -194,6 +221,8 @@ func classify(id, like string) string {
 		return FamilyDebian
 	case "fedora", "rhel", "centos", "rocky", "almalinux":
 		return FamilyFedora
+	case "arch":
+		return FamilyArch
 	}
 	for _, l := range strings.Fields(like) {
 		switch l {
@@ -201,9 +230,32 @@ func classify(id, like string) string {
 			return FamilyDebian
 		case "fedora", "rhel", "centos":
 			return FamilyFedora
+		case "arch":
+			return FamilyArch
 		}
 	}
 	return ""
+}
+
+// pacmanListAwk turns `pacman -Q` output ("NAME VERSION" lines) into
+// "NAME=VERSION " pairs.
+const pacmanListAwk = `NF >= 2 { printf "%s=%s ", $1, $2 }`
+
+// pacmanInfoAwk turns `pacman -Si` output into "NAME=VERSION " pairs, the
+// first repository's entry for each name.
+const pacmanInfoAwk = `/^Name[[:space:]]*:/ { sub(/^Name[[:space:]]*:[[:space:]]*/, ""); n = $1 } /^Version[[:space:]]*:/ { sub(/^Version[[:space:]]*:[[:space:]]*/, ""); if (n != "" && !(n in seen)) { seen[n] = 1; printf "%s=%s ", n, $1 } n = "" }`
+
+// pacmanPairs parses "NAME=VERSION ..." into a map, keeping only the names
+// in archPackages.
+func pacmanPairs(s string) map[string]string {
+	out := map[string]string{}
+	for _, w := range strings.Fields(s) {
+		name, version, ok := strings.Cut(w, "=")
+		if ok && contains(archPackages, name) {
+			out[name] = clean(version)
+		}
+	}
+	return out
 }
 
 // p quotes an absolute remote path, prefixed with the test root.
@@ -328,6 +380,15 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`  fi`,
 		`done`,
 		`for c in ` + shell.Join(queriedCommands...) + `; do printf 'cmd_%s=%s\n' "$c" "$(command -v "$c" 2>/dev/null || true)"; done`,
+		// pacman reports separately, so a dpkg or rpm that happens to be
+		// installed on Arch (or pacman elsewhere) does not mislead; Go picks
+		// by the family. The sync database is only read, never refreshed.
+		`if command -v pacman >/dev/null 2>&1; then`,
+		`  echo pacman=1`,
+		`  printf 'pac_q=%s\n' "$(LC_ALL=C pacman -Q ` + shell.Join(archPackages...) + ` 2>/dev/null | awk ` + shell.Quote(pacmanListAwk) + `)"`,
+		`  printf 'pac_si=%s\n' "$(LC_ALL=C pacman -Si ` + shell.Join(archPackages...) + ` 2>/dev/null | awk ` + shell.Quote(pacmanInfoAwk) + `)"`,
+		`  if ! ls ` + r.p("/var/lib/pacman/sync") + `/*.db >/dev/null 2>&1; then echo pacman_sync_empty=1; fi`,
+		`fi`,
 		`if systemctl is-active --quiet docker.service 2>/dev/null; then echo docker_active=1; fi`,
 		`if systemctl is-enabled --quiet docker.service 2>/dev/null; then echo docker_enabled=1; fi`,
 		`if command -v sshd >/dev/null 2>&1; then`,
@@ -349,7 +410,9 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`    rm -rf "$depper_bt"`,
 		`  fi`,
 		`fi`,
-		`if systemctl is-active --quiet ssh.socket 2>/dev/null; then printf 'ssh_socket_listen=%s\n' "$(systemctl show -p Listen --value ssh.socket 2>/dev/null | tr '\n' ' ')"; fi`,
+		`depper_listen=""`,
+		`for s in ssh.socket sshd.socket; do if systemctl is-active --quiet "$s" 2>/dev/null; then depper_listen="$depper_listen $(systemctl show -p Listen --value "$s" 2>/dev/null | tr '\n' ' ')"; fi; done`,
+		`if test -n "$depper_listen"; then printf 'ssh_socket_listen=%s\n' "$depper_listen"; fi`,
 		`printf 'systemd_version=%s\n' "$(systemctl --version 2>/dev/null | awk 'NR == 1 { print $2 }')"`,
 		`for g in ` + shell.Join(guardUnits...) + `; do`,
 		`  mk=0; for m in ` + shell.Join(guardMarkers...) + `; do test -e ` + r.p(guardStateDir) + `/"$g/$m" && mk=1; done`,
@@ -384,6 +447,19 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`  case "$s" in *"Status: active"*) echo ufw_active=1 ;; esac`,
 		`  printf 'ufw_ports=%s\n' "$(printf '%s\n' "$s" | awk '$2 == "ALLOW" && $1 ~ /^[0-9]+(\/tcp)?$/ { sub("/tcp", "", $1); printf "%s ", $1 }')"`,
 		`fi`,
+		`if systemctl is-enabled --quiet ufw.service 2>/dev/null; then echo ufw_enabled=1; fi`,
+		`if systemctl is-enabled --quiet firewalld.service 2>/dev/null; then echo firewalld_enabled=1; fi`,
+		// A hand-written ruleset loaded by nftables.service or
+		// iptables.service: the number of rules (policy ACCEPT lines do not
+		// count), or "unknown" when it cannot be read.
+		`if systemctl is-active --quiet nftables.service 2>/dev/null; then`,
+		`  if depper_rs=$(nft list ruleset 2>/dev/null); then printf 'ruleset_nftables=%s\n' "$(printf '%s\n' "$depper_rs" | grep -c '[^[:space:]]' || true)"; else echo ruleset_nftables=unknown; fi`,
+		`fi`,
+		`for t in iptables ip6tables; do`,
+		`  if systemctl is-active --quiet "$t.service" 2>/dev/null; then`,
+		`    if depper_rs=$("$t" -S 2>/dev/null); then printf 'ruleset_%s=%s\n' "$t" "$(printf '%s\n' "$depper_rs" | grep -Evc '^-P [A-Z]+ ACCEPT$|^[[:space:]]*$' || true)"; else printf 'ruleset_%s=unknown\n' "$t"; fi`,
+		`  fi`,
+		`done`,
 		`if command -v firewall-cmd >/dev/null 2>&1 || command -v firewall-offline-cmd >/dev/null 2>&1; then`,
 		`  echo firewalld_present=1`,
 		`  if systemctl is-active --quiet firewalld.service 2>/dev/null; then echo firewalld_active=1; fc=firewall-cmd; else fc=firewall-offline-cmd; fi`,
@@ -527,6 +603,21 @@ func parseFacts(out string) (*Facts, map[string]string, error) {
 		}
 	}
 	f.AptListsEmpty = m["apt_lists_empty"] == "1"
+	f.UFWEnabled = m["ufw_enabled"] == "1"
+	f.FirewalldEnabled = m["firewalld_enabled"] == "1"
+	for _, unit := range []string{"nftables", "iptables", "ip6tables"} {
+		n, ok := m["ruleset_"+unit]
+		if !ok {
+			continue
+		}
+		switch n = clean(n); n {
+		case "0":
+		case "unknown", "":
+			f.RulesetServices = append(f.RulesetServices, unit+".service (ruleset unreadable)")
+		default:
+			f.RulesetServices = append(f.RulesetServices, unit+".service ("+n+" rules)")
+		}
+	}
 	for _, p := range composePackages {
 		if v, ok := m["compose_"+p]; ok {
 			if f.Compose == nil {
@@ -544,6 +635,22 @@ func parseFacts(out string) (*Facts, map[string]string, error) {
 			f.Commands[strings.TrimPrefix(k, "cmd_")] = clean(v)
 		case strings.HasPrefix(k, "sshd_") && !sshdMetaKeys[k]:
 			f.SSHD[strings.TrimPrefix(k, "sshd_")] = clean(v)
+		}
+	}
+	// On Arch, pacman alone says what is installed and available.
+	f.Pacman, f.PacmanSyncEmpty = m["pacman"] == "1", m["pacman_sync_empty"] == "1"
+	if f.Family == FamilyArch {
+		installed := pacmanPairs(m["pac_q"])
+		f.PacmanSync = pacmanPairs(m["pac_si"])
+		f.Packages = map[string]bool{}
+		for _, p := range archPackages {
+			_, ok := installed[p]
+			f.Packages[p] = ok
+		}
+		if f.Compose != nil {
+			for _, p := range composePackages {
+				f.Compose[p] = PkgVersions{Installed: pkgVersion(installed[p]), Candidate: pkgVersion(f.PacmanSync[p])}
+			}
 		}
 	}
 	f.SSHDPorts = ports(m["sshd_ports"])
@@ -665,9 +772,9 @@ func (r *Runner) gatherFacts(ctx context.Context, admin *transport.Remote, o *Op
 		if f.SudoMessage != "" {
 			msg = " (sudo said: " + f.SudoMessage + ")"
 		}
-		return nil, fmt.Errorf("%s needs a password for sudo%s; depper connects with BatchMode and cannot type one. Connect as root, or allow passwordless sudo for %s (for example a file in /etc/sudoers.d with `%s ALL=(ALL) NOPASSWD: ALL`)", o.Admin, msg, o.Admin, o.Admin)
+		return nil, fmt.Errorf("%s needs a password for sudo%s; depper connects with BatchMode and cannot type one. Either connect as root with an SSH key (root@%s; root key login is allowed by sshd's default PermitRootLogin prohibit-password), or temporarily allow passwordless sudo for %s (for example the line `%s ALL=(ALL) NOPASSWD: ALL` in a file made with `sudo visudo -f /etc/sudoers.d/depper-init`, removed again after host init)", o.Admin, msg, o.Host, o.Admin, o.Admin)
 	default:
-		return nil, fmt.Errorf("%s is not root and sudo is not installed; connect as root or as a user with passwordless sudo", o.Admin)
+		return nil, fmt.Errorf("%s is not root and sudo is not installed; connect as root with an SSH key, or as a user with passwordless sudo", o.Admin)
 	}
 	return f, nil
 }

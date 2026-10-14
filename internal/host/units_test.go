@@ -336,7 +336,10 @@ func TestClassify(t *testing.T) {
 	for _, tt := range []struct{ id, like, want string }{
 		{"debian", "", FamilyDebian}, {"ubuntu", "debian", FamilyDebian}, {"linuxmint", "ubuntu debian", FamilyDebian},
 		{"fedora", "", FamilyFedora}, {"rocky", "rhel centos fedora", FamilyFedora}, {"almalinux", "", FamilyFedora},
-		{"ol", "fedora", FamilyFedora}, {"arch", "", ""}, {"alpine", "", ""}, {"opensuse-leap", "suse opensuse", ""},
+		{"ol", "fedora", FamilyFedora}, {"alpine", "", ""}, {"opensuse-leap", "suse opensuse", ""},
+		{"arch", "", FamilyArch}, {"omarchy", "arch", FamilyArch}, {"manjaro", "arch", FamilyArch},
+		{"endeavouros", "arch", FamilyArch}, {"cachyos", "arch", FamilyArch}, {"archarm", "arch", FamilyArch},
+		{"gentoo", "", ""},
 	} {
 		if got := classify(tt.id, tt.like); got != tt.want {
 			t.Errorf("classify(%q, %q) = %q", tt.id, tt.like, got)

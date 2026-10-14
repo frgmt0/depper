@@ -101,6 +101,7 @@ func (r *Runner) statusScript() string {
 		`printf 'sshd_match=%s\n' "$depper_match"`,
 		`if test -r `+r.p("/etc/ufw/ufw.conf")+` && grep -q '^ENABLED=yes' `+r.p("/etc/ufw/ufw.conf")+`; then echo ufw=1; fi`,
 		`if systemctl is-active --quiet firewalld.service 2>/dev/null; then echo firewalld=1; fi`,
+		`if systemctl is-enabled --quiet ufw.service 2>/dev/null; then echo ufw_boot=1; fi`,
 		`if test -f `+r.p("/etc/apt/apt.conf.d/20auto-upgrades")+` && grep -q 'APT::Periodic::Unattended-Upgrade "1"' `+r.p("/etc/apt/apt.conf.d/20auto-upgrades")+`; then echo autoupd=1; fi`,
 		`for t in dnf-automatic-install.timer dnf5-automatic.timer; do if systemctl is-enabled --quiet "$t" 2>/dev/null; then echo autoupd=1; fi; done`,
 		`if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then echo tailscale_up=1; fi`,
@@ -257,7 +258,13 @@ func (r *Runner) Status(ctx context.Context, cfg *config.Config) (*StatusResult,
 	if m["firewalld"] == "1" {
 		fwName = "firewalld"
 	}
-	feature("firewall", len(h.Firewall) > 0, fw, fwName+" is active", "no firewall is active (depper enabled one for ports "+intsString(h.Firewall)+")")
+	if fwName == "ufw" && fw && m["ufw_boot"] != "1" {
+		// ufw.conf says enabled, but nothing starts ufw at boot (Arch does
+		// not enable ufw.service when the package is installed).
+		add("firewall", StatusWarn, "ufw is enabled in /etc/ufw/ufw.conf, but ufw.service is not enabled, so the firewall is off after a reboot; run `sudo systemctl enable ufw.service` (or `depper host init --firewall ...` again)")
+	} else {
+		feature("firewall", len(h.Firewall) > 0, fw, fwName+" is active", "no firewall is active (depper enabled one for ports "+intsString(h.Firewall)+")")
+	}
 	feature("auto updates", h.AutoUpdates, m["autoupd"] == "1", "automatic security updates are enabled", "automatic security updates are not enabled")
 	feature("tailscale", h.Tailscale, m["tailscale_up"] == "1", "tailscale is up", "tailscale is not up")
 	return res, nil

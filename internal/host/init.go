@@ -454,6 +454,7 @@ func (r *Runner) printPlan(o *Options, f *Facts, p *Plan) {
 		who = "passwordless sudo"
 	}
 	r.printf("\n%s: %s (%s), admin %s (%s)\n", o.Host, name, f.Arch, o.Admin, who)
+	r.printf("  os-release ID %s, handled as the %s family\n", shellName(f.OSID), familyName[f.Family])
 	n := 0
 	for _, s := range p.Steps {
 		if s.Change {
@@ -473,6 +474,13 @@ func (r *Runner) printPlan(o *Options, f *Facts, p *Plan) {
 		r.printf("WARNING: %s\n", w)
 	}
 	r.printf("\n")
+}
+
+// familyName names each supported family for messages.
+var familyName = map[string]string{
+	FamilyDebian: "Debian (apt)",
+	FamilyFedora: "Fedora/RHEL (dnf)",
+	FamilyArch:   "Arch Linux (pacman)",
 }
 
 const (

@@ -256,6 +256,7 @@ var guardedTools = []string{
 	"apt-get", "dpkg-query", "dnf", "rpm", "useradd", "usermod", "loginctl", "systemctl", "runuser",
 	"sudo", "sshd", "ufw", "firewall-cmd", "firewall-offline-cmd", "tailscale", "curl", "podman", "docker",
 	"cloudflared", "rsync", "getent", "id", "chown", "systemd-run", "ip", "ssh-keygen", "apt-cache", "timeout",
+	"pacman", "nft", "iptables", "ip6tables",
 }
 
 const fakeID = `#!/bin/sh
@@ -311,6 +312,12 @@ else gid=$(awk -F: -v g="$group" '$1 == g { print $3 }' "$FS/etc/group"); fi
 printf '%s:x:%s:%s::%s:%s\n' "$name" "$uid" "$gid" "$home" "$shell" >> "$FS/etc/passwd"
 printf '%s:!:19000:0:99999:7:::\n' "$name" >> "$FS/etc/shadow"
 mkdir -p "$home"
+# useradd-subids: like a useradd whose login.defs has SUB_UID_COUNT, add
+# subordinate ranges itself.
+if test -f "$FAKE_ROOT/useradd-subids"; then
+  printf '%s:100000:65536\n' "$name" >> "$FS/etc/subuid"
+  printf '%s:100000:65536\n' "$name" >> "$FS/etc/subgid"
+fi
 `
 
 const fakeUsermod = `#!/bin/sh
@@ -565,6 +572,8 @@ FS="$FAKE_ROOT/fs"
 inst() { cp "$FAKE_ROOT/pkgsrc/$1" "$FAKE_ROOT/pkg-bin/$1"; chmod 755 "$FAKE_ROOT/pkg-bin/$1"; }
 for p; do
   if grep -qx "$p" "$FAKE_ROOT/unavailable" 2>/dev/null; then echo "E: Unable to locate package $p" >&2; exit 100; fi
+  # On Arch (FAKE_PACMAN) both come from the official repositories.
+  if test -n "${FAKE_PACMAN:-}"; then continue; fi
   case "$p" in
     cloudflared) test -f "$FS/etc/apt/sources.list.d/cloudflared.list" || test -f "$FS/etc/yum.repos.d/cloudflared.repo" || { echo "E: Unable to locate package cloudflared" >&2; exit 100; } ;;
     tailscale) test -f "$FS/etc/apt/sources.list.d/tailscale.list" || test -f "$FS/etc/yum.repos.d/tailscale.repo" || { echo "E: Unable to locate package tailscale" >&2; exit 100; } ;;
@@ -573,7 +582,10 @@ done
 for p; do
   grep -qx "$p" "$FAKE_ROOT/packages" || echo "$p" >> "$FAKE_ROOT/packages"
   case "$p" in
-    rsync|curl|podman|cloudflared|ufw) inst "$p" ;;
+    # Debian's ufw package enables ufw.service; Arch's does not.
+    ufw) inst ufw; if test -n "${FAKE_DEB:-}"; then : > "$FAKE_ROOT/units/ufw.service.enabled"; fi ;;
+    rsync|curl|podman|cloudflared) inst "$p" ;;
+    shadow) inst newuidmap ;;
     tailscale) inst tailscale; : > "$FAKE_ROOT/units/tailscaled.service.file" ;;
     docker.io|moby-engine|docker) inst docker; grep -q '^docker:' "$FS/etc/group" || echo 'docker:x:998:' >> "$FS/etc/group"; : > "$FAKE_ROOT/units/docker.service.file" ;;
     firewalld) inst firewall-cmd; inst firewall-offline-cmd ;;
@@ -597,7 +609,7 @@ while test $# -gt 0; do
 done
 case "$cmd" in
   update) echo "Reading package lists..." ;;
-  install) exec pkg-install $pkgs ;;
+  install) FAKE_DEB=1 exec pkg-install $pkgs ;;
   *) echo "fake apt-get: unsupported $cmd" >&2; exit 1 ;;
 esac
 `
@@ -619,6 +631,38 @@ case "$cmd" in
   install) exec pkg-install $pkgs ;;
   *) echo "fake dnf: unsupported $cmd" >&2; exit 1 ;;
 esac
+`
+
+// fakePacman answers -Q from the packages file and -Si from pacman-sync
+// ("NAME VERSION" lines: the local sync database), and installs with -S
+// only what the sync database has. Every operation that would refresh the
+// database (-Sy, -Syu, -Fy) is logged to pacman-refresh and refused.
+const fakePacman = `#!/bin/sh
+printf '%s\n' "pacman $*" >> "$FAKE_ROOT/pacman.log"
+op=$1; shift
+case "$op" in -S*y*|-F*y*|-Sy*) echo "pacman $op $*" >> "$FAKE_ROOT/pacman-refresh"; echo "fake pacman: refreshing the sync database is not allowed" >&2; exit 1 ;; esac
+syncv() { awk -v p="$1" '$1 == p { print $2; exit }' "$FAKE_ROOT/pacman-sync" 2>/dev/null; }
+rc=0
+case "$op" in
+  -Q)
+    for p; do
+      if grep -qx "$p" "$FAKE_ROOT/packages"; then v=$(syncv "$p"); echo "$p ${v:-1.0-1}"; else echo "error: package '$p' was not found" >&2; rc=1; fi
+    done ;;
+  -Si)
+    for p; do
+      v=$(syncv "$p")
+      if test -n "$v"; then printf 'Repository      : extra\nName            : %s\nVersion         : %s\nDescription     : fake\n\n' "$p" "$v"; else echo "error: package '$p' was not found" >&2; rc=1; fi
+    done ;;
+  -S)
+    pkgs=""; needed=no; noconfirm=no
+    for a; do case "$a" in --needed) needed=yes ;; --noconfirm) noconfirm=yes ;; --noprogressbar) ;; -*) echo "fake pacman: unsupported option $a" >&2; exit 1 ;; *) pkgs="$pkgs $a" ;; esac; done
+    test "$needed" = yes && test "$noconfirm" = yes || { echo "fake pacman: -S needs --needed --noconfirm" >&2; exit 1; }
+    printf '%s\n' "pacman -S $*" >> "$FAKE_ROOT/changes.log"
+    for p in $pkgs; do test -n "$(syncv "$p")" || { echo "error: target not found: $p" >&2; exit 1; }; done
+    FAKE_PACMAN=1 exec pkg-install $pkgs ;;
+  *) echo "fake pacman: unsupported $op" >&2; exit 1 ;;
+esac
+exit $rc
 `
 
 const fakeCurl = `#!/bin/sh
@@ -711,6 +755,13 @@ type distro struct {
 	installed []string
 	// preBin are programs present before host init runs.
 	preBin []string
+	// pacman: the host uses pacman; sync is its sync database ("NAME
+	// VERSION" lines).
+	pacman bool
+	sync   string
+	// files are extra files in the fake root (path relative to fs/), for
+	// example the sshd configuration a distribution ships.
+	files map[string]string
 }
 
 var (
@@ -737,7 +788,30 @@ var (
 		installed: []string{"coreutils", "ca-certificates", "shadow-utils", "curl"},
 		preBin:    []string{"newuidmap", "curl"},
 	}
+	// archLinux is a fresh Arch Linux install (base plus openssh): curl is
+	// a dependency of pacman, newuidmap is in shadow. Its sshd_config sets
+	// nothing but the Include, and the package's 99-archlinux.conf and
+	// systemd's 20-systemd-userdb.conf drop-ins are present.
+	archLinux = distro{
+		osRelease: "NAME=\"Arch Linux\"\nPRETTY_NAME=\"Arch Linux\"\nID=arch\nBUILD_ID=rolling\nANSI_COLOR=\"38;2;23;147;209\"\nHOME_URL=\"https://archlinux.org/\"\nLOGO=archlinux-logo\n",
+		sshUnit:   "sshd.service",
+		installed: []string{"coreutils", "ca-certificates", "curl", "shadow"},
+		preBin:    []string{"newuidmap", "curl"},
+		pacman:    true,
+		sync:      archSync,
+		files:     archSSHDFiles,
+	}
 )
+
+// archSync is an Arch sync database with every package depper installs.
+const archSync = "rsync 3.3.0-2\ncurl 8.10.1-1\nca-certificates 20240618-1\ncoreutils 9.5-2\nshadow 4.16.0-1\npodman 5.2.3-1\npasst 2024_09_06.6b38f07-1\nslirp4netns 1.3.1-1\npodman-compose 1.2.0-1\ndocker 1:27.3.1-1\ndocker-compose 2.29.7-1\ncloudflared 2024.9.1-1\ntailscale 1.76.0-1\nufw 0.36.2-5\n"
+
+// archSSHDFiles are the sshd files of Arch's openssh and systemd packages.
+var archSSHDFiles = map[string]string{
+	"etc/ssh/sshd_config":                          "# See the sshd_config(5) manpage for details\nInclude /etc/ssh/sshd_config.d/*.conf\n#PermitRootLogin prohibit-password\nAuthorizedKeysFile .ssh/authorized_keys\n#PasswordAuthentication yes\nSubsystem sftp /usr/lib/ssh/sftp-server\n",
+	"etc/ssh/sshd_config.d/99-archlinux.conf":      "KbdInteractiveAuthentication no\nUsePAM yes\nPrintMotd no\n",
+	"etc/ssh/sshd_config.d/20-systemd-userdb.conf": "# Allow systemd-userdbd to provide SSH public keys\nAuthorizedKeysCommand /usr/bin/userdbctl ssh-authorized-keys %u\nAuthorizedKeysCommandUser root\n",
+}
 
 // fakeHost is a fake VPS rooted in a temporary directory.
 type fakeHost struct {
@@ -798,6 +872,11 @@ func newFakeHost(t *testing.T, d distro) *fakeHost {
 		h.write("remote-bin/dpkg-query", fakeDpkgQuery, 0o755)
 		h.write("remote-bin/apt-get", fakeAptGet, 0o755)
 		h.write("remote-bin/apt-cache", fakeAptCache, 0o755)
+	} else if d.pacman {
+		h.write("remote-bin/pacman", fakePacman, 0o755)
+		h.write("pacman-sync", d.sync, 0o644)
+		h.write("fs/var/lib/pacman/sync/core.db", "", 0o644)
+		h.write("fs/var/lib/pacman/sync/extra.db", "", 0o644)
 	} else {
 		h.write("remote-bin/rpm", fakeRpm, 0o755)
 		h.write("remote-bin/dnf", fakeDnf, 0o755)
@@ -822,6 +901,9 @@ func newFakeHost(t *testing.T, d distro) *fakeHost {
 	h.write("fs/etc/shadow", "root:*:19000:0:99999:7:::\n", 0o600)
 	h.write("fs/etc/group", "root:x:0:\nsudo:x:27:\nwheel:x:10:\n", 0o644)
 	h.write("fs/etc/ssh/sshd_config", "Include /etc/ssh/sshd_config.d/*.conf\nPermitRootLogin yes\nPasswordAuthentication yes\n", 0o644)
+	for rel, body := range d.files {
+		h.write("fs/"+rel, body, 0o644)
+	}
 	h.write("fs/bin/bash", stubTool, 0o755)
 	h.write("units/"+d.sshUnit+".active", "", 0o644)
 	h.write("admin-user", "root\n", 0o644)

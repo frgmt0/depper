@@ -122,7 +122,7 @@ again changes nothing.`,
 	fl.BoolVar(&f.cloudflared, "cloudflared", false, "install cloudflared from Cloudflare's package repository")
 	fl.BoolVar(&f.hardenSSH, "harden-ssh", false, "disable password and keyboard-interactive SSH login and root password login (a stricter PermitRootLogin is kept); reverted automatically unless new logins succeed")
 	fl.StringVar(&f.firewall, "firewall", "", "enable ufw/firewalld allowing these TCP ports, e.g. 80,443 (the SSH port and every port sshd listens on are always included); reverted automatically unless new logins succeed")
-	fl.BoolVar(&f.autoUpdates, "auto-updates", false, "enable automatic security updates (unattended-upgrades or dnf-automatic)")
+	fl.BoolVar(&f.autoUpdates, "auto-updates", false, "enable automatic security updates (unattended-upgrades or dnf-automatic; refused on Arch Linux)")
 	fl.StringVar(&f.tailscaleEnv, "tailscale-authkey-env", "", "install Tailscale and join the tailnet with the auth key in this environment variable")
 	fl.StringVar(&f.knownHosts, "known-hosts", "", "known_hosts file to pin the host key in (default REPO/.depper/known_hosts)")
 	fl.StringArrayVar(&f.fingerprints, "host-key-fingerprint", nil, "expected host key fingerprint (SHA256:..., as ssh-keygen -lf prints; repeatable): only matching keys are pinned, and none matching is refused")

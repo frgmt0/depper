@@ -54,6 +54,9 @@ const (
 	// markWasEnabled: firewalld was enabled (but not running) before; the
 	// revert stops it without disabling it.
 	markWasEnabled = "was-enabled"
+	// markEnabledUnit: the step enabled the firewall service at boot
+	// (ufw.service on Arch); the revert disables it again.
+	markEnabledUnit = "enabled-unit"
 	// lockDir serializes the revert script and disarm (mkdir is atomic).
 	lockDir      = "lock"
 	revertScript = "revert.sh"
@@ -75,7 +78,7 @@ func lockLines() []string {
 
 // guardMarkers are the markers that mean a change is armed and not yet
 // verified (or not yet reverted).
-var guardMarkers = []string{markHadPrev, markHadNone, markWasInactive, markAddedPorts}
+var guardMarkers = []string{markHadPrev, markHadNone, markWasInactive, markAddedPorts, markEnabledUnit}
 
 // guard is a change that could lock everyone out of the host (sshd
 // hardening, the firewall). Before it is applied, host init records what to
@@ -304,10 +307,10 @@ func (r *Runner) finish(ctx context.Context, admin *transport.Remote, g *guard) 
 		return fmt.Errorf("%s: the change was verified, but %s had already started the revert (the checks took longer than %s), so the change was undone; run host init again", g.name, g.unit, r.revertAfter())
 	case res.stopped:
 		r.printf("WARNING: %s: stopped %s.timer, but could not clear the revert markers (%v)\n", g.name, g.unit, err)
-		return fmt.Errorf("%s: the change was verified and %s.timer is stopped, but clearing the revert markers in %s failed (%v); the next host init would undo the change: remove had-prev, prev, had-none, was-inactive and added-ports there yourself to keep it", g.name, g.unit, d, err)
+		return fmt.Errorf("%s: the change was verified and %s.timer is stopped, but clearing the revert markers in %s failed (%v); the next host init would undo the change: remove had-prev, prev, had-none, was-inactive, added-ports and enabled-unit there yourself to keep it", g.name, g.unit, d, err)
 	}
 	r.printf("WARNING: %s: could not disarm %s.timer (%v); it will undo the change at %s\n", g.name, g.unit, err, clock(g.deadline(r)))
-	return fmt.Errorf("%s: the change was verified, but disarming %s.timer failed (%v), so it will undo the change at %s; run host init again, or to keep the change stop the timer yourself (`sudo systemctl stop %s.timer`) and remove the markers had-prev, prev, had-none, was-inactive and added-ports in %s", g.name, g.unit, err, clock(g.deadline(r)), g.unit, d)
+	return fmt.Errorf("%s: the change was verified, but disarming %s.timer failed (%v), so it will undo the change at %s; run host init again, or to keep the change stop the timer yourself (`sudo systemctl stop %s.timer`) and remove the markers had-prev, prev, had-none, was-inactive, added-ports and enabled-unit in %s", g.name, g.unit, err, clock(g.deadline(r)), g.unit, d)
 }
 
 // e2eLockout is a test-only hook (see docs/development.md): with
@@ -439,10 +442,7 @@ func (r *Runner) applyFirewall(ctx context.Context, admin *transport.Remote, adm
 func (r *Runner) sshGuard(sshdUnit string) *guard {
 	file := r.raw(SSHDropIn)
 	f, tmp := shell.Quote(file), shell.Quote(file+".depper-revert.")+`"$$"`
-	reload := `systemctl reload ssh.service 2>/dev/null || systemctl reload sshd.service 2>/dev/null`
-	if sshdUnit != "" {
-		reload = `systemctl reload ` + shell.Quote(sshdUnit+".service") + ` 2>/dev/null || ` + reload
-	}
+	reload := `depper_sshd_reload`
 	return &guard{
 		name: "--harden-ssh",
 		unit: sshRevertUnit,
@@ -454,18 +454,36 @@ func (r *Runner) sshGuard(sshdUnit string) *guard {
 		// it: always when run automatically or for an interrupted run (a
 		// restart may have loaded it), on a rollback only after host init
 		// reloaded it.
-		revert: []string{
+		revert: append(sshdReloadFuncs(sshdUnit),
 			`depper_restored=no`,
-			`if test -f "$d/` + markHadPrev + `"; then`,
-			`  if cp -p "$d/` + markPrev + `" ` + tmp + ` && mv -f ` + tmp + ` ` + f + `; then rm -f "$d/` + markHadPrev + `" "$d/` + markPrev + `"; depper_restored=yes; else rm -f ` + tmp + `; echo "could not restore ` + SSHDropIn + ` from $d/` + markPrev + `" >&2; depper_fail=1; fi`,
-			`elif test -f "$d/` + markHadNone + `"; then`,
-			`  if rm -f ` + f + `; then rm -f "$d/` + markHadNone + `"; depper_restored=yes; else echo "could not remove ` + SSHDropIn + `" >&2; depper_fail=1; fi`,
+			`if test -f "$d/`+markHadPrev+`"; then`,
+			`  if cp -p "$d/`+markPrev+`" `+tmp+` && mv -f `+tmp+` `+f+`; then rm -f "$d/`+markHadPrev+`" "$d/`+markPrev+`"; depper_restored=yes; else rm -f `+tmp+`; echo "could not restore `+SSHDropIn+` from $d/`+markPrev+`" >&2; depper_fail=1; fi`,
+			`elif test -f "$d/`+markHadNone+`"; then`,
+			`  if rm -f `+f+`; then rm -f "$d/`+markHadNone+`"; depper_restored=yes; else echo "could not remove `+SSHDropIn+`" >&2; depper_fail=1; fi`,
 			`fi`,
 			`if test "$depper_restored" = yes; then`,
-			`  case "$depper_who" in now) test -f "$d/` + markReloaded + `" && depper_reload=yes || depper_reload=no ;; *) depper_reload=yes ;; esac`,
-			`  if test "$depper_reload" = yes; then if ` + reload + `; then rm -f "$d/` + markReloaded + `"; else echo "could not reload sshd after restoring ` + SSHDropIn + `" >&2; depper_fail=1; fi; else rm -f "$d/` + markReloaded + `"; fi`,
+			`  case "$depper_who" in now) test -f "$d/`+markReloaded+`" && depper_reload=yes || depper_reload=no ;; *) depper_reload=yes ;; esac`,
+			`  if test "$depper_reload" = yes; then if `+reload+`; then rm -f "$d/`+markReloaded+`"; else echo "could not reload sshd after restoring `+SSHDropIn+`" >&2; depper_fail=1; fi; else rm -f "$d/`+markReloaded+`"; fi`,
 			`fi`,
-		},
+		),
+	}
+}
+
+// sshdReloadFuncs define two shell functions. depper_sshd_unit prints the
+// unit that runs sshd: the running service (unit, the one the facts found,
+// first; then ssh.service, Debian and Ubuntu, and sshd.service, Fedora and
+// Arch), else an active ssh.socket or sshd.socket. depper_sshd_reload
+// reloads that service; for a socket without a running service every new
+// connection starts an sshd that reads the configuration, so there is
+// nothing to reload.
+func sshdReloadFuncs(unit string) []string {
+	units := "ssh.service sshd.service"
+	if unit != "" {
+		units = shell.Quote(unit+".service") + " " + units
+	}
+	return []string{
+		`depper_sshd_unit() { for depper_u in ` + units + `; do if systemctl is-active --quiet "$depper_u" 2>/dev/null; then echo "$depper_u"; return 0; fi; done; for depper_u in ssh.socket sshd.socket; do if systemctl is-active --quiet "$depper_u" 2>/dev/null; then echo "$depper_u"; return 0; fi; done; return 1; }`,
+		`depper_sshd_reload() { depper_u=$(depper_sshd_unit) || { echo "cannot find the running sshd service (ssh.service or sshd.service) or socket (ssh.socket or sshd.socket)" >&2; return 1; }; case "$depper_u" in *.socket) echo "sshd is started per connection by $depper_u: new connections read the configuration, nothing to reload" ;; *) systemctl reload "$depper_u" ;; esac; }`,
 	}
 }
 
@@ -516,11 +534,11 @@ func (r *Runner) hardenSSH(ctx context.Context, admin *transport.Remote, adminT,
 		}
 		return fmt.Errorf("--harden-ssh: %s cannot log in with its key over a new connection (%v); reverted %s and did not reload sshd", o.User, err, SSHDropIn)
 	}
-	if err := r.runRoot(ctx, admin, []string{
-		`if systemctl is-active --quiet ssh.service; then depper_unit=ssh.service; elif systemctl is-active --quiet sshd.service; then depper_unit=sshd.service; else echo "cannot find the running sshd service (ssh.service or sshd.service)" >&2; exit 1; fi`,
-		`: > ` + shell.Quote(r.guardDir(g.unit)+"/"+markReloaded),
-		`systemctl reload "$depper_unit"`,
-	}); err != nil {
+	if err := r.runRoot(ctx, admin, append(sshdReloadFuncs(sshdUnit),
+		`depper_sshd_unit >/dev/null || { echo "cannot find the running sshd service (ssh.service or sshd.service) or socket (ssh.socket or sshd.socket)" >&2; exit 1; }`,
+		`: > `+shell.Quote(r.guardDir(g.unit)+"/"+markReloaded),
+		`depper_sshd_reload`,
+	)); err != nil {
 		return r.rollback(ctx, admin, g, fmt.Errorf("reloading sshd failed: %w", err))
 	}
 	r.printf("  sshd reloaded; checking new connections...\n")
