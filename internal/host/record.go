@@ -20,6 +20,12 @@ type Record struct {
 	Steps         []string  `json:"steps"`
 	Packages      []string  `json:"packages"`
 	Hardening     Hardening `json:"hardening"`
+	// ComposeProvider names the compose provider host init accepted for
+	// podman when podman-compose could not be installed.
+	ComposeProvider string `json:"compose_provider,omitempty"`
+	// EnabledUnits are the units depper enabled at boot ("docker.socket",
+	// "podman.socket (user deploy)"), so that undoing them is knowable.
+	EnabledUnits []string `json:"enabled_units,omitempty"`
 }
 
 // Hardening lists the opt-in hardening depper applied.
@@ -32,8 +38,8 @@ type Hardening struct {
 
 // mergeRecord combines the previous record with this run's settings.
 // Timestamps and version are left for the caller.
-func mergeRecord(prev *Record, o *Options, firewall []int, steps, packages []string) Record {
-	rec := Record{DeployUser: o.User, Container: o.Container, Cloudflared: o.Cloudflared}
+func mergeRecord(prev *Record, o *Options, firewall []int, steps, packages, enabled []string, composeProvider string) Record {
+	rec := Record{DeployUser: o.User, Container: o.Container, Cloudflared: o.Cloudflared, ComposeProvider: composeProvider}
 	rec.Hardening = Hardening{SSH: o.HardenSSH, AutoUpdates: o.AutoUpdates, Tailscale: o.TailscaleKey.Set()}
 	if o.Firewall != nil {
 		rec.Hardening.Firewall = firewall
@@ -49,12 +55,19 @@ func mergeRecord(prev *Record, o *Options, firewall []int, steps, packages []str
 			rec.Hardening.AutoUpdates = rec.Hardening.AutoUpdates || prev.Hardening.AutoUpdates
 			rec.Hardening.Tailscale = rec.Hardening.Tailscale || prev.Hardening.Tailscale
 			rec.Hardening.Firewall = unionInts(prev.Hardening.Firewall, rec.Hardening.Firewall)
+			if rec.ComposeProvider == "" {
+				rec.ComposeProvider = prev.ComposeProvider
+			}
 		}
 		steps = append(append([]string{}, prev.Steps...), steps...)
 		packages = append(append([]string{}, prev.Packages...), packages...)
+		enabled = append(append([]string{}, prev.EnabledUnits...), enabled...)
 	}
 	rec.Steps = unionStrings(steps)
 	rec.Packages = unionStrings(packages)
+	if len(enabled) > 0 {
+		rec.EnabledUnits = unionStrings(enabled)
+	}
 	return rec
 }
 
@@ -72,6 +85,12 @@ func sameContent(a, b *Record) bool {
 	}
 	if len(y.Hardening.Firewall) == 0 {
 		y.Hardening.Firewall = nil
+	}
+	if len(x.EnabledUnits) == 0 {
+		x.EnabledUnits = nil
+	}
+	if len(y.EnabledUnits) == 0 {
+		y.EnabledUnits = nil
 	}
 	return reflect.DeepEqual(x, y)
 }

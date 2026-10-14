@@ -89,6 +89,12 @@ func (r *Runner) Init(ctx context.Context, o *Options) (*InitResult, error) {
 	err := r.init(ctx, o, res)
 	if err != nil {
 		res.Error = err.Error()
+		// The JSON report keeps the host's messages, which the terminal
+		// showed as they came.
+		var ae *applyError
+		if errors.As(err, &ae) {
+			res.Error = ae.full()
+		}
 	}
 	return res, err
 }
@@ -303,18 +309,19 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 			main = append(main, s)
 		}
 	}
-	appliedPkgs := []string{}
+	appliedPkgs, enabledUnits := []string{}, []string{}
 	var applyErr error
 	if len(main) > 0 {
-		done, err := r.applySteps(ctx, admin, main)
-		res.Applied = append(res.Applied, done...)
+		ran, err := r.runSteps(ctx, admin, main)
+		res.Applied = append(res.Applied, ran.done...)
+		enabledUnits = append(enabledUnits, ran.enabled...)
 		for _, s := range main {
-			if contains(done, s.ID) {
+			if contains(ran.done, s.ID) {
 				appliedPkgs = append(appliedPkgs, s.packages...)
 			}
 		}
 		if err != nil {
-			applyErr = fmt.Errorf("applying the plan failed after %d of %d step(s): %w", len(done), len(main), err)
+			applyErr = &applyError{done: len(ran.done), total: len(main), err: err}
 		}
 	}
 	deployTarget := transport.Target{Host: o.User + "@" + o.Host, Port: o.Port, IdentityFile: deployIdentity, KnownHosts: o.KnownHosts, Options: sessionOptions}
@@ -347,7 +354,11 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 		if ro.Firewall != nil {
 			fw = firewallPorts(ro, facts)
 		}
-		rec := mergeRecord(facts.Record, ro, fw, steps, appliedPkgs)
+		composeProvider := plan.ComposeProvider
+		if s := plan.step(StepPodmanSocket); s != nil && s.Change && !contains(res.Applied, StepPodmanSocket) {
+			composeProvider = ""
+		}
+		rec := mergeRecord(facts.Record, ro, fw, steps, appliedPkgs, enabledUnits, composeProvider)
 		now := r.now().UTC().Format(time.RFC3339)
 		rec.UpdatedAt, rec.DepperVersion = now, r.Version
 		if rec.CreatedAt == "" {
@@ -430,6 +441,41 @@ func (r *Runner) init(ctx context.Context, o *Options, res *InitResult) error {
 	return nil
 }
 
+// applyError reports that applying the plan failed part-way. Its message
+// does not repeat the host's own messages (the failing command's stderr):
+// they were shown as they came, just above it. full includes them, for the
+// JSON report.
+type applyError struct {
+	done, total int
+	err         error
+}
+
+func (e *applyError) Error() string {
+	cause := e.err.Error()
+	var he *hostScriptError
+	if errors.As(e.err, &he) {
+		cause = he.err.Error() + "; the host's messages are above"
+	}
+	return fmt.Sprintf("applying the plan failed after %d of %d step(s): %s", e.done, e.total, cause)
+}
+
+func (e *applyError) full() string {
+	return fmt.Sprintf("applying the plan failed after %d of %d step(s): %v", e.done, e.total, e.err)
+}
+
+func (e *applyError) Unwrap() error { return e.err }
+
+// hostScriptError is a failed root script with the last lines of its
+// stderr, which were also shown to the user as they came.
+type hostScriptError struct {
+	output string
+	err    error
+}
+
+func (e *hostScriptError) Error() string { return e.output + " (" + e.err.Error() + ")" }
+
+func (e *hostScriptError) Unwrap() error { return e.err }
+
 // DoctorFailedError reports that the final doctor run found failures (they
 // were already printed).
 type DoctorFailedError struct{}
@@ -495,6 +541,8 @@ type markerWriter struct {
 	mu   sync.Mutex
 	buf  bytes.Buffer
 	done []string
+	// enabled are the units the steps announced with enabledMarker.
+	enabled []string
 }
 
 func (w *markerWriter) Write(p []byte) (int, error) {
@@ -517,6 +565,10 @@ func (w *markerWriter) line(l string) {
 	switch {
 	case strings.HasPrefix(l, doneMarker):
 		w.done = append(w.done, strings.TrimPrefix(l, doneMarker))
+	case strings.HasPrefix(l, enabledMarker):
+		unit := clean(strings.TrimPrefix(l, enabledMarker))
+		w.enabled = append(w.enabled, unit)
+		_, _ = fmt.Fprintln(w.out, "  | enabled "+unit)
 	case strings.HasPrefix(l, beginMarker):
 	default:
 		_, _ = fmt.Fprintln(w.out, "  | "+clean(l))
@@ -532,9 +584,21 @@ func (w *markerWriter) flush() {
 	}
 }
 
+// stepsRun is what runSteps reports: the IDs of the steps that completed
+// and the units they enabled (enabledMarker).
+type stepsRun struct {
+	done, enabled []string
+}
+
 // applySteps runs steps as root in one round trip and returns the IDs that
 // completed.
 func (r *Runner) applySteps(ctx context.Context, admin *transport.Remote, steps []*Step) ([]string, error) {
+	ran, err := r.runSteps(ctx, admin, steps)
+	return ran.done, err
+}
+
+// runSteps is applySteps, also reporting the units the steps enabled.
+func (r *Runner) runSteps(ctx context.Context, admin *transport.Remote, steps []*Step) (stepsRun, error) {
 	body := []string{"set -eu"}
 	for _, s := range steps {
 		if s.Title != "" {
@@ -546,7 +610,7 @@ func (r *Runner) applySteps(ctx context.Context, admin *transport.Remote, steps 
 	}
 	lines, err := r.asRoot(body)
 	if err != nil {
-		return nil, err
+		return stepsRun{}, err
 	}
 	w := &markerWriter{out: r.out()}
 	tail := &transport.TailBuffer{Max: 4096}
@@ -556,10 +620,10 @@ func (r *Runner) applySteps(ctx context.Context, admin *transport.Remote, steps 
 	w.flush()
 	if err != nil {
 		if msg := lastLines(tail.String(), 3); msg != "" {
-			err = fmt.Errorf("%s (%w)", msg, err)
+			err = &hostScriptError{output: msg, err: err}
 		}
 	}
-	return w.done, err
+	return stepsRun{done: w.done, enabled: w.enabled}, err
 }
 
 // runRoot runs a short root script and returns its error.
@@ -664,7 +728,7 @@ func recordedOptions(o *Options, plan *Plan, applied []string) *Options {
 	if !ok(StepCloudflared) {
 		ro.Cloudflared = false
 	}
-	if !ok(StepPackages, StepSubIDs, StepDockerGroup, StepDockerService) {
+	if !ok(StepPackages, StepSubIDs, StepDockerGroup, StepManagerGroups, StepDockerService, StepPodmanSocket) {
 		ro.Container = ContainerNone
 	}
 	return &ro

@@ -400,8 +400,8 @@ func TestInitDockerOnDebianWarns(t *testing.T) {
 	o := h.options()
 	o.Container = ContainerDocker
 	res := mustInit(t, h, o)
-	if !strings.Contains(h.changes(), "install rsync curl docker.io") || !strings.Contains(h.changes(), "usermod -aG docker deploy") || !strings.Contains(h.changes(), "systemctl enable --now docker.service") {
-		t.Errorf("changes:\n%s", h.changes())
+	if !strings.Contains(h.changes(), "install rsync curl docker.io") || !strings.Contains(h.changes(), "usermod -aG docker deploy") || strings.Contains(h.changes(), "enable --now docker") {
+		t.Errorf("changes (the docker.io package enables docker itself):\n%s", h.changes())
 	}
 	if !strings.Contains(h.read("fs/etc/group"), "docker:x:998:deploy") {
 		t.Errorf("group = %s", h.read("fs/etc/group"))

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/frgmt0/depper/internal/config"
+	"github.com/frgmt0/depper/internal/doctor"
 	"github.com/frgmt0/depper/internal/shell"
 	"github.com/frgmt0/depper/internal/transport"
 )
@@ -70,7 +71,7 @@ const statusMarker = "@@depper-host-status"
 // connection spec of this very session, so Match blocks are applied.
 func (r *Runner) statusScript() string {
 	lines := append([]string{"set -u"}, shell.SessionEnv()...)
-	return shell.Script(append(lines,
+	return shell.Script(append(append(append(lines,
 		"echo "+statusMarker,
 		`u=$(id -un 2>/dev/null || true)`,
 		`printf 'user=%s\n' "$u"`,
@@ -105,8 +106,7 @@ func (r *Runner) statusScript() string {
 		`if test -f `+r.p("/etc/apt/apt.conf.d/20auto-upgrades")+` && grep -q 'APT::Periodic::Unattended-Upgrade "1"' `+r.p("/etc/apt/apt.conf.d/20auto-upgrades")+`; then echo autoupd=1; fi`,
 		`for t in dnf-automatic-install.timer dnf5-automatic.timer; do if systemctl is-enabled --quiet "$t" 2>/dev/null; then echo autoupd=1; fi; done`,
 		`if command -v tailscale >/dev/null 2>&1 && tailscale status >/dev/null 2>&1; then echo tailscale_up=1; fi`,
-		`echo status_done=1`,
-	)...)
+	), doctor.DockerGroupLines(r.raw(""))...), "echo status_done=1")...)
 }
 
 // Status reports on a host prepared by host init, connecting as the deploy
@@ -174,6 +174,10 @@ func (r *Runner) Status(ctx context.Context, cfg *config.Config) (*StatusResult,
 	if engine != "" {
 		if p := clean(m["cmd_"+engine]); p != "" {
 			add("container engine", StatusPass, p)
+			if engine == ContainerDocker {
+				status, detail := doctor.DockerGroupCheck(res.User, m)
+				add("docker group", string(status), detail)
+			}
 		} else {
 			add("container engine", StatusFail, engine+" is not installed")
 		}

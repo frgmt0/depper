@@ -181,7 +181,7 @@ func TestInitArchDerivativeDocker(t *testing.T) {
 	if !strings.Contains(h.Out.String(), "os-release ID omarchy, handled as the Arch Linux (pacman) family") {
 		t.Errorf("output:\n%s", h.Out.String())
 	}
-	for _, want := range []string{"pacman -S --needed --noconfirm --noprogressbar rsync docker\n", "usermod -aG docker deploy", "systemctl enable --now docker.service"} {
+	for _, want := range []string{"pacman -S --needed --noconfirm --noprogressbar rsync docker\n", "usermod -aG docker deploy", "systemctl enable --now docker.socket"} {
 		if !strings.Contains(h.changes(), want) {
 			t.Errorf("missing %q in:\n%s", want, h.changes())
 		}

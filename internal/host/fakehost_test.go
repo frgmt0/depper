@@ -267,6 +267,10 @@ case "${1:-}" in
   -u)
     if test $# -ge 2; then l=$(lookup "$2") || { echo "id: '$2': no such user" >&2; exit 1; }; printf '%s\n' "$l" | cut -d: -f3; else echo "$uid"; fi ;;
   -un) echo "$me" ;;
+  -G)
+    l=$(lookup "$me") || exit 1
+    gid=$(printf '%s\n' "$l" | cut -d: -f4)
+    awk -F: -v u="$me" -v g="$gid" '{ n = split($4, m, ","); hit = ($3 == g); for (i = 1; i <= n; i++) if (m[i] == u) hit = 1; if (hit) { printf "%s%s", sep, $3; sep = " " } } END { print "" }' "$FS/etc/group" ;;
   -nG)
     u=${2:-$me}
     l=$(lookup "$u") || { echo "id: '$u': no such user" >&2; exit 1; }
@@ -341,7 +345,11 @@ done
 const fakeLoginctl = `#!/bin/sh
 FS="$FAKE_ROOT/fs"
 case "$1" in
-  enable-linger) printf '%s\n' "loginctl $*" >> "$FAKE_ROOT/changes.log"; mkdir -p "$FS/var/lib/systemd/linger"; : > "$FS/var/lib/systemd/linger/$2" ;;
+  enable-linger)
+    printf '%s\n' "loginctl $*" >> "$FAKE_ROOT/changes.log"; mkdir -p "$FS/var/lib/systemd/linger"; : > "$FS/var/lib/systemd/linger/$2"
+    # Like systemd-logind, enabling linger starts the user manager.
+    uid=$(awk -F: -v u="$2" '$1 == u { print $3 }' "$FS/etc/passwd")
+    test -n "$uid" && systemctl start "user@$uid.service" ;;
   show-user) if test -e "$FS/var/lib/systemd/linger/$2"; then echo yes; else echo no; fi ;;
   *) echo "fake loginctl: unsupported $1" >&2; exit 1 ;;
 esac
@@ -354,13 +362,45 @@ S="$FAKE_ROOT/units"
 mkdir -p "$S"
 if test "$1" = --user; then
   shift
-  case "$1" in
+  # User units (podman.socket) keep their state per uid in user-units/UID.
+  U="$FAKE_ROOT/user-units/${FAKE_UID:-0}"
+  uargs="$*"
+  mkdir -p "$U"
+  quiet=no; now=no; uunits=""
+  for a; do case "$a" in --quiet) quiet=yes ;; --now) now=yes ;; -*) ;; *) uunits="$uunits $a" ;; esac; done
+  set -- $uunits
+  ucmd=$1; shift
+  case "$ucmd" in
     show-environment)
       if test -e "$FS/run/user/${FAKE_UID:-0}/manager"; then echo "HOME=$HOME"; exit 0; fi
       echo "Failed to connect to bus: No such file or directory" >&2; exit 1 ;;
+    enable)
+      printf '%s\n' "systemctl --user $uargs (uid ${FAKE_UID:-0})" >> "$FAKE_ROOT/changes.log"
+      for u; do : > "$U/$u.enabled"; if test "$now" = yes; then : > "$U/$u.active"; fi; done ;;
+    is-enabled)
+      for u; do if test -e "$U/$u.enabled"; then test "$quiet" = yes || echo enabled; else test "$quiet" = yes || echo disabled; exit 1; fi; done ;;
+    is-active)
+      for u; do if test -e "$U/$u.active"; then test "$quiet" = yes || echo active; else test "$quiet" = yes || echo inactive; exit 3; fi; done ;;
   esac
   exit 0
 fi
+# mgrstart UID: the user manager (user@UID.service) starts with the groups
+# the user has now; its pid (above any real pid) and /proc status live in
+# the fake root.
+mgrstart() {
+  mu=$(awk -F: -v id="$1" '$3 == id { print $1; exit }' "$FS/etc/passwd")
+  mg=$(awk -F: -v id="$1" '$3 == id { print $4; exit }' "$FS/etc/passwd")
+  mgroups=$(awk -F: -v u="$mu" -v g="$mg" '{ n = split($4, m, ","); hit = ($3 == g); for (i = 1; i <= n; i++) if (m[i] == u) hit = 1; if (hit) printf "%s ", $3 }' "$FS/etc/group")
+  # manager-ignores-groups: a manager that comes up with the primary group
+  # only (the restart did not pick up the new group).
+  if test -f "$FAKE_ROOT/manager-ignores-groups"; then mgroups="$mg "; fi
+  mpid=$((5000000 + $1))
+  mkdir -p "$FS/proc/$mpid" "$FS/run/user/$1"
+  printf 'Name:\tsystemd\nGroups:\t%s\n' "$mgroups" > "$FS/proc/$mpid/status"
+  echo "$mpid" > "$S/user@$1.service.mainpid"
+  : > "$FS/run/user/$1/manager"
+  echo "user-manager $1 groups $mgroups" >> "$FAKE_ROOT/manager-events"
+}
 if test "$1" = --version; then
   echo "systemd $(cat "$FAKE_ROOT/systemd-version" 2>/dev/null || echo 252) (fake)"
   exit 0
@@ -372,6 +412,7 @@ if test "$1" = show; then
     SubState) case "$u" in *.timer) if test -e "$S/$u.active"; then echo waiting; elif test -e "$S/$u.loaded"; then echo elapsed; else echo dead; fi ;; *) if test -e "$S/$u.running"; then echo start; else echo dead; fi ;; esac ;;
     ActiveState) if test -e "$S/$u.running"; then echo activating; elif test -e "$S/$u.active"; then echo active; else echo inactive; fi ;;
     LoadState) if test -e "$S/$u.active" || test -e "$S/$u.loaded"; then echo loaded; else echo not-found; fi ;;
+    MainPID) cat "$S/$u.mainpid" 2>/dev/null || echo 0 ;;
     ActiveEnterTimestampMonotonic) cat "$S/$u.entered" 2>/dev/null || echo 0 ;;
     Listen) cat "$FAKE_ROOT/$u.listen" 2>/dev/null ;;
     *) echo "fake systemctl: unsupported property $prop" >&2; exit 1 ;;
@@ -387,14 +428,14 @@ for a; do
   esac
 done
 case "$cmd" in
-  start|enable|reload|stop|disable) printf '%s\n' "systemctl $*" >> "$FAKE_ROOT/changes.log" ;;
+  start|enable|reload|stop|disable|restart) printf '%s\n' "systemctl $*" >> "$FAKE_ROOT/changes.log" ;;
 esac
 # Starting firewalld loads its permanent configuration.
 fwstart() { if test "$1" = firewalld.service; then for z in "$FAKE_ROOT"/fwd/*.perm; do test -f "$z" && cp "$z" "${z%.perm}.runtime"; done; fi; }
 case "$cmd" in
   start)
     for u in $units; do
-      case "$u" in user@*.service) id=${u#user@}; id=${id%.service}; mkdir -p "$FS/run/user/$id"; : > "$FS/run/user/$id/manager" ;; esac
+      case "$u" in user@*.service) id=${u#user@}; id=${id%.service}; test -f "$S/$u.mainpid" || mgrstart "$id" ;; esac
       # A transient service of systemd-run runs its command now (oneshot:
       # start returns when it finished); like systemd, this leaves its
       # timer as it is.
@@ -427,7 +468,8 @@ case "$cmd" in
     # sshd reloads the drop-in (once).
     if test -f "$FAKE_ROOT/timer-fires-on-reload" && test -e "$S/depper-ssh-revert.timer.active"; then rm -f "$FAKE_ROOT/timer-fires-on-reload"; "$0" start depper-ssh-revert.service; fi ;;
   list-unit-files) for u in $units; do if test -e "$S/$u.file"; then echo "$u disabled"; fi; done ;;
-  daemon-reload|restart) ;;
+  restart) for u in $units; do case "$u" in user@*.service) id=${u#user@}; id=${id%.service}; mgrstart "$id" ;; esac; done ;;
+  daemon-reload) ;;
   *) echo "fake systemctl: unsupported $cmd" >&2; exit 1 ;;
 esac
 `
@@ -587,7 +629,7 @@ for p; do
     rsync|curl|podman|cloudflared) inst "$p" ;;
     shadow) inst newuidmap ;;
     tailscale) inst tailscale; : > "$FAKE_ROOT/units/tailscaled.service.file" ;;
-    docker.io|moby-engine|docker) inst docker; grep -q '^docker:' "$FS/etc/group" || echo 'docker:x:998:' >> "$FS/etc/group"; : > "$FAKE_ROOT/units/docker.service.file" ;;
+    docker.io|moby-engine|docker) inst docker; grep -q '^docker:' "$FS/etc/group" || echo 'docker:x:998:' >> "$FS/etc/group"; : > "$FAKE_ROOT/units/docker.service.file"; test -f "$FAKE_ROOT/no-docker-socket" || : > "$FAKE_ROOT/units/docker.socket.file"; if test -n "${FAKE_DEB:-}"; then : > "$FAKE_ROOT/units/docker.service.enabled"; : > "$FAKE_ROOT/units/docker.service.active"; : > "$FAKE_ROOT/units/docker.socket.enabled"; : > "$FAKE_ROOT/units/docker.socket.active"; fi ;;
     firewalld) inst firewall-cmd; inst firewall-offline-cmd ;;
     uidmap|shadow-utils) inst newuidmap ;;
     dnf-automatic) : > "$FAKE_ROOT/units/dnf-automatic-install.timer.file" ;;
@@ -659,6 +701,13 @@ case "$op" in
     test "$needed" = yes && test "$noconfirm" = yes || { echo "fake pacman: -S needs --needed --noconfirm" >&2; exit 1; }
     printf '%s\n' "pacman -S $*" >> "$FAKE_ROOT/changes.log"
     for p in $pkgs; do test -n "$(syncv "$p")" || { echo "error: target not found: $p" >&2; exit 1; }; done
+    if test -f "$FAKE_ROOT/pacman-download-fails"; then
+      for p in $pkgs; do echo "error: failed retrieving file '$p-1.0-1-x86_64.pkg.tar.zst' from mirror.example.org : The requested URL returned error: 404" >&2; done
+      echo "warning: failed to retrieve some files" >&2
+      echo "error: failed to commit transaction (failed to retrieve some files)" >&2
+      echo "Errors occurred, no packages were upgraded." >&2
+      exit 1
+    fi
     FAKE_PACMAN=1 exec pkg-install $pkgs ;;
   *) echo "fake pacman: unsupported $op" >&2; exit 1 ;;
 esac

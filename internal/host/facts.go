@@ -66,8 +66,31 @@ type Facts struct {
 	Packages map[string]bool   `json:"packages"`
 	Commands map[string]string `json:"commands"`
 
-	DockerActive  bool `json:"docker_active"`
-	DockerEnabled bool `json:"docker_enabled"`
+	// DockerActive and DockerEnabled are docker.service's is-active and
+	// is-enabled; DockerSocketActive and DockerSocketEnabled docker.socket's
+	// (socket activation, Arch's default: docker.service stays disabled).
+	DockerActive        bool `json:"docker_active"`
+	DockerEnabled       bool `json:"docker_enabled"`
+	DockerSocketActive  bool `json:"docker_socket_active"`
+	DockerSocketEnabled bool `json:"docker_socket_enabled"`
+	// DockerGID is the gid of the docker group ("" when there is none).
+	DockerGID string `json:"docker_gid,omitempty"`
+	// ManagerPID is the main pid of user@UID.service (0 when it is not
+	// running) and ManagerGroups the supplementary gids of that process
+	// (ManagerGroupsKnown when /proc could be read): its services inherit
+	// them, so a manager started before the user joined a group lacks it.
+	ManagerPID         int      `json:"user_manager_pid,omitempty"`
+	ManagerGroups      []string `json:"user_manager_groups,omitempty"`
+	ManagerGroupsKnown bool     `json:"user_manager_groups_known"`
+	// ComposePlugin is the docker-compose CLI plugin or binary on the host
+	// ("" when there is none); podman runs it as its compose provider.
+	ComposePlugin string `json:"compose_plugin,omitempty"`
+	// PodmanSocketEnabled is what `systemctl --user is-enabled
+	// podman.socket` prints for the deploy user ("" when the unit is not
+	// found or the user manager is not running), PodmanSocketActive whether
+	// it is active.
+	PodmanSocketEnabled string `json:"podman_socket_enabled,omitempty"`
+	PodmanSocketActive  bool   `json:"podman_socket_active"`
 
 	SSHDTest       bool              `json:"sshd_config_valid"`
 	SSHDTestOutput string            `json:"-"`
@@ -369,6 +392,11 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`  if test -e ` + r.p("/var/lib/systemd/linger") + `/"$u"; then echo linger=1; else echo linger=0; fi`,
 		`  rt=` + r.p("/run/user") + `/"$uid"`,
 		`  if runuser -u "$u" -- env XDG_RUNTIME_DIR="$rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" systemctl --user show-environment >/dev/null 2>&1; then echo usermgr=1; else echo usermgr=0; fi`,
+		// The groups of the running user manager, whose services inherit them.
+		`  depper_mpid=$(systemctl show -p MainPID --value "user@$uid.service" 2>/dev/null || true)`,
+		`  case "$depper_mpid" in ""|*[!0-9]*) depper_mpid=0 ;; esac`,
+		`  printf 'usermgr_pid=%s\n' "$depper_mpid"`,
+		`  if test "$depper_mpid" != 0 && test -r ` + r.p("/proc") + `/"$depper_mpid/status"; then printf 'usermgr_groups=%s\n' "$(awk '$1 == "Groups:" { $1 = ""; print }' ` + r.p("/proc") + `/"$depper_mpid/status" | tr -cd '0-9 ')"; echo usermgr_groups_read=1; fi`,
 		`  if grep -q "^$u:" ` + r.p("/etc/subuid") + ` 2>/dev/null; then echo subuid=1; else echo subuid=0; fi`,
 		`  if grep -q "^$u:" ` + r.p("/etc/subgid") + ` 2>/dev/null; then echo subgid=1; else echo subgid=0; fi`,
 		`else echo user_exists=0; fi`,
@@ -391,6 +419,9 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 		`fi`,
 		`if systemctl is-active --quiet docker.service 2>/dev/null; then echo docker_active=1; fi`,
 		`if systemctl is-enabled --quiet docker.service 2>/dev/null; then echo docker_enabled=1; fi`,
+		`if systemctl is-active --quiet docker.socket 2>/dev/null; then echo docker_socket_active=1; fi`,
+		`if systemctl is-enabled --quiet docker.socket 2>/dev/null; then echo docker_socket_enabled=1; fi`,
+		`printf 'docker_gid=%s\n' "$(getent group docker 2>/dev/null | cut -d: -f3)"`,
 		`if command -v sshd >/dev/null 2>&1; then`,
 		`  if t=$(sshd -T 2>&1); then`,
 		`    echo sshd_t=1`,
@@ -502,6 +533,16 @@ func (r *Runner) factsScript(o *Options, key PublicKey) (string, error) {
 			`  printf 'compose_%s=%s\n' "$p" "$v"`,
 			`done`,
 			`if command -v apt-cache >/dev/null 2>&1 && ! ls `+r.p("/var/lib/apt/lists")+`/*_Packages* >/dev/null 2>&1; then echo apt_lists_empty=1; fi`,
+			// The docker-compose CLI plugin (or binary) podman can run as its
+			// provider, and the deploy user's podman.socket it then needs.
+			`depper_plugin=""`,
+			`for f in `+r.p("/usr/libexec/docker/cli-plugins/docker-compose")+` `+r.p("/usr/lib/docker/cli-plugins/docker-compose")+` `+r.p("/usr/local/libexec/docker/cli-plugins/docker-compose")+` `+r.p("/usr/local/lib/docker/cli-plugins/docker-compose")+`; do if test -x "$f"; then depper_plugin=$f; break; fi; done`,
+			`if test -z "$depper_plugin"; then depper_plugin=$(command -v docker-compose 2>/dev/null || true); fi`,
+			`printf 'compose_plugin=%s\n' "$depper_plugin"`,
+			`if test -n "$pw" && runuser -u "$u" -- env XDG_RUNTIME_DIR="$rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" systemctl --user show-environment >/dev/null 2>&1; then`,
+			`  printf 'podman_socket_enabled=%s\n' "$(runuser -u "$u" -- env XDG_RUNTIME_DIR="$rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" systemctl --user is-enabled podman.socket 2>/dev/null | head -n 1 | tr -cd 'a-z-')"`,
+			`  if runuser -u "$u" -- env XDG_RUNTIME_DIR="$rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" systemctl --user is-active --quiet podman.socket 2>/dev/null; then echo podman_socket_active=1; fi`,
+			`fi`,
 		)
 	}
 	root = append(root, `echo root_facts=1`)
@@ -562,6 +603,12 @@ func parseFacts(out string) (*Facts, map[string]string, error) {
 		Commands:             map[string]string{},
 		DockerActive:         m["docker_active"] == "1",
 		DockerEnabled:        m["docker_enabled"] == "1",
+		DockerSocketActive:   m["docker_socket_active"] == "1",
+		DockerSocketEnabled:  m["docker_socket_enabled"] == "1",
+		ManagerGroups:        strings.Fields(m["usermgr_groups"]),
+		ManagerGroupsKnown:   m["usermgr_groups_read"] == "1",
+		PodmanSocketEnabled:  clean(m["podman_socket_enabled"]),
+		PodmanSocketActive:   m["podman_socket_active"] == "1",
 		SSHDTest:             m["sshd_t"] == "1",
 		SSHDTestOutput:       clean(m["sshd_t_msg"]),
 		SSHD:                 map[string]string{},
@@ -582,6 +629,15 @@ func parseFacts(out string) (*Facts, map[string]string, error) {
 	f.Family = classify(f.OSID, f.OSLike)
 	if uid, err := strconv.Atoi(m["user_uid"]); err == nil {
 		f.UserUID = uid
+	}
+	if pid, err := strconv.Atoi(m["usermgr_pid"]); err == nil && pid > 0 {
+		f.ManagerPID = pid
+	}
+	if gid := clean(m["docker_gid"]); gidRe.MatchString(gid) {
+		f.DockerGID = gid
+	}
+	if p := clean(m["compose_plugin"]); p != "" {
+		f.ComposePlugin = p
 	}
 	// A firewalld port or the ssh service counts when it is open both now
 	// and after a reload (runtime and permanent); a stopped firewalld only
@@ -761,6 +817,7 @@ func (r *Runner) gatherFacts(ctx context.Context, admin *transport.Remote, o *Op
 		for i, mm := range f.SSHDMatch {
 			f.SSHDMatch[i] = strings.TrimPrefix(mm, r.fsRoot)
 		}
+		f.ComposePlugin = strings.TrimPrefix(f.ComposePlugin, r.fsRoot)
 	}
 	switch f.Privilege {
 	case PrivRoot, PrivSudo:
@@ -790,6 +847,9 @@ func pkgVersion(v string) string {
 }
 
 var pkgVersionRe = regexp.MustCompile(`^[0-9][A-Za-z0-9.+~:_-]{0,80}$`)
+
+// gidRe matches a numeric group id.
+var gidRe = regexp.MustCompile(`^[0-9]{1,10}$`)
 
 // versionMajor returns the major version of a Debian or RPM version string
 // (an epoch "N:" is skipped), or -1.

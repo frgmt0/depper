@@ -19,11 +19,13 @@ const (
 	StepTailscalePkg  = "tailscale-install"
 	StepUser          = "user"
 	StepAuthorizedKey = "authorized-key"
+	StepDockerGroup   = "docker-group"
 	StepLinger        = "linger"
 	StepUserManager   = "user-manager"
-	StepSubIDs        = "subids"
-	StepDockerGroup   = "docker-group"
+	StepManagerGroups = "user-manager-groups"
 	StepDockerService = "docker-service"
+	StepPodmanSocket  = "podman-socket"
+	StepSubIDs        = "subids"
 	StepFirewall      = "firewall"
 	StepAutoUpdates   = "auto-updates"
 	StepTailscaleUp   = "tailscale-up"
@@ -63,6 +65,12 @@ type Plan struct {
 	// rootBefore is yes).
 	rootBefore string
 	hardenRoot bool
+	// ComposeProvider is set when podman compose is to run the
+	// docker-compose provider present on the host because podman-compose
+	// cannot be installed (it then needs the user's podman.socket); it
+	// names that provider and is recorded in host.json.
+	ComposeProvider string `json:"compose_provider,omitempty"`
+
 	// unsynced are packages to install on Arch that the pacman sync
 	// database does not have; buildPlan refuses when there are any.
 	unsynced []string
@@ -320,7 +328,15 @@ func (r *Runner) buildPlan(o *Options, f *Facts, key PublicKey) (*Plan, error) {
 	if o.Compose && o.Container != ContainerNone {
 		req, err := composeProvider(o.Container, f)
 		if err != nil {
-			return nil, err
+			via := dockerComposeForPodman(o.Container, f)
+			if via == "" {
+				return nil, err
+			}
+			// podman runs docker-compose as its provider; it talks to the
+			// podman API socket, which a later step enables.
+			req = pkgReq{Pkg: "docker-compose", Installed: true}
+			p.ComposeProvider = "docker-compose (" + via + ") through podman.socket"
+			p.warn("podman-compose cannot be installed (it is not in the package repositories of %s), so podman compose will run the docker-compose provider on the host (%s); it talks to podman's API socket, so host init enables podman.socket for %s", f.OSID, via, o.User)
 		}
 		reqs = append(reqs, req)
 	}
@@ -488,6 +504,23 @@ fi`
 		}
 	}
 
+	// docker: the group comes before linger and the user manager (enabling
+	// linger starts it). A running user manager keeps the groups it started
+	// with, and every service it starts inherits them: a group added after
+	// it started is missing from the services, while new SSH logins have it.
+	dockerGroupAdded := false
+	if o.Container == ContainerDocker {
+		p.warn("%s", DockerGroupWarning)
+		s = p.add(&Step{ID: StepDockerGroup, Title: "Add " + o.User + " to the docker group"})
+		if f.UserExists && contains(f.UserGroups, "docker") {
+			s.Detail = "already a member"
+		} else {
+			dockerGroupAdded = true
+			s.Change, s.Detail = true, "usermod -aG docker "+o.User+" (root-equivalent; before the user manager starts, so its services get the group)"
+			s.lines = []string{"usermod -aG docker " + u}
+		}
+	}
+
 	// Linger and the user manager.
 	s = p.add(&Step{ID: StepLinger, Title: "Enable lingering for " + o.User})
 	if f.UserExists && f.Linger {
@@ -501,27 +534,74 @@ fi`
 		s.Detail = "`systemctl --user` works as " + o.User
 	} else {
 		s.Change, s.Detail = true, "systemctl start user@UID.service, then check `systemctl --user` as "+o.User
-		wait := r.managerWait
-		if wait == 0 {
-			wait = 30
-		}
-		s.lines = []string{
+		s.lines = append([]string{
 			"depper_uid=$(id -u " + u + ")",
 			`systemctl start "user@$depper_uid.service"`,
-			`depper_rt=` + r.p("/run/user") + `/"$depper_uid"`,
-			"depper_i=0",
-			"until runuser -u " + u + ` -- env XDG_RUNTIME_DIR="$depper_rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$depper_rt/bus" systemctl --user show-environment >/dev/null 2>&1; do`,
-			`  depper_i=$((depper_i + 1))`,
-			"  if test \"$depper_i\" -ge " + strconv.Itoa(wait) + "; then echo \"the systemd user manager for " + o.User + " did not start (systemctl --user fails)\" >&2; exit 1; fi",
-			"  sleep 1",
-			"done",
+		}, r.managerWaitLines(o.User)...)
+	}
+
+	// A user manager that was already running without the docker group is
+	// restarted, which restarts every service of the user.
+	if o.Container == ContainerDocker {
+		s = p.add(&Step{ID: StepManagerGroups, Title: "Give the systemd user manager of " + o.User + " the docker group"})
+		unit := fmt.Sprintf("user@%d.service", f.UserUID)
+		running := f.UserExists && f.ManagerPID > 0
+		lacks := f.DockerGID != "" && f.ManagerGroupsKnown && !contains(f.ManagerGroups, f.DockerGID)
+		switch {
+		case !running:
+			s.Detail = "the user manager is not running yet; it starts with the docker group"
+		case dockerGroupAdded || lacks:
+			why := unit + " is running without the docker group (it started before " + o.User + " joined it)"
+			if dockerGroupAdded {
+				why = unit + " is already running, so it would not get the docker group added above"
+			}
+			s.Change = true
+			s.Detail = why + ": restart it, then check that its process has the docker group. This restarts all of " + o.User + "'s services (a short interruption for anything already deployed)"
+			p.warn("host init restarts %s so that services get the docker group; every service of %s restarts with it (a short interruption for anything already deployed)", unit, o.User)
+			s.lines = append([]string{
+				"depper_uid=$(id -u " + u + ")",
+				`systemctl restart "user@$depper_uid.service"`,
+			}, r.managerWaitLines(o.User)...)
+			s.lines = append(s.lines, r.managerGroupCheckLines()...)
+		case !f.ManagerGroupsKnown:
+			s.Detail = "could not read the groups of " + unit + " (/proc/" + strconv.Itoa(f.ManagerPID) + "/status); depper doctor checks them after host init"
+		default:
+			s.Detail = unit + " has the docker group (gid " + f.DockerGID + ")"
+		}
+
+		// docker at boot: socket activation (docker.socket, Arch's default)
+		// or docker.service, whichever the host already uses; else
+		// docker.socket where the unit exists. What depper enables is
+		// recorded in host.json.
+		s = p.add(&Step{ID: StepDockerService, Title: "Enable docker at boot"})
+		switch {
+		case f.DockerSocketEnabled:
+			s.Detail = "docker.socket is enabled (socket activation)"
+		case f.DockerEnabled:
+			s.Detail = "docker.service is enabled"
+		case f.DockerActive:
+			s.Detail = "docker.service is running"
+		default:
+			s.Change, s.Detail = true, "systemctl enable --now docker.socket (socket activation), or docker.service where there is no docker.socket; unless the package enabled one of them"
+			s.lines = dockerEnableLines()
 		}
 	}
 
-	// Rootless podman needs subordinate id ranges; docker needs its group
-	// and service.
-	switch o.Container {
-	case ContainerPodman:
+	// podman compose through the docker-compose provider talks to the
+	// user's podman API socket.
+	if p.ComposeProvider != "" {
+		s = p.add(&Step{ID: StepPodmanSocket, Title: "Enable podman.socket for " + o.User})
+		if f.UserExists && f.UserManager && f.PodmanSocketActive && podmanSocketEnabled(f.PodmanSocketEnabled) {
+			s.Detail = "podman.socket is enabled and active for " + o.User
+		} else {
+			s.Change = true
+			s.Detail = "systemctl --user enable --now podman.socket as " + o.User + ": podman compose runs " + p.ComposeProvider + ", which talks to podman's API socket"
+			s.lines = r.podmanSocketLines(o.User)
+		}
+	}
+
+	// Rootless podman needs subordinate id ranges.
+	if o.Container == ContainerPodman {
 		s = p.add(&Step{ID: StepSubIDs, Title: "Subordinate uid/gid ranges for rootless podman"})
 		if f.UserExists && f.SubUID && f.SubGID {
 			s.Detail = "/etc/subuid and /etc/subgid already have ranges for " + o.User
@@ -534,22 +614,6 @@ fi`
 				"if ! grep -q " + shell.Quote("^"+o.User+":") + " " + r.p("/etc/subuid") + "; then usermod --add-subuids \"$depper_range\" " + u + "; fi",
 				"if ! grep -q " + shell.Quote("^"+o.User+":") + " " + r.p("/etc/subgid") + "; then usermod --add-subgids \"$depper_range\" " + u + "; fi",
 			}
-		}
-	case ContainerDocker:
-		p.warn("%s", DockerGroupWarning)
-		s = p.add(&Step{ID: StepDockerGroup, Title: "Add " + o.User + " to the docker group"})
-		if f.UserExists && contains(f.UserGroups, "docker") {
-			s.Detail = "already a member"
-		} else {
-			s.Change, s.Detail = true, "usermod -aG docker "+o.User+" (root-equivalent)"
-			s.lines = []string{"usermod -aG docker " + u}
-		}
-		s = p.add(&Step{ID: StepDockerService, Title: "Enable the docker service"})
-		if f.DockerActive && f.DockerEnabled {
-			s.Detail = "docker.service is enabled and running"
-		} else {
-			s.Change, s.Detail = true, "systemctl enable --now docker.service"
-			s.lines = []string{"systemctl enable --now docker.service"}
 		}
 	}
 
@@ -830,7 +894,7 @@ func (p *Plan) addRecord(f *Facts, o *Options, extra []string) {
 	if len(steps) > 0 {
 		steps = append(steps, StepRecord)
 	}
-	rec := mergeRecord(f.Record, o, firewallPorts(o, f), steps, p.Packages)
+	rec := mergeRecord(f.Record, o, firewallPorts(o, f), steps, p.Packages, nil, p.ComposeProvider)
 	if f.Record != nil && sameContent(f.Record, &rec) {
 		s.Detail = "up to date"
 	} else {
@@ -1004,6 +1068,113 @@ func composeProvider(engine string, f *Facts) (pkgReq, error) {
 		reason += ". Install docker-ce and docker-compose-plugin from Docker's repository (https://docs.docker.com/engine/install/), or use podman"
 	}
 	return pkgReq{}, &ErrUnsupported{Reason: reason}
+}
+
+// dockerComposeForPodman returns the docker-compose provider podman compose
+// can run instead of podman-compose (the CLI plugin or binary on the host,
+// else an installed docker-compose package of version 2 or later), or "".
+func dockerComposeForPodman(engine string, f *Facts) string {
+	if engine != ContainerPodman {
+		return ""
+	}
+	if f.ComposePlugin != "" {
+		return f.ComposePlugin
+	}
+	for _, pkg := range []string{"docker-compose-plugin", "docker-compose-v2", "docker-compose"} {
+		if v := f.Compose[pkg].Installed; v != "" && (pkg != "docker-compose" || versionMajor(v) >= 2) {
+			return "the " + pkg + " package"
+		}
+	}
+	return ""
+}
+
+// podmanSocketEnabled reports an is-enabled state that starts the unit with
+// the user manager.
+func podmanSocketEnabled(state string) bool {
+	return state == "enabled" || state == "enabled-runtime"
+}
+
+// enabledMarker precedes a unit an applied step enabled (stdout), so host
+// init records it in host.json.
+const enabledMarker = "@@depper-enabled "
+
+// userEnv runs the rest of the line as user with the environment
+// `systemctl --user` needs; $depper_rt must hold the runtime directory
+// (runtimeDirLine).
+func userEnv(user string) string {
+	return "runuser -u " + shell.Quote(user) + ` -- env XDG_RUNTIME_DIR="$depper_rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$depper_rt/bus"`
+}
+
+// runtimeDirLine sets $depper_rt to the runtime directory of the user whose
+// uid is in $depper_uid.
+func (r *Runner) runtimeDirLine() string {
+	return `depper_rt=` + r.p("/run/user") + `/"$depper_uid"`
+}
+
+// managerWaitLines wait until `systemctl --user` works as user;
+// $depper_uid must hold the user's uid.
+func (r *Runner) managerWaitLines(user string) []string {
+	wait := r.managerWait
+	if wait == 0 {
+		wait = 30
+	}
+	return []string{
+		r.runtimeDirLine(),
+		"depper_i=0",
+		"until " + userEnv(user) + " systemctl --user show-environment >/dev/null 2>&1; do",
+		`  depper_i=$((depper_i + 1))`,
+		"  if test \"$depper_i\" -ge " + strconv.Itoa(wait) + "; then echo \"the systemd user manager for " + user + " did not start (systemctl --user fails)\" >&2; exit 1; fi",
+		"  sleep 1",
+		"done",
+	}
+}
+
+// managerGroupCheckLines fail unless the process of user@$depper_uid.service
+// has the docker group among its groups (/proc/PID/status), which every
+// service it starts inherits.
+func (r *Runner) managerGroupCheckLines() []string {
+	return []string{
+		`depper_gid=$(getent group docker | cut -d: -f3)`,
+		`case "$depper_gid" in ""|*[!0-9]*) echo "cannot determine the gid of the docker group" >&2; exit 1 ;; esac`,
+		`depper_pid=$(systemctl show -p MainPID --value "user@$depper_uid.service")`,
+		`case "$depper_pid" in ""|0|*[!0-9]*) echo "cannot determine the process of user@$depper_uid.service" >&2; exit 1 ;; esac`,
+		`if ! awk -v g="$depper_gid" '$1 == "Groups:" { for (i = 2; i <= NF; i++) if ($i == g) f = 1 } END { exit !f }' ` + r.p("/proc") + `/"$depper_pid/status"; then`,
+		`  echo "user@$depper_uid.service still lacks the docker group (gid $depper_gid) after the restart" >&2; exit 1`,
+		`fi`,
+		`echo "user@$depper_uid.service has the docker group (gid $depper_gid)"`,
+	}
+}
+
+// dockerEnableLines enable docker at boot, unless the package already did:
+// docker.socket (socket activation) where the unit exists, else
+// docker.service. The unit enabled is announced with enabledMarker.
+func dockerEnableLines() []string {
+	return []string{
+		`if systemctl is-enabled --quiet docker.socket 2>/dev/null || systemctl is-enabled --quiet docker.service 2>/dev/null || systemctl is-active --quiet docker.service 2>/dev/null; then`,
+		`  echo "docker is already enabled (by its package); nothing to enable"`,
+		`elif systemctl list-unit-files docker.socket 2>/dev/null | grep -q '^docker\.socket'; then`,
+		`  systemctl enable --now docker.socket`,
+		`  echo ` + shell.Quote(enabledMarker+"docker.socket"),
+		`else`,
+		`  systemctl enable --now docker.service`,
+		`  echo ` + shell.Quote(enabledMarker+"docker.service"),
+		`fi`,
+	}
+}
+
+// podmanSocketLines enable and start podman.socket as user (idempotent) and
+// announce it with enabledMarker when it was not enabled before.
+func (r *Runner) podmanSocketLines(user string) []string {
+	as := userEnv(user) + " systemctl --user"
+	return []string{
+		"depper_uid=$(id -u " + shell.Quote(user) + ")",
+		r.runtimeDirLine(),
+		"depper_was=0",
+		"if " + as + " is-enabled --quiet podman.socket 2>/dev/null; then depper_was=1; fi",
+		as + " enable --now podman.socket",
+		"if ! " + as + " is-active --quiet podman.socket; then echo \"podman.socket for " + user + " is not active after enabling it\" >&2; exit 1; fi",
+		`if test "$depper_was" = 0; then echo ` + shell.Quote(enabledMarker+"podman.socket (user "+user+")") + `; fi`,
+	}
 }
 
 // shellName renders a login shell for messages.
